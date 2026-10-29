@@ -10,11 +10,7 @@ REPO = Path(__file__).resolve().parents[2]
 
 
 class WinFgScratchTest(unittest.TestCase):
-    """Win-FG's per-size descriptor sets on a pool held to its sizes, as Arm's Mali driver holds it.
-
-    ML-PY4J (Galaxy S21, Mali-G78): the compositor crashed in vkUpdateDescriptorSets from
-    winfg::ensureScratch, because each size change left the last size's sets in the pool.
-    """
+    """Win-FG's per-size descriptor sets on a pool held to its sizes."""
 
     @classmethod
     def setUpClass(cls):

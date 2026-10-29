@@ -2324,4 +2324,5 @@
     <string name="drawer_component_downloads">구성 요소 다운로드</string>
     <string name="drawer_component_downloads_hint">다운로드는 구성 요소 페이지와 공유됩니다. 위에서 다운로드한 버전을 선택하면 다음 게임 실행 시 사용됩니다.</string>
     <string name="drawer_component_choose_download">다운로드할 버전 선택</string>
+    <string name="stores_engine_missing">이 빌드에서는 아직 %1$s을(를) 사용할 수 없습니다: 스토어 엔진이 포함되지 않았습니다</string>
 </resources>

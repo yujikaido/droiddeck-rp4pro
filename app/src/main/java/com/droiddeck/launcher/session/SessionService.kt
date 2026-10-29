@@ -168,6 +168,7 @@ class SessionService : Service() {
             ACTION_ACTIVITY_VISIBLE -> {
                 if (!SessionState.pipActive) pipTask = false
                 activityVisible = true
+                manualPauseRequested = manualPauseOnReturn(manualPauseRequested, SessionState.suspended)
                 suspendDownloadNow = false
                 resumeSteamSleepOnReturn()
                 suspendAttemptFailed = false
@@ -1666,6 +1667,9 @@ class SessionService : Service() {
     }
 
     companion object {
+        /** Manual pause: a paused session waits for Resume; a pause held off while Steam updated is dropped when the player comes back. */
+        internal fun manualPauseOnReturn(requested: Boolean, suspended: Boolean) = requested && suspended
+
         private const val TAG = "SessionService"
         /** The stop reason in events.jsonl for the session menu's Stop (with or without the quit animation). */
         const val STOP_FROM_MENU = "Stop in the session menu"

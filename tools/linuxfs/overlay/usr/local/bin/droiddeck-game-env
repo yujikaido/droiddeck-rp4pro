@@ -3,6 +3,7 @@ import json
 import os
 import re
 import runpy
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -540,11 +541,28 @@ def mark_install_scripts(command, env):
     scripts = [path for path in scripts if not path or os.path.isfile(path)]
     if not scripts:
         return
+    seed_env = dict(env, DROIDDECK_SEED_SCRIPTS="\n".join(p for p in scripts if p))
+    if env.get("STEAM_COMPAT_DATA_PATH"):
+        # This launch's prefix only (and the stock ones a new prefix copies): the client waits.
+        seed_env["DROIDDECK_SEED_PREFIX"] = env["STEAM_COMPAT_DATA_PATH"]
     try:
-        subprocess.run([SEED_REDISTS, root], env=dict(env, DROIDDECK_SEED_SCRIPTS="\n".join(p for p in scripts if p)),
-                       stdout=sys.stderr, timeout=60, check=False)
+        run_bounded([SEED_REDISTS, root], seed_env, 60)
     except (OSError, subprocess.SubprocessError) as error:
         print("droiddeck-game-env: install scripts not marked (%s)" % error, file=sys.stderr)
+
+
+def run_bounded(command, env, timeout):
+    """Run command in its own process group, and on timeout end the whole group."""
+    process = subprocess.Popen(command, env=env, stdout=sys.stderr, start_new_session=True)
+    try:
+        return process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except OSError:
+            process.kill()
+        process.wait()
+        raise
 
 
 def main():

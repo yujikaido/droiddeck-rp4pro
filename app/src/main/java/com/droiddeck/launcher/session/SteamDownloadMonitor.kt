@@ -19,6 +19,9 @@ internal class SteamDownloadMonitor {
     private var lastNetworkAt = 0L
     private var bootstrapLogLength = UNREAD
     private var lastBootstrapGrowthAt = 0L
+    private var installCheckedLength = UNREAD
+    private var installing = false
+    private var installingSince = 0L
 
     fun poll(runtimeRoot: File, now: Long = System.currentTimeMillis(), receivedBytes: Long = -1L): Boolean {
         val current = manifests(runtimeRoot).associate { it.path to read(it) }
@@ -45,18 +48,31 @@ internal class SteamDownloadMonitor {
         return (receivedBytes - previousBytes) * 1000L / (now - previousAt) >= MIN_RECEIVE_BYTES_PER_SEC
     }
 
-    // The client's own first-run update (several hundred MB) is not an app download, so the manifests and
-    // content_log never show it. It counts as active while the app receives data or Steam's bootstrap log
-    // grows; with network = false only the log counts (after the first frame, when the received data may
-    // be the store or a game's download as well). Call after poll(), which samples the received bytes.
+    // The client's own first-run update counts as active while data arrives or the bootstrap log grows (only the log with network = false), and while the updater installs (up to CLIENT_INSTALL_MAX_MS). Call after poll().
     fun clientUpdateActive(runtimeRoot: File, now: Long = System.currentTimeMillis(), network: Boolean = true): Boolean {
         val log = File(runtimeRoot, "root/.local/share/Steam/logs/bootstrap_log.txt")
         val length = if (log.isFile) log.length() else -1L
         if (bootstrapLogLength != UNREAD && length > bootstrapLogLength) lastBootstrapGrowthAt = now
         bootstrapLogLength = length
+        if (length != installCheckedLength) {
+            installCheckedLength = length
+            installing = length > 0L && installingUpdate(tail(log, length))
+        }
+        if (!installing) installingSince = 0L else if (installingSince == 0L) installingSince = now
         return network && lastNetworkAt > 0L && now - lastNetworkAt <= CLIENT_UPDATE_GRACE_MS ||
-            lastBootstrapGrowthAt > 0L && now - lastBootstrapGrowthAt <= CLIENT_UPDATE_GRACE_MS
+            lastBootstrapGrowthAt > 0L && now - lastBootstrapGrowthAt <= CLIENT_UPDATE_GRACE_MS ||
+            installing && now - installingSince <= CLIENT_INSTALL_MAX_MS
     }
+
+    private fun tail(log: File, length: Long): String = runCatching {
+        RandomAccessFile(log, "r").use { input ->
+            val start = maxOf(0L, length - BOOTSTRAP_TAIL_BYTES)
+            val bytes = ByteArray((length - start).toInt())
+            input.seek(start)
+            input.readFully(bytes)
+            String(bytes, Charsets.UTF_8)
+        }
+    }.getOrDefault("")
 
     fun reset() {
         previous = emptyMap()
@@ -69,6 +85,9 @@ internal class SteamDownloadMonitor {
         lastNetworkAt = 0L
         bootstrapLogLength = UNREAD
         lastBootstrapGrowthAt = 0L
+        installCheckedLength = UNREAD
+        installing = false
+        installingSince = 0L
     }
 
     private fun readContentActivity(runtimeRoot: File, now: Long): Boolean {
@@ -149,9 +168,18 @@ internal class SteamDownloadMonitor {
          * the session log (LoadingState.steamUpdateDownloading). Without the last, every start said so for ~100 s. */
         fun clientUpdateShown(updating: Boolean, active: Boolean, progressSeen: Boolean) = updating && active && progressSeen
 
+        /** Whether the updater, in its latest start in this bootstrap log text, is installing a client update and has not yet shut down to start it. */
+        fun installingUpdate(text: String): Boolean {
+            val session = text.substring(maxOf(0, text.lastIndexOf("] Startup - ")))
+            val unpack = session.lastIndexOf("uninstalled manifest found")
+            return unpack >= 0 && session.indexOf("] Shutdown", unpack) < 0
+        }
+
         const val MANIFEST_PROGRESS_GRACE_MS = 8_000L
         const val CONTENT_ACTIVITY_GRACE_MS = 90_000L
         const val CLIENT_UPDATE_GRACE_MS = 90_000L
+        const val CLIENT_INSTALL_MAX_MS = 15L * 60L * 1000L
+        const val BOOTSTRAP_TAIL_BYTES = 128L * 1024L
         const val UNREAD = Long.MIN_VALUE
         const val MIN_RECEIVE_BYTES_PER_SEC = 64L * 1024L
         val PATH = Regex("\"path\"\\s+\"([^\"]+)\"")

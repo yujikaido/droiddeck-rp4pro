@@ -1,7 +1,4 @@
-// Host harness for Win-FG's per-size scratch (descriptor sets + UBOs), driven by test_winfg_scratch.py.
-// A fake device stands in for Arm's Mali driver: its descriptor pool is held to the sizes it was made
-// with, a failed allocation returns VK_ERROR_OUT_OF_POOL_MEMORY, and a write to a null or dead set
-// aborts (Arm's driver faults there: ML-PY4J's crash in write_descriptor_set).
+// Host harness for Win-FG's per-size scratch (descriptor sets + UBOs), on a fake device whose descriptor pool is held to its sizes.
 #include "framegen.cpp"
 
 #include <cstdio>
@@ -167,7 +164,7 @@ size_t liveSets() { size_t n = 0; for (auto& kv : g_pools) n += kv.second.live.s
 
 int main(int argc, char** argv) {
     std::string c = argc > 1 ? argv[1] : "";
-    // The sizes the compositor's scene went through in ML-PY4J's session: no window, Big Picture, back.
+    // The sizes the compositor's scene goes through: no window, Big Picture, back.
     const uint32_t sizes[][2] = {{1920, 1080}, {1280, 800}, {1920, 1080}, {1280, 800}, {24, 24},
                                  {1280, 800}, {1920, 1080}, {1600, 720}, {1280, 800}, {1920, 1080}};
     if (c == "resize") {

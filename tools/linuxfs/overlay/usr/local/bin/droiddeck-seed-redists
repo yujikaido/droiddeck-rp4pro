@@ -49,23 +49,62 @@ vcredist\\2022 x64 14.51.36247.0
 KNOWN
 )
 
+# The install scripts in the libraries' games, cached per game folder by a stamp of its manifest (LastPlayed left out).
+CACHE_VERSION="droiddeck-game-scripts 2"
 cache="$steam_root/.droiddeck-game-scripts"
 libraries="$steam_root"
 for library in $LIBRARIES; do libraries="$libraries
 $library"; done
 libraries=$(printf '%s\n%s\n' "$libraries" "$(sed -n 's/^[[:space:]]*"path"[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p' "$steam_root/steamapps/libraryfolders.vdf" 2>/dev/null)" | awk 'NF && !seen[$0]++')
-sig=$(while IFS= read -r library; do ls -l --time-style=+%s "$library"/steamapps/appmanifest_*.acf 2>/dev/null; done <<<"$libraries" | cksum)
-if [ "$(head -n 1 "$cache" 2>/dev/null)" != "$sig" ]; then
-  {
-    printf '%s\n' "$sig"
-    while IFS= read -r library; do
-      [ -d "$library/steamapps/common" ] || continue
-      find "$library/steamapps/common" -mindepth 2 -maxdepth 5 -iname 'installscript*.vdf' \
-        -not -path '*/Steamworks Shared/*' 2>/dev/null
-    done <<<"$libraries" | sort -u
-  } >"$cache.tmp" && mv -f "$cache.tmp" "$cache"
+manifests() {
+  local library manifest
+  while IFS= read -r library; do
+    for manifest in "$library"/steamapps/appmanifest_*.acf; do [ -f "$manifest" ] && printf '%s\0' "$manifest"; done
+  done <<<"$libraries" | xargs -0 -r awk '
+    function value(key,   rest) {
+      if (!match(low, "\"" key "\"[ \t\r\n]+\"")) return ""
+      rest = substr(text, RSTART + RLENGTH)
+      return substr(rest, 1, index(rest, "\"") - 1)
+    }
+    function flush(   dir, library) {
+      if (file == "") return
+      low = tolower(text)
+      dir = value("installdir")
+      library = file
+      sub(/\/steamapps\/[^\/]*$/, "", library)
+      if (dir != "" && dir != "." && dir != ".." && index(dir, "/") == 0 && tolower(dir) != "steamworks shared")
+        printf "%s/steamapps/common/%s\t%s:%s:%s\n", library, dir, value("stateflags"), value("buildid"), value("lastupdated")
+      text = ""
+    }
+    FNR == 1 { flush(); file = FILENAME }
+    { text = text $0 "\n" }
+    END { flush() }
+  ' | awk -F'\t' 'NF == 2 && !seen[$1]++'
+}
+cached_lines() { [ "$(head -n 1 "$cache" 2>/dev/null)" = "$CACHE_VERSION" ] && tail -n +2 "$cache"; }
+if [ -n "${DROIDDECK_SEED_PREFIX:-}" ]; then
+  # A launch's own pass: no folder is searched; the launch's scripts and the session's cache cover the rest.
+  entries=$(cached_lines)
+else
+  current=$(manifests)
+  old=$(cached_lines)
+  kept=$(awk -F'\t' 'NR == FNR { if (NF == 2) want[$1 FS $2] = 1; next } ($1 FS $2) in want' \
+    <(printf '%s\n' "$current") <(printf '%s\n' "$old"))
+  fresh=$(awk -F'\t' 'NR == FNR { have[$1 FS $2] = 1; next } NF == 2 && !(($1 FS $2) in have)' \
+    <(printf '%s\n' "$kept") <(printf '%s\n' "$current"))
+  found=$(while IFS=$'\t' read -r dir stamp; do
+    [ -n "$dir" ] || continue
+    scripts=$(find "$dir" -mindepth 1 -maxdepth 4 -iname 'installscript*.vdf' 2>/dev/null | sort)
+    if [ -z "$scripts" ]; then printf '%s\t%s\t\n' "$dir" "$stamp"; continue; fi
+    while IFS= read -r script; do printf '%s\t%s\t%s\n' "$dir" "$stamp" "$script"; done <<<"$scripts"
+  done <<<"$fresh")
+  entries=$(printf '%s\n%s\n' "$kept" "$found" | sed '/^$/d' | sort -u)
+  if [ "$(printf '%s\n%s' "$CACHE_VERSION" "$entries")" != "$(cat "$cache" 2>/dev/null)" ]; then
+    printf '%s\n%s' "$CACHE_VERSION" "$entries" >"$cache.tmp" && mv -f "$cache.tmp" "$cache"
+  fi
 fi
-game_scripts() { { tail -n +2 "$cache" 2>/dev/null; printf '%s\n' "${DROIDDECK_SEED_SCRIPTS:-}"; } | sed '/^$/d' | tr '\n' '\0'; }
+library_scripts=$(printf '%s\n' "$entries" | awk -F'\t' 'NF >= 3 && $3 != "" { print $3 }' | sort -u)
+game_scripts() { printf '%s\n%s\n' "$library_scripts" "${DROIDDECK_SEED_SCRIPTS:-}" | sed '/^$/d' | tr '\n' '\0'; }
 game_pairs=$(game_scripts | read_scripts)
 [ -n "$(printf '%s' "$game_pairs" | tr -d '[:space:]')" ] && pairs=$(printf '%s\n%s\n' "$pairs" "$game_pairs" | sort -u | sed '/^$/d')
 declare -A vulkan=()
@@ -186,13 +225,19 @@ present() { awk -F'\t' '
   }
 ' - "$1"; }
 
-for reg in "$steam_root"/steamapps/common/Proton*/files/share/default_pfx*/system.reg \
-           /mnt/droiddeck-sd/steamapps/common/Proton*/files/share/default_pfx*/system.reg \
-           /root/Games/*/steamapps/common/Proton*/files/share/default_pfx*/system.reg \
-           "$steam_root"/compatibilitytools.d/*/files/share/default_pfx*/system.reg \
-           "$steam_root"/steamapps/compatdata/*/pfx/system.reg \
-           /mnt/droiddeck-sd/steamapps/compatdata/*/pfx/system.reg \
-           /root/Games/*/steamapps/compatdata/*/pfx/system.reg; do
+registries=("$steam_root"/steamapps/common/Proton*/files/share/default_pfx*/system.reg
+            /mnt/droiddeck-sd/steamapps/common/Proton*/files/share/default_pfx*/system.reg
+            /root/Games/*/steamapps/common/Proton*/files/share/default_pfx*/system.reg
+            "$steam_root"/compatibilitytools.d/*/files/share/default_pfx*/system.reg)
+if [ -n "${DROIDDECK_SEED_PREFIX:-}" ]; then
+  # A launch's own pass: its prefix, and the stock ones a new prefix is copied from.
+  registries+=("${DROIDDECK_SEED_PREFIX%/}/pfx/system.reg")
+else
+  registries+=("$steam_root"/steamapps/compatdata/*/pfx/system.reg
+               /mnt/droiddeck-sd/steamapps/compatdata/*/pfx/system.reg
+               /root/Games/*/steamapps/compatdata/*/pfx/system.reg)
+fi
+for reg in "${registries[@]}"; do
   [ -f "$reg" ] || continue
   seeded=${reg%/*}/.droiddeck-redists
   legacy=${reg%/*}/.bannerlator-redists

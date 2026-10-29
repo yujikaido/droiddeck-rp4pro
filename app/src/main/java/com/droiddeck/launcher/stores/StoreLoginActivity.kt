@@ -81,7 +81,11 @@ class StoreLoginActivity : ComponentActivity() {
             window.setBackgroundDrawable(android.graphics.drawable.ColorDrawable(c))
             @Suppress("DEPRECATION") overridePendingTransition(0, 0)
         }
-        if (flow == null) { finish(); return }
+        if (flow == null) {
+            // no login flow (the store engine is missing or gave no login page): tell the player rather than closing silently
+            store?.let { android.widget.Toast.makeText(this, getString(R.string.stores_engine_missing, it.label), android.widget.Toast.LENGTH_LONG).show() }
+            finish(); return
+        }
         val chrome = buildChrome()
         setContentView(chrome)
         if (flooded) {

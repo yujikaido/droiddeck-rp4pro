@@ -168,6 +168,64 @@ exit 7
         self.assertIn('curl exit 7 after 5 tries', last)
         self.assertFalse((self.steam / 'package/droiddeck-installed').exists())
 
+    def test_an_unreachable_host_moves_to_the_next_one(self):
+        # Every TLS handshake with the first host fails (curl 35).
+        self.fake_sleep()
+        blocked = self.bin / 'curl'
+        blocked.write_text('''#!/bin/bash
+set -eu
+printf '%s\\n' "$2" >> "$TEST_REQUESTS"
+case $2 in
+  https://client-update.fastly.steamstatic.com/*)
+    echo "curl: (35) Send failure: Broken pipe" >&2; exit 35 ;;
+esac
+cp "$TEST_CDN/${2##*/}" "$4"
+''')
+        result = self.install()
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual([
+            'https://client-update.fastly.steamstatic.com/steam_client_steamdeck_publicbeta_linuxarm64',
+            'https://client-update.akamai.steamstatic.com/steam_client_steamdeck_publicbeta_linuxarm64',
+            'https://client-update.akamai.steamstatic.com/steamdeck_publicbeta.zip',
+        ], self.requests.read_text().splitlines())
+        self.assertIn('failed (try 1 of 5), trying again (curl exit 35 from client-update.fastly.steamstatic.com)',
+                      result.stderr)
+        self.assertEqual('123456\n', (self.steam / 'package/droiddeck-installed').read_text())
+
+    def test_every_host_is_tried_before_giving_up(self):
+        self.fake_sleep()
+        refused = self.bin / 'curl'
+        refused.write_text('''#!/bin/bash
+printf '%s\\n' "$2" >> "$TEST_REQUESTS"
+exit 35
+''')
+        result = self.install()
+        self.assertNotEqual(0, result.returncode)
+        hosts = [line.split('/')[2] for line in self.requests.read_text().splitlines()]
+        self.assertEqual(['client-update.fastly.steamstatic.com', 'client-update.akamai.steamstatic.com',
+                          'client-update.steamstatic.com', 'client-update.fastly.steamstatic.com',
+                          'client-update.akamai.steamstatic.com'], hosts)
+        last = result.stderr.strip().splitlines()[-1]
+        self.assertTrue(last.startswith("droiddeck-steam-install: could not reach Steam's download servers ("), last)
+        self.assertIn('curl exit 35 after 5 tries', last)
+
+    def test_a_slow_answer_stays_on_the_same_host(self):
+        # A part that broke off mid-transfer (18) or wrote nowhere (23) is not the host's fault.
+        self.fake_sleep()
+        flaky = self.bin / 'curl'
+        flaky.write_text('''#!/bin/bash
+set -eu
+printf '%s\\n' "$2" >> "$TEST_REQUESTS"
+case $2 in
+  *.zip)
+    if [ ! -e "$TEST_REQUESTS.dropped" ]; then : > "$TEST_REQUESTS.dropped"; exit 18; fi ;;
+esac
+cp "$TEST_CDN/${2##*/}" "$4"
+''')
+        self.assertEqual(0, self.install().returncode)
+        hosts = {line.split('/')[2] for line in self.requests.read_text().splitlines()}
+        self.assertEqual({'client-update.fastly.steamstatic.com'}, hosts)
+
     def test_a_dropped_part_that_never_comes_back_says_so_too(self):
         self.fake_sleep()
         dropped = self.bin / 'curl'

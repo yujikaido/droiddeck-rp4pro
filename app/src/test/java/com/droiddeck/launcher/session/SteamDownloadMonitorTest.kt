@@ -181,6 +181,48 @@ class SteamDownloadMonitorTest {
         }
     }
 
+    @Test fun clientUpdateLastsWhileTheUpdaterInstalls() {
+        // The install step writes nothing for 90 s.
+        val root = Files.createTempDirectory("droiddeck-steam-download-").toFile()
+        try {
+            val log = File(root, "root/.local/share/Steam/logs/bootstrap_log.txt").apply {
+                check(parentFile?.mkdirs() != false)
+                writeText(
+                    "[2026-10-28 01:23:06] uninstalled manifest found in /root/.local/share/Steam/package/x (1).\n" +
+                        "[2026-10-28 01:23:24] Instalando a atualização...\n" +
+                        "[2026-10-28 01:23:31] Shutdown\n" +
+                        "[2026-10-28 02:38:35] Startup - updater built Oct 26 2026 22:12:06\n" +
+                        "[2026-10-28 02:38:36] Download concluído.\n",
+                )
+            }
+            val monitor = SteamDownloadMonitor()
+
+            assertFalse(monitor.clientUpdateActive(root, now = 1_000L))
+            log.appendText("[2026-10-28 02:38:36] uninstalled manifest found in /root/.local/share/Steam/package/x (1).\n")
+            log.appendText("[2026-10-28 02:39:04] Instalando a atualização...\n")
+            assertTrue(monitor.clientUpdateActive(root, now = 2_000L))
+            assertTrue("quiet log, still installing", monitor.clientUpdateActive(root, now = 200_000L))
+            assertTrue(monitor.clientUpdateActive(root, now = 2_000L + SteamDownloadMonitor.CLIENT_INSTALL_MAX_MS))
+            assertFalse("an install that never ends stops holding the session",
+                monitor.clientUpdateActive(root, now = 2_001L + SteamDownloadMonitor.CLIENT_INSTALL_MAX_MS))
+            log.appendText("[2026-10-28 02:39:11] Shutdown\n")
+            assertTrue("the log grew", monitor.clientUpdateActive(root, now = 2_002L + SteamDownloadMonitor.CLIENT_INSTALL_MAX_MS))
+            assertFalse(monitor.clientUpdateActive(root, now = 3_000L + SteamDownloadMonitor.CLIENT_INSTALL_MAX_MS + SteamDownloadMonitor.CLIENT_UPDATE_GRACE_MS))
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test fun anInstallIsReadFromTheUpdatersLatestStartOnly() {
+        val done = "[1] Startup - a\n[2] uninstalled manifest found in p (1).\n[3] Instalando a atualização...\n" +
+            "[4] Executando limpeza...\n[5] Shutdown\n"
+        assertFalse(SteamDownloadMonitor.installingUpdate(done))
+        assertFalse(SteamDownloadMonitor.installingUpdate(done + "[6] Startup - b\n[7] Verifying installation...\n"))
+        assertTrue(SteamDownloadMonitor.installingUpdate(done + "[6] Startup - b\n[7] uninstalled manifest found in p (1).\n"))
+        assertTrue(SteamDownloadMonitor.installingUpdate("[7] uninstalled manifest found in p (1).\n[8] 正在安装更新...\n"))
+        assertFalse(SteamDownloadMonitor.installingUpdate(""))
+    }
+
     private fun manifest(root: File, appId: String, downloaded: Long, total: Long, flags: Int): File {
         val file = File(root, "steamapps/appmanifest_$appId.acf")
         check(file.parentFile?.mkdirs() != false)

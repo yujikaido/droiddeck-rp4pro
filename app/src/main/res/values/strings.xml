@@ -2363,4 +2363,5 @@
     <string name="setup_bridge_menus_software_detail">Always drawn without the GPU. Try this if Steam shows a black screen. Games still use the GPU.</string>
     <string name="setup_gpu_bridge">Runs through the Mali bridge</string>
     <string name="setup_gpu_bridge_detail">%1$s runs games through the Mali bridge, on the phone\'s own driver. If a game has problems, send logs from Setup > Diagnostics.</string>
+    <string name="stores_engine_missing">%1$s is not available in this build yet: its store engine is not included</string>
 </resources>

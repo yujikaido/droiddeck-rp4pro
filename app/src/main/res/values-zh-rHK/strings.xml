@@ -2324,4 +2324,5 @@
     <string name="setup_bridge_menus_software_detail">一律不用 GPU 繪製。如果 Steam 顯示黑畫面，請試試這個選項。遊戲仍會使用 GPU。</string>
     <string name="setup_gpu_bridge">透過 Mali 橋接運行</string>
     <string name="setup_gpu_bridge_detail">%1$s 透過 Mali 橋接運行遊戲，使用手機內置的驅動程式。如果遊戲有問題，請在「設定 &gt; 診斷」傳送記錄。</string>
+    <string name="stores_engine_missing">這個版本暫不支援 %1$s：未包含它的商店引擎</string>
 </resources>

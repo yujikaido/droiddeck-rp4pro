@@ -7,6 +7,7 @@ import runpy
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -72,17 +73,34 @@ class GameEnvironmentTest(unittest.TestCase):
             script.parent.mkdir(parents=True)
             script.write_text("{}")
             calls = []
-            run = MODULE["mark_install_scripts"].__globals__["subprocess"].run
-            MODULE["mark_install_scripts"].__globals__["subprocess"].run = lambda args, **kw: calls.append((args, kw["env"]))
-            try:
-                env = {"STEAM_COMPAT_CLIENT_INSTALL_PATH": str(root)}
+            module = MODULE["mark_install_scripts"].__globals__
+            with mock.patch.dict(module, run_bounded=lambda args, env, timeout: calls.append((args, env))):
+                env = {"STEAM_COMPAT_CLIENT_INSTALL_PATH": str(root), "STEAM_COMPAT_DATA_PATH": "/sd/steamapps/compatdata/409710"}
                 MODULE["mark_install_scripts"](["/proton", "run", str(root / "legacycompat/iscriptevaluator.exe"), "legacycompat\\evaluatorscript_409710.vdf"], env)
                 MODULE["mark_install_scripts"](["/proton", "waitforexitandrun", "/game/Game.exe"], env)
-            finally:
-                MODULE["mark_install_scripts"].__globals__["subprocess"].run = run
             self.assertEqual(len(calls), 1)
             self.assertEqual(calls[0][0][1], str(root))
             self.assertEqual(calls[0][1]["DROIDDECK_SEED_SCRIPTS"], str(script))
+            self.assertEqual(calls[0][1]["DROIDDECK_SEED_PREFIX"], "/sd/steamapps/compatdata/409710")
+
+    def test_a_seeding_past_its_time_is_ended_with_everything_it_started(self):
+        # The timeout ends the shell and its find.
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / "child.pid"
+            script = "sleep 30 & echo $! > %s; wait" % marker
+            with self.assertRaises(subprocess.TimeoutExpired):
+                MODULE["run_bounded"](["sh", "-c", script], dict(os.environ), 1)
+            child = int(marker.read_text())
+            for _ in range(50):
+                try:
+                    with open("/proc/%d/stat" % child) as stat:
+                        if stat.read().split(")")[-1].split()[0] == "Z":
+                            break
+                except (FileNotFoundError, ProcessLookupError):
+                    break
+                time.sleep(0.1)
+            else:
+                self.fail("the seeding's child outlived its timeout")
 
     def test_the_service_helper_gets_the_games_install_scripts_marked_first(self):
         # Just Cause 2: legacycompat\\steamservice.exe /runfunc runs the install steps with no script
@@ -99,9 +117,7 @@ class GameEnvironmentTest(unittest.TestCase):
             (sd / "steamapps/appmanifest_8190.acf").write_text('"AppState" { "appid" "8190" "installdir" "Just Cause 2" }')
             calls = []
             module = MODULE["mark_install_scripts"].__globals__
-            run = module["subprocess"].run
-            module["subprocess"].run = lambda args, **kw: calls.append((args, kw["env"]))
-            try:
+            with mock.patch.dict(module, run_bounded=lambda args, env, timeout: calls.append((args, env))):
                 helper = ["/proton", "run", "Z:\\root\\.local\\share\\Steam\\legacycompat\\steamservice.exe",
                           "/runfunc", "2528692275", "1", "6959", "32768"]
                 env = {"STEAM_COMPAT_CLIENT_INSTALL_PATH": str(root), "STEAM_COMPAT_INSTALL_PATH": "",
@@ -110,8 +126,6 @@ class GameEnvironmentTest(unittest.TestCase):
                     MODULE["mark_install_scripts"](helper, env)
                     MODULE["mark_install_scripts"](helper[:3], env)
                     MODULE["mark_install_scripts"](helper, dict(env, STEAM_COMPAT_DATA_PATH=str(sd / "steamapps/compatdata/9")))
-            finally:
-                module["subprocess"].run = run
             self.assertEqual(len(calls), 2)
             self.assertEqual(calls[0][0][1], str(root))
             self.assertEqual(calls[0][1]["DROIDDECK_SEED_SCRIPTS"].split("\n"), [

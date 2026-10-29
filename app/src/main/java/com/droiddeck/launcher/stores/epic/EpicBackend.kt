@@ -24,6 +24,14 @@ object EpicBackend : StoreBackend, EpicLaunchSupport {
     }
 
     override fun signIn(context: Context) {
+        // A build without the store engine (libdroiddeckstores.so) cannot sign in: say so instead of opening a blank page.
+        if (!EpicNative.ready()) {
+            val line = context.getString(R.string.stores_engine_missing, store.label)
+            StoresState.logLine(line)
+            StoresState.post { StoresState.problems[store] = line }
+            android.widget.Toast.makeText(context, line, android.widget.Toast.LENGTH_LONG).show()
+            return
+        }
         context.startActivity(
             Intent(context, StoreLoginActivity::class.java)
                 .putExtra(StoreLoginActivity.EXTRA_STORE, store.id)

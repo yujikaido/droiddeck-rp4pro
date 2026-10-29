@@ -685,6 +685,7 @@ private fun SignInCard(store: Store, height: Dp) {
             }
             Spacer(Modifier.height(6.dp))
             Rise(3) { SignInButton(store, large = true) }
+            StoresState.problems[store]?.let { line -> Rise(4) { Note(line) } }
         }
     }
 }

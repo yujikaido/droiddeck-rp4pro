@@ -1,6 +1,7 @@
 #!/bin/bash
 set -eu
-cdn=https://client-update.fastly.steamstatic.com
+# Valve's three client hosts: one that can't be reached is followed by the next on the next try; each part is checked against the manifest's sha2.
+cdns="https://client-update.fastly.steamstatic.com https://client-update.akamai.steamstatic.com https://client-update.steamstatic.com"
 steam_channel=steamdeck_publicbeta
 manifest=steam_client_${steam_channel}_linuxarm64
 steam_root=${XDG_DATA_HOME:-$HOME/.local/share}/Steam
@@ -45,24 +46,30 @@ trap 'rm -rf "$work"' EXIT
 # the app looks for it to tell the player to check the connection or a VPN/accelerator app
 # (every try refused within 11 ms behind a VPN, and the session just ended).
 UNREACHABLE="droiddeck-steam-install: could not reach Steam's download servers"
+read -r -a hosts <<< "$cdns"
 fetch() {
-  local attempt rc
+  local attempt rc host
   for attempt in 1 2 3 4 5; do
-    if curl -fsSL "$1" -o "$2" --connect-timeout 20 --speed-limit 1024 --speed-time 60; then return 0; else rc=$?; fi
+    host=${hosts[0]}
+    if curl -fsSL "$host/$1" -o "$2" --connect-timeout 20 --speed-limit 1024 --speed-time 60; then return 0; else rc=$?; fi
     rm -f "$2"
     [ "$rc" -ne 22 ] || break
     [ "$attempt" -lt 5 ] || break
-    echo "== droiddeck-steam-install: ${1##*/} failed (try $attempt of 5), trying again" >&2
+    # Only a connection that failed before any answer (curl 6, 7, 28, 35, 52, 56) moves to the next host.
+    case $rc in
+      6|7|28|35|52|56) hosts=("${hosts[@]:1}" "$host") ;;
+    esac
+    echo "== droiddeck-steam-install: $1 failed (try $attempt of 5), trying again (curl exit $rc from ${host#https://})" >&2
     sleep $((attempt * 2))
   done
   if [ "$rc" -eq 22 ]; then
-    echo "droiddeck-steam-install: ${1##*/}: the server has no such file (HTTP error)" >&2
+    echo "droiddeck-steam-install: $1: the server has no such file (HTTP error)" >&2
   elif [ "$rc" -ne 23 ]; then
-    echo "$UNREACHABLE (${1##*/}, curl exit $rc after 5 tries)" >&2
+    echo "$UNREACHABLE ($1, curl exit $rc after 5 tries)" >&2
   fi
   exit 1
 }
-fetch "$cdn/$manifest" "$work/manifest"
+fetch "$manifest" "$work/manifest"
 version=$(awk -F'"' '$2 == "version" { print $4; exit }' "$work/manifest")
 awk -F'"' '
   /^\t"/ && NF >= 3 && $4 == "" { block = $2 }
@@ -77,7 +84,7 @@ mkdir -p "$steam_root/package"
 while read -r block file sum; do
   i=$((${i:-0} + 1))
   echo "== STEP $(date -u +%H:%M:%S) downloading Steam: $block ($i/$total)"
-  fetch "$cdn/$file" "$work/$file"
+  fetch "$file" "$work/$file"
   echo "$sum  $work/$file" | sha256sum -c --quiet
   unzip -qo "$work/$file" -d "$steam_root"
   rm -f "$work/$file"
