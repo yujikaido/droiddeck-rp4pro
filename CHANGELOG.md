@@ -5,6 +5,27 @@
 Newest first. Each build is on the [Releases](../../releases) page; from fix43 on, the app's **Updates** page
 offers new ones by itself.
 
+## fix49: Tales of Symphonia at full speed, on v0.5.4.2
+
+This build also carries fix46 to fix48, which were never released on their own.
+
+- **Tales of Symphonia battles: 15 fps -> 30 (the game's cap), 60 on screen with LSFG 2x.** The game locks its
+  main thread to "CPU 0". On a PC that is a fast core; on the RP4 Pro it is one of the four slow Cortex-A55 cores,
+  so the whole game ran on the weakest core while the fast A78s sat idle. DroidDeck now tells Wine to number the
+  cores fast-first for this game (`WINE_CPU_TOPOLOGY`, from its known-games table), so "CPU 0" is an A78. It also
+  loads faster. Best setting: Retroid **Performance** mode (the middle one) with **LSFG 2x**: about 60 fps on
+  screen with the GPU at half load. On **Standard** the fast cores slow down too far and battles drop to about 12.
+- **Rebased on ASEbrahim's DroidDeck Mali v0.5.4.2** (fix46), with all the RP4 Pro fixes and the Retro tab on top.
+- **Anti-aliasing switch for Ys Origin** (fix47): a card on the game's Launch settings, 4x or Off. Off takes the
+  Search Party's Base from 45 to 77 fps; 4x has smoother edges. It changes only that one setting in the game's
+  own settings file.
+- **Ys Origin: the real cause of the white rooms** (fix48): like Oath, it was Microsoft's own `d3dx9` under FEX.
+  DroidDeck now switches Ys Origin to Wine's built-in `d3dx9` by itself, and effects that had been hidden are back:
+  the brazier fire and the statue glow.
+- **The Frame limit now caps DXVK games too** (fix48). Steam -> Settings -> Display -> Frame limit used to cap only
+  the screen, so a game without vsync kept rendering past it. At 60 it now holds exactly 60.0 fps, and in Ys Origin
+  the GPU drops to its lowest clock (about 47 % busy), which saves battery.
+
 ## fix45: Ys: The Oath in Felghana draws its world
 
 In the DirectX 9 version, a loaded save showed only the HUD on black. The game was drawing the world, but every

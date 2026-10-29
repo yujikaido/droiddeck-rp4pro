@@ -19,7 +19,7 @@ is safe on other phones, but nothing else has been tested on them.
 
 This isn't the general DroidDeck Mali build; it's made and tested for the RP4 Pro. What that changes:
 
-- **Tested game by game on the RP4 Pro.** It's built on DroidDeck Mali v0.5.4.1, which runs on the RP4 Pro
+- **Tested game by game on the RP4 Pro.** It's built on DroidDeck Mali v0.5.4.2, which runs on the RP4 Pro
   too, and adds the fixes and per-game settings found on this device (see [Games](GAMES.md)).
 - **GPU bugs of this driver are fixed in the bridge**, so games that broke on it draw correctly: Ys Origin's
   white rooms, Tales of Symphonia closing at start, Oath in Felghana's black world.
@@ -35,11 +35,13 @@ This isn't the general DroidDeck Mali build; it's made and tested for the RP4 Pr
 
 More before/after pictures are in the [Changelog](CHANGELOG.md) and [Fixes](FIXES.md).
 
-## Latest: fix45
+## Latest: fix49
 
-**Ys: The Oath in Felghana draws its world** in the DirectX 9 version (it showed only the HUD on black), and
-fix44 made **Tales of Symphonia** start. Get it from the [Releases](../../releases) page, or from the app's
-**Updates** page on fix43 or later. Every build's notes are in the [CHANGELOG](CHANGELOG.md).
+**Tales of Symphonia runs at full speed**: battles went from 15 fps to the game's cap of 30, and LSFG 2x shows 60.
+The game had locked itself to a slow core. fix49 is also rebased on DroidDeck Mali **v0.5.4.2**, adds an
+**anti-aliasing switch** for Ys Origin (45 -> 77 fps with it off), brings back Ys Origin's fire and glow
+effects, and makes the **Frame limit** cap DirectX games too. Get it from the [Releases](../../releases) page, or
+from the app's **Updates** page on fix43 or later. Every build's notes are in the [CHANGELOG](CHANGELOG.md).
 
 ## More pages
 
@@ -52,8 +54,8 @@ fix44 made **Tales of Symphonia** start. Get it from the [Releases](../../releas
 
 ## Installing
 
-`DroidDeck-MaliBridge-v0.5.4.1-rp4pro-fix45.apk` (on the [Releases](../../releases) page) is DroidDeck Mali
-v0.5.4.1 built from source with these fixes and the Retro tab. fix14, the earlier build on v0.5.4, is still
+`DroidDeck-MaliBridge-v0.5.4.2-rp4pro-fix49.apk` (on the [Releases](../../releases) page) is DroidDeck Mali
+v0.5.4.2 built from source with these fixes and the Retro tab. fix14, the earlier build on v0.5.4, is still
 there too. Both are signed with a **personal debug key**, not the author's. Because of that:
 
 - If you have the official DroidDeck Mali installed, **uninstall it first**. Android refuses to install over
@@ -135,7 +137,7 @@ Steam's **Quick Access** menu, the same as on a Steam Deck.
 | `patches/` | the compositor and frame-generation patches against the `mali-test-build` fork |
 | `tools/` | the Vulkan probes run inside the DroidDeck rootfs during the investigation (`vk*.py`), the apitrace frame replay (`ys_replay.py`), and the preload build / APK repack scripts |
 | `docs/` | the pull-request write-ups sent upstream, and [`PROGRESS-LOG.md`](docs/PROGRESS-LOG.md), the day-by-day investigation log |
-| branch [`source`](../../tree/source) | the whole app fix45 is built from (DroidDeck Mali v0.5.4.1 with the fixes and the Retro tab) |
+| branch [`source`](../../tree/source) | the whole app fix49 is built from (DroidDeck Mali v0.5.4.2 with the fixes and the Retro tab) |
 
 ## Credits
 
