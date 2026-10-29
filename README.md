@@ -14,6 +14,24 @@ Claude Code, so they live on the fork branches below instead. Maintainers are we
 Tested on my personal Retroid Pocket 4 Pro only. The fixes switch themselves on for the r32 Mali driver, so the build
 is safe on other phones, but nothing else has been tested on them.
 
+## What's different from DroidDeck Mali
+
+- **It runs on the RP4 Pro.** The stock build never gets Steam started on this device's Mali-G77; this one
+  does, and games run from the SD card too.
+- **GPU bugs of this driver are fixed in the bridge**, so games that broke on it draw correctly: Ys Origin's
+  white rooms, Tales of Symphonia closing at start, Oath in Felghana's black world.
+- **Frame generation works**: LSFG on the Vulkan 1.1 driver, and Win-FG no longer crashes on a second launch.
+- **A Retro tab**, so your emulators and ROMs live next to your Steam games.
+- **Updates from this repository**, in the app's Updates page.
+
+| A Retro tab for your emulators | Ys Origin: white rooms fixed (69 fps) |
+|---|---|
+| ![Retro start screen](screenshots/13-retro-start-screen.jpg) | ![Ys Origin room](screenshots/02-ys-origin-room-after-fix.jpg) |
+| **Ys: The Oath in Felghana draws its world (69 fps)** | **LSFG frame generation on the Vulkan 1.1 driver** |
+| ![Oath Icebound Cave](screenshots/15-ys-oath-icebound-cave-after-fix45-69fps.jpg) | ![LSFG in Ys Origin](screenshots/11-lsfg-ys-origin-title-50-to-60fps.jpg) |
+
+More before/after pictures are in the [Changelog](CHANGELOG.md) and [Fixes](FIXES.md).
+
 ## Latest: fix45
 
 **Ys: The Oath in Felghana draws its world** in the DirectX 9 version (it showed only the HUD on black), and
