@@ -18,8 +18,8 @@ is safe on other phones, but nothing else has been tested on them.
 
 This isn't the general DroidDeck Mali build; it's made and tested for the RP4 Pro. What that changes:
 
-- **It runs on the RP4 Pro.** The stock build never gets Steam started on this device's Mali-G77; this one
-  does, and games run from the SD card too.
+- **Tested game by game on the RP4 Pro.** It's built on DroidDeck Mali v0.5.4.1, which runs on the RP4 Pro
+  too, and adds the fixes and per-game settings found on this device (see [Games](GAMES.md)).
 - **GPU bugs of this driver are fixed in the bridge**, so games that broke on it draw correctly: Ys Origin's
   white rooms, Tales of Symphonia closing at start, Oath in Felghana's black world.
 - **Frame generation works**: LSFG on the Vulkan 1.1 driver, and Win-FG no longer crashes on a second launch.
