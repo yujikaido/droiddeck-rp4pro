@@ -5,6 +5,21 @@
 Newest first. Each build is on the [Releases](../../releases) page; from fix43 on, the app's **Updates** page
 offers new ones by itself.
 
+## fix50: fast cores first for every game
+
+Older PC games lock their main thread to Windows "CPU 0". On a PC that is a fast core; on the RP4 Pro's
+Dimensity 1100 it is one of the four slow Cortex-A55 cores. That is what held Tales of Symphonia's battles at
+15 fps until fix49 gave it its own setting.
+
+fix50 does it for every game: just before a game starts, DroidDeck reads each core's top speed and has Wine number
+them fastest first (`WINE_CPU_TOPOLOGY`, here `8:4,5,6,7,0,1,2,3`), so "CPU 0" is a fast core on any chip layout.
+Games that don't lock themselves to a core run exactly as before. Of the six games checked (Symphonia, Ys Origin,
+Oath, Ark, Ys I, TMNT), only Symphonia locks a core; its fix49 entry was written for this chip only, so it is
+gone, and DroidDeck takes it back by itself on first start.
+
+It stays off when a game has its own `WINE_CPU_TOPOLOGY`, when you choose **Game cores**, when all cores run at the
+same speed or core 0 is already a fast one, or with `BL_FAST_CORES_FIRST=0`.
+
 ## fix49: Tales of Symphonia at full speed, on v0.5.4.2
 
 This build also carries fix46 to fix48, which were never released on their own.

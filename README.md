@@ -35,12 +35,13 @@ This isn't the general DroidDeck Mali build; it's made and tested for the RP4 Pr
 
 More before/after pictures are in the [Changelog](CHANGELOG.md) and [Fixes](FIXES.md).
 
-## Latest: fix49
+## Latest: fix50
 
-**Tales of Symphonia runs at full speed**: battles went from 15 fps to the game's cap of 30, and LSFG 2x shows 60.
-The game had locked itself to a slow core. fix49 is also rebased on DroidDeck Mali **v0.5.4.2**, adds an
-**anti-aliasing switch** for Ys Origin (45 -> 77 fps with it off), brings back Ys Origin's fire and glow
-effects, and makes the **Frame limit** cap DirectX games too. Get it from the [Releases](../../releases) page, or
+**Every game gets the fast cores first.** Older PC games lock their main thread to "CPU 0", which is a fast core
+on a PC but a slow one on this chip; Tales of Symphonia ran its battles at 15 fps that way. fix50 numbers the
+cores fastest first for every game, from the device's own core speeds, so games like that run on a fast core
+without needing their own entry. fix49 before it brought DroidDeck Mali **v0.5.4.2**, the Ys Origin
+**anti-aliasing switch**, Ys Origin's fire and glow effects, and a **Frame limit** that caps DirectX games too. Get it from the [Releases](../../releases) page, or
 from the app's **Updates** page on fix43 or later. Every build's notes are in the [CHANGELOG](CHANGELOG.md).
 
 ## More pages
@@ -54,7 +55,7 @@ from the app's **Updates** page on fix43 or later. Every build's notes are in th
 
 ## Installing
 
-`DroidDeck-MaliBridge-v0.5.4.2-rp4pro-fix49.apk` (on the [Releases](../../releases) page) is DroidDeck Mali
+`DroidDeck-MaliBridge-v0.5.4.2-rp4pro-fix50.apk` (on the [Releases](../../releases) page) is DroidDeck Mali
 v0.5.4.2 built from source with these fixes and the Retro tab. fix14, the earlier build on v0.5.4, is still
 there too. Both are signed with a **personal debug key**, not the author's. Because of that:
 
@@ -137,7 +138,7 @@ Steam's **Quick Access** menu, the same as on a Steam Deck.
 | `patches/` | the compositor and frame-generation patches against the `mali-test-build` fork |
 | `tools/` | the Vulkan probes run inside the DroidDeck rootfs during the investigation (`vk*.py`), the apitrace frame replay (`ys_replay.py`), and the preload build / APK repack scripts |
 | `docs/` | the pull-request write-ups sent upstream, and [`PROGRESS-LOG.md`](docs/PROGRESS-LOG.md), the day-by-day investigation log |
-| branch [`source`](../../tree/source) | the whole app fix49 is built from (DroidDeck Mali v0.5.4.2 with the fixes and the Retro tab) |
+| branch [`source`](../../tree/source) | the whole app fix50 is built from (DroidDeck Mali v0.5.4.2 with the fixes and the Retro tab) |
 
 ## Credits
 

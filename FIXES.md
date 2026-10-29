@@ -15,7 +15,7 @@ The problems this build fixes, with their causes, the screenshots, the known lim
 | **Press Play twice**: the first launch with frame generation on crashes the app | The Win-FG engine destroys its images and resets its descriptor pool while a frame is still in flight, and reuses descriptor sets from a destroyed pool at the same frame size | Waits for the GPU before both teardowns; the scratch cache is dropped with its pool |
 | **Tales of Symphonia quits at start**, back to the Steam page (fix44) | The game wants a 2x MSAA render target; r32p1 multisamples at 1x and 4x only, and DXVK 1.10's D3D9 offers 2x anyway, then fails the texture ("Cannot create texture ... Samples: 2") | New MaliBridge erratum `msaa2_as_4`: 2x is offered wherever 4x exists, and 2x images, render passes and pipelines are made with 4 samples |
 | **Ys: The Oath in Felghana shows only the HUD** after a save loads, DirectX 9 version (fix45) | An apitrace shows the world drawn with every world matrix (vertex constants c24-c31) NaN; they come from Microsoft's native `d3dx9_41`/`d3dx9_43`, which return NaN under FEX. The DirectX 8 version, without `d3dx9`, is fine | DroidDeck's known-games table sets `WINEDLLOVERRIDES=d3dx9_41,d3dx9_43=b` for this game (Wine's built-in `d3dx9`), applied by itself at session start |
-| **Tales of Symphonia battles at 15 fps** (fix49) | The game locks its main thread to Windows "CPU 0". On the Dimensity 1100 that is a Cortex-A55 (slow core); the thread sat at 91 % with the GPU 11-23 % busy | DroidDeck's known-games table sets `WINE_CPU_TOPOLOGY=8:4,5,6,7,0,1,2,3`, so Windows CPU 0-3 are the A78s: 30 fps (the game's cap), 60 shown with LSFG 2x |
+| **Tales of Symphonia battles at 15 fps** (fix49) | The game locks its main thread to Windows "CPU 0". On the Dimensity 1100 that is a Cortex-A55 (slow core); the thread sat at 91 % with the GPU 11-23 % busy | fix49: DroidDeck's known-games table set `WINE_CPU_TOPOLOGY=8:4,5,6,7,0,1,2,3`, so Windows CPU 0-3 are the A78s: 30 fps (the game's cap), 60 shown with LSFG 2x. fix50: the same for every game, built from the device's own core speeds (fastest first); a game's own setting, the Game cores setting or `BL_FAST_CORES_FIRST=0` turn it off. Of six games checked, only Symphonia pins; the others run as before |
 | **The Frame limit did not cap DirectX games** (fix48) | Steam -> Settings -> Display -> Frame limit only set the compositor's rate; a game without vsync kept rendering faster and wasting power | The session also sets DXVK's own limiter (`DXVK_FRAME_RATE`) a little above the limit: a 60 limit holds 60.0 fps, and Ys Origin's GPU drops to its lowest clock |
 | **LSFG unavailable** ("device Vulkan version below 1.2") | The LSFG engine has a Vulkan 1.1 route through three KHR extensions, but the compositor never switched it on, handed the driver a 1.2-only feature struct and did not enable the extensions | fix14: the 1.1 route is on, the memory-model feature goes through its KHR struct, and the three extensions are enabled on the compositor's device |
 
@@ -86,7 +86,7 @@ DroidDeck branches for `main`.
 
 ## Source and commit history
 
-This repository holds the build, the write-ups and the evidence. The app that fix49 is built from is on this
+This repository holds the build, the write-ups and the evidence. The app that fix50 is built from is on this
 repository's **[`source`](../../commits/source)** branch: the v0.5.4.1 source release as its first commit, then
 one commit per change (ASEbrahim's v0.5.4.2 came in as one commit, fix46), the Retro tab included. The bridge and compositor fixes, with their history, are also on
 branches of the two forks, where each commit is one fix with its reasoning in the message:
@@ -119,5 +119,5 @@ updated to the v0.5.4.2 base, with a correction on `nan_position`'s cause.
 The order is the order the problems appeared: nothing started, then games from the SD card, then the white
 rooms, then the second launch. The pull requests in `docs/` tell each story in full, and
 [`docs/PROGRESS-LOG.md`](docs/PROGRESS-LOG.md) is the unpolished day-by-day log, dead ends included. The
-fix44 to fix49 changes (the `msaa2_as_4` erratum, the known-games entries for Oath, Ys Origin and Tales of
-Symphonia, the anti-aliasing switch and the Frame limit change) are on the `source` branch.
+fix44 to fix50 changes (the `msaa2_as_4` erratum, the known-games entries for Oath and Ys Origin, the
+anti-aliasing switch, the Frame limit change and fast cores first) are on the `source` branch.

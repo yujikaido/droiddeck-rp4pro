@@ -2,7 +2,7 @@
 
 [README](README.md) · **Games** · [Changelog](CHANGELOG.md) · [Fixes](FIXES.md) · [License](LICENSE)
 
-Retroid Pocket 4 Pro, fix13 to fix49, Proton Experimental, default DroidDeck settings unless noted. Add a row
+Retroid Pocket 4 Pro, fix13 to fix50, Proton Experimental, default DroidDeck settings unless noted. Add a row
 for each game you try; "Playable" means a full session without crashes or rendering faults.
 
 | Game | Install | Status | FPS | Notes |
@@ -26,8 +26,8 @@ whether the game is on internal storage or the SD card, and the frame-generation
 - **Ys Origin:** before/after screenshots of the white room, LSFG and Win-FG are in [FIXES.md](FIXES.md#screenshots).
 - **Ys I & II Chronicles+:** set its FEX preset to **Performance** (TSO off) for full-speed dialog scenes.
 - **Tales of Symphonia:** needs fix44 or later to start, fix49 for full speed. The game locks its main thread to
-  "CPU 0", a slow Cortex-A55 on this chip; fix49 numbers the cores fast-first for it (`WINE_CPU_TOPOLOGY`), by
-  itself. Best: Retroid **Performance** mode (the middle one) with **LSFG 2x**, about 60 fps on screen.
+  "CPU 0", a slow Cortex-A55 on this chip; DroidDeck numbers the cores fast-first (`WINE_CPU_TOPOLOGY`), by
+  itself: for this game in fix49, for every game since fix50. Best: Retroid **Performance** mode (the middle one) with **LSFG 2x**, about 60 fps on screen.
 - **Ys: The Oath in Felghana:** needs fix45 or later for the DirectX 9 version; DroidDeck sets it up by itself.
   Before/after screenshots are in the [CHANGELOG](CHANGELOG.md#fix45-ys-the-oath-in-felghana-draws-its-world).
 - **Ys VI: The Ark of Napishtim:** Steam's launch menu offers four entries; "Play Ys VI" is the DirectX 9 game.
