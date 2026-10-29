@@ -1,0 +1,40 @@
+{
+ "schema": 1,
+ "version": 1,
+ "about": "Settings MaliBridge applies to a Steam game by itself (KnownGames.kt). Keyed by Steam app id; each entry may carry a 'when' (gpu: deviceName substrings, any of them; driverMin/driverMax: Mali driver release like r32p1, inclusive; vulkanBelow/vulkanAtLeast: the Vulkan games see; bridge: only in Mali bridge sessions). Fields: tool (proton-experimental-arm64, proton-11-arm64), dxvk (a version on the Nightlies, e.g. 1.10.3), fexPreset (a FEX preset id), env (KEY: VALUE for the game), bridge (VKBRIDGE_ KEY: VALUE, written to <bridge cache dir>/presets/<appid>.env). Only entries with evidence; 'source' says what it is based on. Titles with no entry follow the default tool.",
+ "defaultTool": "proton-experimental-arm64",
+ "games": {
+  "322330": [
+   {
+    "name": "Don't Starve Together",
+    "when": {"bridge": true},
+    "env": {"PROTON_USE_WINED3D": "1"},
+    "source": "Tested on a Galaxy Tab S11 Ultra (Mali-G925): the default path closes a few seconds after start; WineD3D plays at 60 fps."
+   }
+  ],
+  "220": [
+   {
+    "name": "Half-Life 2",
+    "when": {"bridge": true, "vulkanBelow": "1.3"},
+    "dxvk": "1.10.3",
+    "source": "Player report, OnePlus phone (Mali-G710, Vulkan 1.1): starts with DXVK 1.10.3; Proton's own DXVK needs Vulkan 1.3."
+   }
+  ],
+  "294100": [
+   {
+    "name": "RimWorld",
+    "when": {"bridge": true, "vulkanBelow": "1.3"},
+    "dxvk": "1.10.3",
+    "source": "Player report, OnePlus Ace 2V (Mali-G710, Vulkan 1.1): plays with DXVK 1.10.3; Proton's own DXVK needs Vulkan 1.3."
+   }
+  ],
+  "560430": [
+   {
+    "name": "Indiana Jones and the Emperor's Tomb",
+    "when": {"bridge": true},
+    "fexPreset": "STABILITY",
+    "source": "Player report, POCO X8 Pro (Mali-G720 MC8): the faster CPU presets stop it at start; Stability runs about 30 fps."
+   }
+  ]
+ }
+}

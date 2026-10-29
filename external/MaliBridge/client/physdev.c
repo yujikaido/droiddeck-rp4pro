@@ -1,0 +1,829 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
+ *
+ * Physical device queries: what the app sees is the server's GPU, with the bridge's memory
+ * model, its extension list and the features the server emulates.
+ */
+#define _GNU_SOURCE
+#include "vkb_client.h"
+#include "gen/vkb_client_gen.h"
+#include "emu.h"
+#include "vkb_ext_alias.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+const char *const *vkb_client_device_exts(uint32_t *n);
+
+/* ------------------------------------------------------------------ what the app is shown */
+
+/*
+ * Two per-game values that change only what the app sees, never what the bridge does with the GPU
+ * (the server keeps the real heaps and the real identity for its Mali detection, errata and
+ * probe). Each comes from the guest's environment, else from the server (vkbQueryServer's
+ * heap_max_mb and spoof_gpu: the game's preset file, <cache dir>/env, the server's environment,
+ * the game's built-in preset); both are off by default.
+ *
+ * VKBRIDGE_HEAP_MAX_MB=<n>: every device-local heap is reported at most n MB, and its
+ * VK_EXT_memory_budget budget at most that too. On a unified-memory GPU the one heap is about all
+ * of RAM, so DXVK sizes its budget, and the "dedicated video memory" games read from DXGI, as if
+ * the game had all of it; 4096 is what most good Mali runs in GameNative's crowd configs use (its
+ * WRAPPER_VMEM_MAX_SIZE; the idea only, this is our own code). 0: off.
+ *
+ * VKBRIDGE_SPOOF_GPU=nvidia|amd: the app is shown a desktop GPU's vendorID, deviceID and
+ * deviceName (GameNative shows a GeForce by default; again the idea only). driverID, driverName,
+ * driverVersion, deviceType, the UUIDs and the limits stay the real GPU's: DXVK picks its tiler
+ * paths and driver workarounds by driverID (ARM_PROPRIETARY), and keeping them is the point. The
+ * risks are in the README (vkd3d-proton picks code generation by vendorID). off/0: off.
+ */
+struct spoof_gpu {
+    uint32_t vendor, device;
+    const char *name;
+};
+static const struct spoof_gpu spoof_gpus[] = {
+    [VKB_SPOOF_NVIDIA] = {0x10de, 0x1c03, "NVIDIA GeForce GTX 1060 6GB"},
+    [VKB_SPOOF_AMD] = {0x1002, 0x67df, "AMD Radeon RX 480 Graphics"},
+};
+
+/* VKB_SPOOF_* or 0 (off); *from: where it came from */
+static uint32_t spoof_choice(const vkb_physdev *pd, const char **from)
+{
+    const char *e = getenv("VKBRIDGE_SPOOF_GPU");
+    *from = "the guest's VKBRIDGE_SPOOF_GPU";
+    if (e && *e) {
+        if (!strcmp(e, "nvidia")) return VKB_SPOOF_NVIDIA;
+        if (!strcmp(e, "amd")) return VKB_SPOOF_AMD;
+        if (strcmp(e, "0") && strcmp(e, "off")) VKB_ONCE(VKB_LOG_WARN, "VKBRIDGE_SPOOF_GPU=%s is not nvidia, amd or off; the real GPU is shown", e);
+        return 0;
+    }
+    *from = "the server's VKBRIDGE_SPOOF_GPU (the game's preset or <cache dir>/env)";
+    uint32_t v = pd->info.spoof_gpu;
+    return v == VKB_SPOOF_NVIDIA || v == VKB_SPOOF_AMD ? v : 0;
+}
+
+/* The cap in bytes, or 0 (off); *from: where it came from */
+static VkDeviceSize heap_cap(const vkb_physdev *pd, const char **from)
+{
+    const char *e = getenv("VKBRIDGE_HEAP_MAX_MB");
+    if (e && *e) {
+        *from = "the guest's VKBRIDGE_HEAP_MAX_MB";
+        char *end;
+        unsigned long long mb = strtoull(e, &end, 10);
+        if (*end || *e == '-') {
+            VKB_ONCE(VKB_LOG_WARN, "VKBRIDGE_HEAP_MAX_MB=%s is not a number of MB; heaps reported as they are", e);
+            return 0;
+        }
+        return (VkDeviceSize)mb << 20;
+    }
+    *from = "the server's VKBRIDGE_HEAP_MAX_MB (the game's preset or <cache dir>/env)";
+    return (VkDeviceSize)pd->info.heap_max_mb << 20;
+}
+
+static void cap_heaps(vkb_physdev *pd)
+{
+    const char *from;
+    VkDeviceSize cap = heap_cap(pd, &from);
+    if (!cap) return;
+    VkPhysicalDeviceMemoryProperties *c = &pd->client_mem;
+    for (uint32_t h = 0; h < c->memoryHeapCount; h++) {
+        if (!(c->memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) || c->memoryHeaps[h].size <= cap) continue;
+        VKB_INFO("memory: device-local heap %u reported as %llu MB, not %llu MB (%s)", h, (unsigned long long)(cap >> 20),
+                 (unsigned long long)(c->memoryHeaps[h].size >> 20), from);
+        c->memoryHeaps[h].size = cap;
+    }
+}
+
+/* ------------------------------------------------------------------ memory model */
+
+/*
+ * Images and GPU-only buffers live in memory the client never maps; host-visible memory must be
+ * shared pages (server_memory.c), which only buffers (and the rare linear image) can use. So the
+ * app gets a discrete-GPU-like view: device-local types without host access, and host-visible
+ * types (shared) that only resources able to use them list in their memoryTypeBits.
+ */
+static void build_memory_model(vkb_physdev *pd)
+{
+    const VkPhysicalDeviceMemoryProperties *s = &pd->server_mem;
+    VkPhysicalDeviceMemoryProperties *c = &pd->client_mem;
+    memset(c, 0, sizeof(*c));
+    uint32_t share = pd->info.strategy != VKB_MEM_NONE ? pd->info.shareable_types : 0;
+    int pure_dl = -1;
+    for (uint32_t t = 0; t < s->memoryTypeCount; t++) {
+        VkMemoryPropertyFlags f = s->memoryTypes[t].propertyFlags;
+        /* Lazily allocated memory is for transient attachments only (Mali's one device-local
+         * type without host access is that): it is not the device's ordinary memory. */
+        if ((f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) && !(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
+            !(f & (VK_MEMORY_PROPERTY_PROTECTED_BIT | VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT))) {
+            pure_dl = (int)t;
+            break;
+        }
+    }
+    /* A driver whose one plain device-local type is not one images allow is taken as one without
+     * such a type: the device-local type the client offers is backed by one images do allow (the
+     * XRing O1's Mali-G925, r49p1: type 0 is 0x1, but images and buffers allow types 1 and 2 only,
+     * so every image's mask came out empty and gamescope could not start, issues #6 and #8). */
+    int uma = pure_dl < 0 || (pd->info.image_types && !(pd->info.image_types & (1u << pure_dl)));
+    if (pure_dl >= 0 && uma)
+        VKB_INFO("memory: images do not allow the plain device-local type %d (they allow 0x%x): device-local types backed by those",
+                 pure_dl, pd->info.image_types);
+    /* Heaps: the server's, plus (UMA) a host heap for shared types so they are not "device local". */
+    for (uint32_t h = 0; h < s->memoryHeapCount; h++) {
+        c->memoryHeaps[h] = s->memoryHeaps[h];
+        pd->heap_map[h] = h;
+    }
+    c->memoryHeapCount = s->memoryHeapCount;
+    uint32_t host_heap = UINT32_MAX;
+
+    struct cand {
+        VkMemoryPropertyFlags flags;
+        uint32_t heap, server;
+        uint8_t shared, cached;
+    } cands[VK_MAX_MEMORY_TYPES * 2];
+    uint32_t nc = 0;
+    if (uma) {
+        /* A device-local type with no host access, backed by the first ordinary device-local type
+         * that images allow (the server's self-test tried some: image_types). Not simply the first
+         * device-local type: Mali-G2-Ultra's images (XRing O3, driver 56, 22 memory types) do not
+         * list that one, and every image's mask came out empty (issue #1). A server too old to say
+         * sends 0: the first device-local type, as before. */
+        for (int pass = pd->info.image_types ? 0 : 1; pass < 2 && !nc; pass++)
+            for (uint32_t t = 0; t < s->memoryTypeCount; t++) {
+                VkMemoryPropertyFlags f = s->memoryTypes[t].propertyFlags;
+                if (pass == 0 && !(pd->info.image_types & (1u << t))) continue;
+                if ((f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
+                    !(f & (VK_MEMORY_PROPERTY_PROTECTED_BIT | VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT))) {
+                    cands[nc++] = (struct cand){VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, s->memoryTypes[t].heapIndex, t, 0, 0};
+                    VKB_INFO("memory: device-local type backed by server type %u (flags 0x%x; images allow 0x%x%s)", t, f,
+                             pd->info.image_types, pass ? ", not known: the first device-local type" : "");
+                    break;
+                }
+            }
+        /* Resources that do not all allow that one (the server's dl_types; the XRing O3's buffers
+         * allow 0x3 only, its images type 6: every buffer's mask came out without a device-local
+         * type): one more such type for each other backing they need, at most 4 in all. */
+        uint32_t more = nc ? pd->info.dl_types & ~(1u << cands[0].server) : 0;
+        for (uint32_t t = 0; more && t < s->memoryTypeCount && nc < 4; t++) {
+            if (!(more & (1u << t))) continue;
+            cands[nc++] = (struct cand){VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, s->memoryTypes[t].heapIndex, t, 0, 0};
+            VKB_INFO("memory: device-local type also backed by server type %u (flags 0x%x; resources need types 0x%x)", t,
+                     s->memoryTypes[t].propertyFlags, pd->info.dl_types);
+        }
+    }
+    /* With dl_types the server's resources disagree on types: every shareable type is offered,
+     * also one with the flags of another (a buffer may allow the one and not the other). */
+    int keep_dups = uma && pd->info.dl_types;
+    for (uint32_t t = 0; t < s->memoryTypeCount && nc < VK_MAX_MEMORY_TYPES; t++) {
+        VkMemoryPropertyFlags f = s->memoryTypes[t].propertyFlags;
+        uint32_t heap = s->memoryTypes[t].heapIndex;
+        if (!(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
+            cands[nc++] = (struct cand){f, heap, t, 0, 0};
+            continue;
+        }
+        if (!(share & (1u << t))) continue; /* host-visible but not shareable: not offered */
+        VkMemoryPropertyFlags cf = f;
+        if (!(pd->info.coherent_types & (1u << t))) cf &= ~VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        else cf |= VK_MEMORY_PROPERTY_HOST_COHERENT_BIT; /* coherent in practice (the self-test says so) */
+        /* dma-heap pages come from the uncached heap, so CPU reads are slow - but the type keeps
+         * HOST_CACHED: gamescope (and others) require a cached host-visible type to start at all. */
+        /* On a unified-memory GPU the shared pages are device memory too, and keep saying so:
+         * gamescope's upload buffer insists on DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT (Mali,
+         * tablet run 4). Images never land there - their requirements leave shared types out. */
+        (void)host_heap;
+        /* Two client types with identical flags on one heap are pointless: keep the first. */
+        int dup = 0;
+        for (uint32_t i = 0; i < nc && !keep_dups; i++) dup |= cands[i].flags == cf && cands[i].heap == heap;
+        if (!dup) cands[nc++] = (struct cand){cf, heap, t, 1, 0};
+    }
+    /* Cached readback for apps (VKB_CACHED_APPS, server_memory.c): a HOST_CACHED type without
+     * HOST_COHERENT whose pages the CPU caches; apps flush and invalidate it as the spec says. A
+     * shared type that already has those flags (one that needs flushes) becomes that type. */
+    uint32_t cached = pd->info.strategy != VKB_MEM_NONE ? pd->info.cached_types & share : 0;
+    if (pd->info.cached_flags & VKB_CACHED_APPS) {
+        for (uint32_t t = 0; t < s->memoryTypeCount && nc < VK_MAX_MEMORY_TYPES; t++) {
+            if (!(cached & (1u << t))) continue;
+            VkMemoryPropertyFlags cf = (s->memoryTypes[t].propertyFlags | VK_MEMORY_PROPERTY_HOST_CACHED_BIT) & ~VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+            uint32_t heap = s->memoryTypes[t].heapIndex;
+            int dup = 0;
+            for (uint32_t i = 0; i < nc; i++)
+                if (cands[i].flags == cf && cands[i].heap == heap && cands[i].shared) {
+                    cands[i].server = t;
+                    cands[i].cached = dup = 1;
+                }
+            if (!dup) cands[nc++] = (struct cand){cf, heap, t, 1, 1};
+        }
+    }
+    /* The client's own frame readback (VKB_CACHED_WSI, client/wsi.c): the first such type, not
+     * offered to apps. VKBRIDGE_CACHED_READBACK=0 in the guest turns it off here. */
+    const char *cr = getenv("VKBRIDGE_CACHED_READBACK");
+    pd->readback_type = (pd->info.cached_flags & VKB_CACHED_WSI) && cached && !(cr && *cr == '0') ? __builtin_ctz(cached) : -1;
+    if (pd->readback_type >= 0 || (pd->info.cached_flags & VKB_CACHED_APPS))
+        VKB_INFO("cached readback: server types 0x%x; frame readback in server type %d%s", cached, pd->readback_type,
+                 pd->info.cached_flags & VKB_CACHED_APPS ? "; offered to apps" : "");
+    /* Order: fewer property bits first, which satisfies the spec's subset ordering. */
+    for (uint32_t i = 1; i < nc; i++) {
+        struct cand x = cands[i];
+        uint32_t j = i;
+        while (j > 0 && __builtin_popcount(cands[j - 1].flags) > __builtin_popcount(x.flags)) {
+            cands[j] = cands[j - 1];
+            j--;
+        }
+        cands[j] = x;
+    }
+    if (nc > VK_MAX_MEMORY_TYPES) nc = VK_MAX_MEMORY_TYPES;
+    /* VKBRIDGE_DL_MEMTYPE=<server type>: the device-local type without host access (where images
+     * and GPU-only buffers go) is backed by that server type instead - e.g. the DL|HV|HC type a
+     * native app's images land in on Mali, to compare (gpubench). Must be a type the resources'
+     * requirements allow on the server, or binding fails. */
+    const char *force = getenv("VKBRIDGE_DL_MEMTYPE");
+    if (force && *force) {
+        uint32_t ft = (uint32_t)strtoul(force, NULL, 0);
+        for (uint32_t i = 0; i < nc && ft < s->memoryTypeCount; i++) {
+            if (cands[i].shared || cands[i].flags != VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) continue;
+            VKB_INFO("VKBRIDGE_DL_MEMTYPE: device-local type %u backed by server type %u (flags 0x%x) instead of %u (flags 0x%x)", i, ft,
+                     s->memoryTypes[ft].propertyFlags, cands[i].server, s->memoryTypes[cands[i].server].propertyFlags);
+            cands[i].server = ft;
+            cands[i].heap = s->memoryTypes[ft].heapIndex;
+            break;
+        }
+    }
+    c->memoryTypeCount = nc;
+    for (uint32_t i = 0; i < nc; i++) {
+        c->memoryTypes[i].propertyFlags = cands[i].flags;
+        c->memoryTypes[i].heapIndex = cands[i].heap;
+        pd->type_map[i].server_type = cands[i].server;
+        pd->type_map[i].shared = cands[i].shared;
+        pd->type_map[i].cached = cands[i].cached;
+    }
+    /* Images and GPU-only buffers need a device-local type without host access backed by ordinary
+     * memory: without one (a client that took Mali's lazily allocated type for it), every image
+     * allocation fails with VK_ERROR_OUT_OF_DEVICE_MEMORY. */
+    int ordinary = 0;
+    for (uint32_t i = 0; i < nc; i++) {
+        VkMemoryPropertyFlags sf = s->memoryTypes[cands[i].server].propertyFlags;
+        if (!cands[i].shared && (cands[i].flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
+            !(sf & (VK_MEMORY_PROPERTY_PROTECTED_BIT | VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT)))
+            ordinary = 1;
+    }
+    if (!ordinary) {
+        char line[256];
+        int n = 0;
+        for (uint32_t i = 0; i < s->memoryTypeCount && n < (int)sizeof(line) - 24; i++)
+            n += snprintf(line + n, sizeof(line) - (size_t)n, " %u:0x%x", i, s->memoryTypes[i].propertyFlags);
+        VKB_ONCE(VKB_LOG_WARN, "memory: no ordinary device-local type for images (server types%s); image allocations will fail", line);
+    }
+    for (uint32_t i = 0; i < s->memoryTypeCount; i++)
+        VKB_DBG("server memory type %u: flags 0x%x heap %u", i, s->memoryTypes[i].propertyFlags, s->memoryTypes[i].heapIndex);
+    for (uint32_t i = 0; i < nc; i++)
+        VKB_DBG("memory type %u: flags 0x%x heap %u -> server type %u%s", i, c->memoryTypes[i].propertyFlags,
+                c->memoryTypes[i].heapIndex, pd->type_map[i].server_type, pd->type_map[i].shared ? " (shared)" : "");
+    cap_heaps(pd);
+}
+
+uint32_t vkb_mem_bits_to_client(vkb_physdev *pd, uint32_t server_bits, int allow_shared)
+{
+    uint32_t bits = 0;
+    for (uint32_t i = 0; i < pd->client_mem.memoryTypeCount; i++) {
+        if (!(server_bits & (1u << pd->type_map[i].server_type))) continue;
+        if (pd->type_map[i].shared && !allow_shared) continue;
+        bits |= 1u << i;
+    }
+    if (!bits && server_bits) {
+        /* Nothing left for the resource: say what the driver allowed and what the client maps. */
+        char line[320];
+        int n = 0;
+        for (uint32_t i = 0; i < pd->client_mem.memoryTypeCount && n < (int)sizeof(line) - 24; i++)
+            n += snprintf(line + n, sizeof(line) - (size_t)n, " %u:0x%x/s%u%s", i, pd->client_mem.memoryTypes[i].propertyFlags,
+                          pd->type_map[i].server_type, pd->type_map[i].shared ? "S" : "");
+        VKB_ONCE(VKB_LOG_WARN, "memory: a resource allowing server types 0x%x gets no client type (%s; client types%s)", server_bits,
+                 allow_shared ? "shared allowed" : "not shareable", line);
+    }
+    return bits;
+}
+
+/*
+ * A buffer's types. The spec promises a host-visible coherent type to every buffer that is not
+ * sparse, and the client's host-visible types are its shared ones only. On a unified-memory Mali
+ * the driver's device-local types are host-visible too (0x7, 0xb), and the client offers them
+ * without host access (dl_types: one per backing resources need). Where a buffer's mask holds
+ * host-visible types but none the shared pages are made in, it got no type an app can map: the
+ * XRing O3 (driver 56, issue #1) puts dma-heap pages in type 14 only, while its indirect buffers
+ * allow 0x1040 and gamescope's upload buffer 0x3 ("no memory type for the buffer (types 0x1
+ * allowed)", gamescope's "findMemoryType failed"). Such a buffer is offered the shared types as
+ * well: memory the driver could map anyway, in another of its host-visible types, which the
+ * driver binds it to (the tester's runs on that phone). A buffer whose mask has no host-visible
+ * type (GPU-only) is left as it is, and so is one that already has a shared type (G720, G925:
+ * buffers allow 0x3, the shared type is backed by type 1). A buffer that is not shareable (made
+ * without the bridge's handle types: no sharing strategy, sparse, or the driver refused) cannot
+ * take shared pages: nothing to offer, said once.
+ */
+uint32_t vkb_mem_buffer_bits_to_client(vkb_physdev *pd, uint32_t server_bits, int allow_shared)
+{
+    uint32_t bits = vkb_mem_bits_to_client(pd, server_bits, allow_shared);
+    const VkPhysicalDeviceMemoryProperties *s = &pd->server_mem;
+    uint32_t hv = 0;
+    for (uint32_t t = 0; t < s->memoryTypeCount; t++)
+        if ((server_bits & (1u << t)) && (s->memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) hv |= 1u << t;
+    if (!hv) return bits;
+    uint32_t mappable = 0, shared = 0;
+    for (uint32_t i = 0; i < pd->client_mem.memoryTypeCount; i++) {
+        if (pd->type_map[i].shared) shared |= 1u << i;
+        if ((bits & (1u << i)) && (pd->client_mem.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) mappable |= 1u << i;
+    }
+    if (mappable) return bits;
+    if (!allow_shared || !shared) {
+        VKB_ONCE(VKB_LOG_WARN, "memory: a buffer allowing server types 0x%x (host-visible 0x%x) has no type an app can map: %s (logged once)",
+                 server_bits, hv, !shared ? "the client has no shared type" : "the buffer is not shareable");
+        return bits;
+    }
+    static int told;
+    if (__atomic_fetch_add(&told, 1, __ATOMIC_RELAXED) < 4)
+        VKB_INFO("memory: a buffer allowing server types 0x%x (host-visible 0x%x, none shared) also gets the shared types 0x%x (client 0x%x)",
+                 server_bits, hv, shared, bits | shared);
+    return bits | shared;
+}
+
+/* ------------------------------------------------------------------ setup */
+
+/* The render node the session presents for this GPU (VKBRIDGE_DRM_RENDER="major:minor"). */
+static int drm_node(int64_t *major, int64_t *minor)
+{
+    const char *v = getenv("VKBRIDGE_DRM_RENDER");
+    long long a, b;
+    if (!v || sscanf(v, "%lld:%lld", &a, &b) != 2) return 0;
+    if (major) *major = a;
+    if (minor) *minor = b;
+    return 1;
+}
+
+/* VKBRIDGE_HIDE_EXTS=a,b,c: pretend the GPU lacks these (testing; imitating another driver). */
+static int hidden_ext(const char *name)
+{
+    const char *h = getenv("VKBRIDGE_HIDE_EXTS");
+    if (!h) return 0;
+    size_t n = strlen(name);
+    for (const char *p = h; (p = strstr(p, name)); p += n)
+        if ((p == h || p[-1] == ',') && (p[n] == ',' || p[n] == 0)) return 1;
+    return 0;
+}
+
+static int bridged_device_ext_for(vkb_physdev *pd, const char *name)
+{
+    /* Clip distance emulation rewrites the vertex and fragment shaders together, at pipeline
+     * creation: pipeline libraries and shader identifiers would split them. */
+    if ((pd->info.emu & VKB_EMU_CLIP_DISTANCE) &&
+        (!strcmp(name, "VK_EXT_graphics_pipeline_library") || !strcmp(name, "VK_EXT_shader_module_identifier")))
+        return 0;
+    return 1;
+}
+
+static int bridged_device_ext(const char *name)
+{
+    if (hidden_ext(name)) return 0;
+    /* The server GPU's DRM node means nothing on this side: the session's stand-in node is
+     * reported instead (drm_node), or the extension is hidden. VKBRIDGE_PASS_DRM=1 passes the
+     * server's through (host tests, where both sides share one machine). */
+    if (!strcmp(name, "VK_EXT_physical_device_drm")) return getenv("VKBRIDGE_PASS_DRM") && !getenv("VKBRIDGE_DRM_RENDER");
+    for (int i = 0; i < VKB_EXT_COUNT; i++)
+        if (vkb_exts[i].device && !vkb_exts[i].client && !strcmp(vkb_exts[i].name, name)) return 1;
+    return 0;
+}
+
+int vkb_physdev_ready(vkb_physdev *pd)
+{
+    if (pd->ready) return pd->ready > 0;
+    pthread_mutex_lock(&pd->lock);
+    if (pd->ready) {
+        pthread_mutex_unlock(&pd->lock);
+        return pd->ready > 0;
+    }
+    vkb_call c;
+    vkb_call_begin(&c, VKB_CMD_vkbQueryServer, pd->obj.table);
+    vkb_enc_u64(&c.e, pd->obj.remote);
+    if (!vkb_call_exec(&c)) {
+        pd->ready = -1;
+        pthread_mutex_unlock(&pd->lock);
+        return 0;
+    }
+    vkb_dec_raw_tail(&c.d, &pd->info, sizeof(pd->info)); /* an older server's is shorter (no dl_types) */
+    vkb_call_end(&c);
+    vkb_client_knobs_set(pd->info.client_knobs);
+    vkb_wire_vkGetPhysicalDeviceProperties((VkPhysicalDevice)pd, &pd->props);
+    vkb_wire_vkGetPhysicalDeviceMemoryProperties((VkPhysicalDevice)pd, &pd->server_mem);
+    build_memory_model(pd);
+
+    uint32_t n = 0;
+    vkb_wire_vkEnumerateDeviceExtensionProperties((VkPhysicalDevice)pd, NULL, &n, NULL);
+    VkExtensionProperties *srv = calloc(n + 1, sizeof(*srv));
+    vkb_wire_vkEnumerateDeviceExtensionProperties((VkPhysicalDevice)pd, NULL, &n, srv);
+    uint32_t ncl = 0;
+    const char *const *cl = vkb_client_device_exts(&ncl);
+    uint32_t nemu = 0;
+    const VkExtensionProperties *emu = vkb_emu_extensions(pd, &nemu);
+    pd->exts = calloc(n + ncl + nemu + VKB_EXT_ALIAS_COUNT + 2, sizeof(VkExtensionProperties));
+    pd->next = 0;
+    for (uint32_t i = 0; i < n; i++)
+        if (bridged_device_ext(srv[i].extensionName) && bridged_device_ext_for(pd, srv[i].extensionName)) pd->exts[pd->next++] = srv[i];
+    for (uint32_t i = 0; i < nemu; i++) {
+        int dup = 0;
+        for (uint32_t j = 0; j < pd->next; j++) dup |= !strcmp(pd->exts[j].extensionName, emu[i].extensionName);
+        if (!dup) pd->exts[pd->next++] = emu[i];
+    }
+    /* EXT names the driver has only as KHR ones (vkb_ext_alias.h). */
+    pd->aliased = 0;
+    for (uint32_t i = 0; i < VKB_EXT_ALIAS_COUNT; i++) {
+        int have_app = 0, have_driver = 0;
+        for (uint32_t j = 0; j < pd->next; j++) {
+            have_app |= !strcmp(pd->exts[j].extensionName, vkb_ext_aliases[i].app);
+            have_driver |= !strcmp(pd->exts[j].extensionName, vkb_ext_aliases[i].driver);
+        }
+        if (have_app || !have_driver) continue;
+        VkExtensionProperties *e = &pd->exts[pd->next++];
+        snprintf(e->extensionName, sizeof(e->extensionName), "%s", vkb_ext_aliases[i].app);
+        e->specVersion = vkb_ext_aliases[i].spec;
+        pd->aliased |= 1u << i;
+        VKB_INFO("%s: offered as an alias of %s", vkb_ext_aliases[i].app, vkb_ext_aliases[i].driver);
+    }
+    if (drm_node(NULL, NULL)) {
+        VkExtensionProperties *e = &pd->exts[pd->next++];
+        snprintf(e->extensionName, sizeof(e->extensionName), "VK_EXT_physical_device_drm");
+        e->specVersion = 1;
+    }
+    for (uint32_t i = 0; i < ncl; i++) {
+        int dup = 0;
+        for (uint32_t j = 0; j < pd->next; j++) dup |= !strcmp(pd->exts[j].extensionName, cl[i]);
+        if (dup) continue;
+        /* Placed mappings move the client's own mapping of shared memory (memory.c). */
+        if ((!strcmp(cl[i], "VK_EXT_map_memory_placed") || !strcmp(cl[i], "VK_KHR_map_memory2")) && pd->info.strategy == VKB_MEM_NONE)
+            continue;
+        VkExtensionProperties *e = &pd->exts[pd->next++];
+        snprintf(e->extensionName, sizeof(e->extensionName), "%s", cl[i]);
+        e->specVersion = !strcmp(cl[i], "VK_KHR_swapchain") ? 70 : !strcmp(cl[i], "VK_KHR_incremental_present") ? 2 : 1;
+    }
+    free(srv);
+    VKB_INFO("%s: %u extensions offered, memory sharing %s, emulation 0x%x", pd->props.deviceName, pd->next,
+             vkb_mem_strategy_name(pd->info.strategy), pd->info.emu);
+    pd->ready = 1;
+    pthread_mutex_unlock(&pd->lock);
+    return 1;
+}
+
+/* ------------------------------------------------------------------ properties */
+
+uint32_t vkb_max_api(void)
+{
+    /* VKBRIDGE_MAX_API=1.3 imitates an older driver (testing). */
+    const char *v = getenv("VKBRIDGE_MAX_API");
+    unsigned ma, mi;
+    if (v && sscanf(v, "%u.%u", &ma, &mi) == 2) return VK_MAKE_API_VERSION(0, ma, mi, 0xfff);
+    return VKB_API_VERSION;
+}
+
+static void patch_props(vkb_physdev *pd, VkPhysicalDeviceProperties *p)
+{
+    if (p->apiVersion > vkb_max_api()) p->apiVersion = vkb_max_api();
+    const char *from;
+    uint32_t sp = vkb_physdev_ready(pd) ? spoof_choice(pd, &from) : 0;
+    if (!sp) return;
+    const struct spoof_gpu *g = &spoof_gpus[sp];
+    VKB_ONCE(VKB_LOG_INFO, "GPU shown to the app as %s (vendor 0x%04x, device 0x%04x), not %s (vendor 0x%04x, device 0x%04x; %s)", g->name,
+             g->vendor, g->device, pd->props.deviceName, pd->props.vendorID, pd->props.deviceID, from);
+    p->vendorID = g->vendor;
+    p->deviceID = g->device;
+    snprintf(p->deviceName, sizeof(p->deviceName), "%s", g->name);
+}
+
+VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetPhysicalDeviceProperties(VkPhysicalDevice physicalDevice, VkPhysicalDeviceProperties *pProperties)
+{
+    vkb_physdev *pd = vkb_pd(physicalDevice);
+    if (vkb_physdev_ready(pd)) *pProperties = pd->props;
+    else vkb_wire_vkGetPhysicalDeviceProperties(physicalDevice, pProperties);
+    patch_props(pd, pProperties);
+    vkb_emu_patch_limits(pd, pProperties);
+}
+
+VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice, VkPhysicalDeviceProperties2 *pProperties)
+{
+    vkb_physdev *pd = vkb_pd(physicalDevice);
+    vkb_wire_vkGetPhysicalDeviceProperties2(physicalDevice, pProperties);
+    patch_props(pd, &pProperties->properties);
+    vkb_emu_patch_limits(pd, &pProperties->properties);
+    for (VkBaseOutStructure *b = (VkBaseOutStructure *)pProperties->pNext; b; b = b->pNext) {
+        if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES) {
+            VkPhysicalDeviceDriverProperties *d = (VkPhysicalDeviceDriverProperties *)b;
+            size_t l = strlen(d->driverInfo);
+            if (l + 12 < sizeof(d->driverInfo)) strcat(d->driverInfo, " (vkbridge)");
+        }
+        if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT) {
+            VkPhysicalDeviceDrmPropertiesEXT *d = (VkPhysicalDeviceDrmPropertiesEXT *)b;
+            int64_t ma, mi;
+            if (drm_node(&ma, &mi)) {
+                /* gamescope insists on a primary node; the stand-in serves as both, as with
+                 * KGSL on an Adreno. */
+                d->hasPrimary = VK_TRUE;
+                d->primaryMajor = ma;
+                d->primaryMinor = mi;
+                d->hasRender = VK_TRUE;
+                d->renderMajor = ma;
+                d->renderMinor = mi;
+            }
+        }
+        vkb_emu_patch_properties_chain(pd, b);
+    }
+}
+
+VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetPhysicalDeviceFeatures(VkPhysicalDevice physicalDevice, VkPhysicalDeviceFeatures *pFeatures)
+{
+    vkb_wire_vkGetPhysicalDeviceFeatures(physicalDevice, pFeatures);
+    vkb_emu_patch_features(vkb_pd(physicalDevice), pFeatures);
+}
+
+VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetPhysicalDeviceFeatures2(VkPhysicalDevice physicalDevice, VkPhysicalDeviceFeatures2 *pFeatures)
+{
+    vkb_wire_vkGetPhysicalDeviceFeatures2(physicalDevice, pFeatures);
+    vkb_emu_patch_features(vkb_pd(physicalDevice), &pFeatures->features);
+    for (VkBaseOutStructure *b = (VkBaseOutStructure *)pFeatures->pNext; b; b = b->pNext)
+        vkb_emu_patch_features_chain(vkb_pd(physicalDevice), b);
+}
+
+VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetPhysicalDeviceMemoryProperties(VkPhysicalDevice physicalDevice,
+                                                                      VkPhysicalDeviceMemoryProperties *pMemoryProperties)
+{
+    vkb_physdev *pd = vkb_pd(physicalDevice);
+    if (!vkb_physdev_ready(pd)) {
+        memset(pMemoryProperties, 0, sizeof(*pMemoryProperties));
+        return;
+    }
+    *pMemoryProperties = pd->client_mem;
+}
+
+VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetPhysicalDeviceMemoryProperties2(VkPhysicalDevice physicalDevice,
+                                                                       VkPhysicalDeviceMemoryProperties2 *pMemoryProperties)
+{
+    vkb_physdev *pd = vkb_pd(physicalDevice);
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT *budget = NULL;
+    for (VkBaseOutStructure *b = (VkBaseOutStructure *)pMemoryProperties->pNext; b; b = b->pNext)
+        if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT) budget = (void *)b;
+    vkb_wire_vkGetPhysicalDeviceMemoryProperties2(physicalDevice, pMemoryProperties);
+    if (!vkb_physdev_ready(pd)) return;
+    pMemoryProperties->memoryProperties = pd->client_mem;
+    if (budget) {
+        VkDeviceSize b[VK_MAX_MEMORY_HEAPS], u[VK_MAX_MEMORY_HEAPS];
+        memcpy(b, budget->heapBudget, sizeof(b));
+        memcpy(u, budget->heapUsage, sizeof(u));
+        memset(budget->heapBudget, 0, sizeof(budget->heapBudget));
+        memset(budget->heapUsage, 0, sizeof(budget->heapUsage));
+        for (uint32_t h = 0; h < pd->client_mem.memoryHeapCount; h++) {
+            budget->heapBudget[h] = b[pd->heap_map[h]];
+            budget->heapUsage[h] = u[pd->heap_map[h]];
+            /* never more than the heap the app is shown (VKBRIDGE_HEAP_MAX_MB); the usage stays
+             * the real one, so over the cap reads as over budget */
+            if (budget->heapBudget[h] > pd->client_mem.memoryHeaps[h].size) budget->heapBudget[h] = pd->client_mem.memoryHeaps[h].size;
+        }
+    }
+}
+
+VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetPhysicalDeviceQueueFamilyProperties(VkPhysicalDevice physicalDevice, uint32_t *pCount,
+                                                                           VkQueueFamilyProperties *pProps)
+{
+    vkb_wire_vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, pCount, pProps);
+}
+
+VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetPhysicalDeviceQueueFamilyProperties2(VkPhysicalDevice physicalDevice, uint32_t *pCount,
+                                                                            VkQueueFamilyProperties2 *pProps)
+{
+    vkb_wire_vkGetPhysicalDeviceQueueFamilyProperties2(physicalDevice, pCount, pProps);
+}
+
+VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetPhysicalDeviceFormatProperties(VkPhysicalDevice physicalDevice, VkFormat format,
+                                                                      VkFormatProperties *pFormatProperties)
+{
+    if (vkb_emu_format_properties(vkb_pd(physicalDevice), format, pFormatProperties, NULL)) return;
+    vkb_wire_vkGetPhysicalDeviceFormatProperties(physicalDevice, format, pFormatProperties);
+}
+
+/* Format answers never change: DXVK asked ~900 times a second in Deep Rock Galactic, each a round
+ * trip. Kept for the plain query and the one with VkFormatProperties3 (what DXVK and vkd3d send). */
+typedef struct fmt_entry {
+    VkPhysicalDevice pd;
+    VkFormat format;
+    int with3;
+    VkFormatProperties props;
+    VkFormatProperties3 props3;
+} fmt_entry;
+#define FMT_SLOTS 2048
+static fmt_entry fmt_cache[FMT_SLOTS];
+static pthread_mutex_t fmt_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static unsigned fmt_slot(VkPhysicalDevice pd, VkFormat format, int with3)
+{
+    uint64_t k = ((uint64_t)(uintptr_t)pd >> 4) * 0x9e3779b97f4a7c15ull ^ (uint64_t)(uint32_t)format * 2654435761u ^ (uint64_t)with3;
+    return (unsigned)(k ^ (k >> 29)) & (FMT_SLOTS - 1);
+}
+
+VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice, VkFormat format,
+                                                                       VkFormatProperties2 *pFormatProperties)
+{
+    if (vkb_emu_format_properties(vkb_pd(physicalDevice), format, &pFormatProperties->formatProperties, pFormatProperties)) return;
+    VkBaseOutStructure *next = pFormatProperties->pNext;
+    VkFormatProperties3 *p3 = NULL;
+    if (next && next->sType == VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3 && !next->pNext) p3 = (VkFormatProperties3 *)next;
+    int cacheable = !next || p3;
+    unsigned slot = fmt_slot(physicalDevice, format, p3 != NULL);
+    if (cacheable) {
+        pthread_mutex_lock(&fmt_lock);
+        fmt_entry *e = &fmt_cache[slot];
+        if (e->pd == physicalDevice && e->format == format && e->with3 == (p3 != NULL)) {
+            pFormatProperties->formatProperties = e->props;
+            if (p3) {
+                p3->linearTilingFeatures = e->props3.linearTilingFeatures;
+                p3->optimalTilingFeatures = e->props3.optimalTilingFeatures;
+                p3->bufferFeatures = e->props3.bufferFeatures;
+            }
+            pthread_mutex_unlock(&fmt_lock);
+            return;
+        }
+        pthread_mutex_unlock(&fmt_lock);
+    }
+    vkb_wire_vkGetPhysicalDeviceFormatProperties2(physicalDevice, format, pFormatProperties);
+    if (cacheable) {
+        pthread_mutex_lock(&fmt_lock);
+        fmt_entry *e = &fmt_cache[slot];
+        e->pd = physicalDevice;
+        e->format = format;
+        e->with3 = p3 != NULL;
+        e->props = pFormatProperties->formatProperties;
+        if (p3) e->props3 = *p3;
+        pthread_mutex_unlock(&fmt_lock);
+    }
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkGetPhysicalDeviceImageFormatProperties(VkPhysicalDevice physicalDevice, VkFormat format,
+                                                                               VkImageType type, VkImageTiling tiling,
+                                                                               VkImageUsageFlags usage, VkImageCreateFlags flags,
+                                                                               VkImageFormatProperties *pProps)
+{
+    VkFormat real = vkb_emu_real_format(vkb_pd(physicalDevice), format, &usage, &flags);
+    vkb_emu_planar_ext_usage(vkb_pd(physicalDevice), real, tiling, usage, &flags);
+    return vkb_wire_vkGetPhysicalDeviceImageFormatProperties(physicalDevice, real, type, tiling, usage, flags, pProps);
+}
+
+/* A DMA_BUF or DRM-modifier format query the driver refused (or answered without IMPORTABLE), logged
+ * once per distinct query: what gamescope asked when it found no exportable modifier is otherwise
+ * invisible (MaliBridge#10, Mali-G77 r32p1: "modifiers.size() > 0"). */
+static void log_refused_query(const VkPhysicalDeviceImageFormatInfo2 *info, int has_mod, uint64_t mod, VkResult r,
+                              VkExternalMemoryFeatureFlags features, const char *then)
+{
+    static uint64_t seen[32];
+    static unsigned nseen;
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    uint64_t k = ((uint64_t)info->format * 0x9e3779b97f4a7c15ull) ^ ((uint64_t)info->usage << 20) ^ ((uint64_t)info->flags << 40) ^
+                 ((uint64_t)info->tiling << 8) ^ (mod * 0xbf58476d1ce4e5b9ull) ^ (uint64_t)info->type ^ ((uint64_t)has_mod << 63);
+    pthread_mutex_lock(&lock);
+    int fresh = 1;
+    for (unsigned i = 0; i < nseen && i < 32; i++) fresh &= seen[i] != k;
+    if (fresh && nseen < 32) seen[nseen++] = k;
+    else fresh = 0;
+    pthread_mutex_unlock(&lock);
+    if (!fresh) return;
+    unsigned views = 0;
+    for (const VkBaseInStructure *b = info->pNext; b; b = b->pNext)
+        if (b->sType == VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO) views = ((const VkImageFormatListCreateInfo *)b)->viewFormatCount;
+    char m[40] = "none";
+    if (has_mod) snprintf(m, sizeof(m), "0x%llx", (unsigned long long)mod);
+    VKB_WARN("dma-buf image query refused by the driver: format %d type %d tiling %d usage 0x%x flags 0x%x (%u view formats) modifier %s: "
+             "result %d, external features 0x%x%s", info->format, info->type, info->tiling, info->usage, info->flags, views, m, r, features, then);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkGetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physicalDevice,
+                                                                                const VkPhysicalDeviceImageFormatInfo2 *pInfo,
+                                                                                VkImageFormatProperties2 *pProps)
+{
+    VkPhysicalDeviceImageFormatInfo2 info = *pInfo;
+    vkb_physdev *pd = vkb_pd(physicalDevice);
+    info.format = vkb_emu_real_format(pd, pInfo->format, &info.usage, &info.flags);
+    vkb_emu_planar_ext_usage(pd, info.format, info.tiling, info.usage, &info.flags);
+    VkResult r = vkb_wire_vkGetPhysicalDeviceImageFormatProperties2(physicalDevice, &info, pProps);
+    const VkPhysicalDeviceExternalImageFormatInfo *ei = NULL;
+    const VkPhysicalDeviceImageDrmFormatModifierInfoEXT *mi = NULL;
+    for (const VkBaseInStructure *b = pInfo->pNext; b; b = b->pNext) {
+        if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO) ei = (const void *)b;
+        if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT) mi = (const void *)b;
+    }
+    int dmabuf = ei && ei->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    VkExternalMemoryProperties *xp = NULL;
+    for (VkBaseOutStructure *b = pProps->pNext; b; b = b->pNext)
+        if (b->sType == VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES) xp = &((VkExternalImageFormatProperties *)b)->externalMemoryProperties;
+    VkExternalMemoryFeatureFlags features = r == VK_SUCCESS && xp ? xp->externalMemoryFeatures : 0;
+    int refused = (dmabuf || mi) && (r != VK_SUCCESS || (dmabuf && !(features & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT)));
+    int emulating = (pd->info.emu & VKB_EMU_DMABUF_EXPORT) != 0;
+    /* The export emulation (the server's pages) on, a dma-buf image at the LINEAR modifier refused:
+     * answered from the same image at plain LINEAR tiling, exportable and importable. The server
+     * makes such an image as a plain LINEAR one and reports the LINEAR modifier: an export (a
+     * modifier list with LINEAR, server_emu_layer.c linear_mod_plain) and an import (the explicit
+     * LINEAR modifier, linear_import_plain, kept only at the dma-buf's layout). Answered without
+     * IMPORTABLE, gamescope imported its clients' LINEAR dma-bufs as OPTIMAL images, which Mali
+     * sizes larger than the dma-buf (VK_ERROR_INVALID_EXTERNAL_HANDLE; S10+ under dmabufmod). */
+    int fallback = refused && emulating && dmabuf && mi && mi->drmFormatModifier == 0 /* DRM_FORMAT_MOD_LINEAR */ &&
+                   info.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT && info.type == VK_IMAGE_TYPE_2D;
+    if (refused && (dmabuf || mi->drmFormatModifier == 0))
+        log_refused_query(&info, mi != NULL, mi ? mi->drmFormatModifier : 0, r, features,
+                          fallback ? "; answered from plain LINEAR tiling (export emulated)" : "");
+    if (fallback) {
+        VkPhysicalDeviceImageFormatInfo2 lin = info;
+        lin.pNext = NULL;
+        lin.tiling = VK_IMAGE_TILING_LINEAR;
+        VkImageFormatListCreateInfo fl;
+        for (const VkBaseInStructure *b = pInfo->pNext; b; b = b->pNext)
+            if (b->sType == VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO) {
+                fl = *(const VkImageFormatListCreateInfo *)b;
+                fl.pNext = NULL;
+                lin.pNext = &fl;
+            }
+        VkImageFormatProperties2 lp = {VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2};
+        VkResult lr = vkb_wire_vkGetPhysicalDeviceImageFormatProperties2(physicalDevice, &lin, &lp);
+        if (lr == VK_SUCCESS) {
+            pProps->imageFormatProperties = lp.imageFormatProperties;
+            if (xp) {
+                xp->externalMemoryFeatures = VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT | VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT;
+                xp->exportFromImportedHandleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+                xp->compatibleHandleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+            }
+            return VK_SUCCESS;
+        }
+        log_refused_query(&lin, 0, 0, lr, 0, "; the LINEAR-modifier query stays refused");
+        return r;
+    }
+    if (r != VK_SUCCESS || !emulating || !dmabuf || !xp) return r;
+    /* dma-buf export of images is emulated by the server (dma-heap pages): what imports, exports. */
+    if (xp->externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT) {
+        xp->externalMemoryFeatures |= VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT;
+        xp->exportFromImportedHandleTypes |= VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+        xp->compatibleHandleTypes |= VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    }
+    return r;
+}
+
+VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetPhysicalDeviceSparseImageFormatProperties(VkPhysicalDevice physicalDevice, VkFormat format,
+                                                                                 VkImageType type, VkSampleCountFlagBits samples,
+                                                                                 VkImageUsageFlags usage, VkImageTiling tiling,
+                                                                                 uint32_t *pCount, VkSparseImageFormatProperties *pProps)
+{
+    if (vkb_emu_is_emulated_format(vkb_pd(physicalDevice), format)) {
+        *pCount = 0;
+        return;
+    }
+    vkb_wire_vkGetPhysicalDeviceSparseImageFormatProperties(physicalDevice, format, type, samples, usage, tiling, pCount, pProps);
+}
+
+VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetPhysicalDeviceSparseImageFormatProperties2(VkPhysicalDevice physicalDevice,
+                                                                                  const VkPhysicalDeviceSparseImageFormatInfo2 *pInfo,
+                                                                                  uint32_t *pCount, VkSparseImageFormatProperties2 *pProps)
+{
+    if (vkb_emu_is_emulated_format(vkb_pd(physicalDevice), pInfo->format)) {
+        *pCount = 0;
+        return;
+    }
+    vkb_wire_vkGetPhysicalDeviceSparseImageFormatProperties2(physicalDevice, pInfo, pCount, pProps);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL vkb_ep_vkGetPhysicalDeviceToolProperties(VkPhysicalDevice physicalDevice, uint32_t *pToolCount,
+                                                                        VkPhysicalDeviceToolProperties *pToolProperties)
+{
+    (void)physicalDevice;
+    (void)pToolProperties;
+    *pToolCount = 0;
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetPhysicalDeviceExternalBufferProperties(VkPhysicalDevice physicalDevice,
+                                                                              const VkPhysicalDeviceExternalBufferInfo *pInfo,
+                                                                              VkExternalBufferProperties *pProps)
+{
+    vkb_wire_vkGetPhysicalDeviceExternalBufferProperties(physicalDevice, pInfo, pProps);
+}
+
+VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetPhysicalDeviceExternalSemaphoreProperties(VkPhysicalDevice physicalDevice,
+                                                                                 const VkPhysicalDeviceExternalSemaphoreInfo *pInfo,
+                                                                                 VkExternalSemaphoreProperties *pProps)
+{
+    vkb_wire_vkGetPhysicalDeviceExternalSemaphoreProperties(physicalDevice, pInfo, pProps);
+}
+
+VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetPhysicalDeviceExternalFenceProperties(VkPhysicalDevice physicalDevice,
+                                                                             const VkPhysicalDeviceExternalFenceInfo *pInfo,
+                                                                             VkExternalFenceProperties *pProps)
+{
+    vkb_wire_vkGetPhysicalDeviceExternalFenceProperties(physicalDevice, pInfo, pProps);
+}
+
+VKAPI_ATTR void VKAPI_CALL vkb_ep_vkGetPhysicalDeviceMultisamplePropertiesEXT(VkPhysicalDevice physicalDevice,
+                                                                              VkSampleCountFlagBits samples,
+                                                                              VkMultisamplePropertiesEXT *pProps)
+{
+    if (!vkb_physdev_has_ext(physicalDevice, "VK_EXT_sample_locations")) { /* as the generated ones (icd.c) */
+        pProps->maxSampleLocationGridSize = (VkExtent2D){0, 0};
+        return;
+    }
+    vkb_wire_vkGetPhysicalDeviceMultisamplePropertiesEXT(physicalDevice, samples, pProps);
+}

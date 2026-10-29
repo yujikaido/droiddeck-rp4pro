@@ -1,0 +1,607 @@
+#!/usr/bin/python3
+import json
+import os
+import re
+import runpy
+import subprocess
+import sys
+from pathlib import Path
+
+SYNC_KEYS = ("BL_SYNC_FALLBACK", "BL_FSYNC_FIRST", "BL_SYNC_MIN_NOFILE", "PROTON_NO_ESYNC", "PROTON_NO_FSYNC", "PROTON_NO_NTSYNC", "WINEESYNC")
+SEED_REDISTS = "/usr/local/bin/droiddeck-seed-redists"
+PACK_KEYS = ("WINESERVER", "BL_SYNC_PACK", "WINEESYNC", "PROTON_NO_ESYNC", "PROTON_NO_FSYNC")
+
+
+def game_id(env):
+    prefix = env.get("STEAM_COMPAT_DATA_PATH", "").rstrip("/")
+    if not prefix:
+        return None
+    value = prefix.rsplit("/", 1)[-1]
+    if not re.fullmatch(r"-?[0-9]+", value):
+        return None
+    number = int(value)
+    if not -(2**31) <= number < 2**32 or number == 0:
+        return None
+    return str(number % 2**32)
+
+
+DOTNET_FEX = {
+    "FEX_TSOENABLED": "1",
+    "FEX_VECTORTSOENABLED": "1",
+    "FEX_MEMCPYSETTSOENABLED": "1",
+    "FEX_HALFBARRIERTSOENABLED": "1",
+    "FEX_X87REDUCEDPRECISION": "0",
+    "FEX_MULTIBLOCK": "0",
+}
+
+
+def game_files(exe):
+    """Lower-cased names of the files next to the game's executable and one directory below."""
+    names = set()
+    folder = os.path.dirname(exe)
+    try:
+        with os.scandir(folder) as top:
+            for entry in top:
+                names.add(entry.name.lower())
+                if entry.is_dir(follow_symlinks=False):
+                    try:
+                        with os.scandir(entry.path) as inner:
+                            names.update(e.name.lower() for e in inner)
+                    except OSError:
+                        pass
+    except OSError:
+        pass
+    return names
+
+
+class Game:
+    """What a fix gets to look at: the executable, its launch arguments and the files beside it."""
+
+    def __init__(self, exe, args, app_id=None, bridge=False):
+        self.exe = exe
+        self.args = args
+        self.app_id = app_id
+        self.bridge = bridge
+        self.stem = os.path.splitext(os.path.basename(exe))[0].lower()
+        self.files = game_files(exe)
+
+    def has_arg(self, name):
+        return any(a == name or a.startswith(name + "=") for a in self.args)
+
+
+FIXES = []
+
+
+def fix(function):
+    FIXES.append(function)
+    return function
+
+
+def is_godot(game):
+    return game.stem + ".pck" in game.files or "godotsharp.dll" in game.files
+
+
+@fix
+def dotnet_memory_ordering(game):
+    if "coreclr.dll" in game.files:
+        return DOTNET_FEX, [], ".NET runtime: FEX with full TSO and without multiblock"
+
+
+@fix
+def re_engine_memory_ordering(game):
+    """RE Engine games (RE2/3/4/7/8, DMC5, Monster Hunter Rise...) hang minutes in with a Wine
+    critical-section error when x86 memory ordering is not kept (box64 issue 1124: frequent at
+    STRONGMEM=0, rare at 1). Main TSO and the half barriers stay on whatever the general FEX
+    preset says; a game's own FEX preset still wins."""
+    if is_re_engine(game):
+        return ORDERED_FEX, [], "RE Engine: FEX main TSO and half barriers kept on (it hangs without)"
+
+
+# HPL engine games (Frictional). With GL_ATI_fragment_shader present, HPL gives each D16 shadow map
+# an extra unsized GL_ALPHA colour buffer ("hack to avoid ATI driver failure" in the released HPL2
+# source, used by both Amnesia games; SOMA's HPL3 logs the same cap and the same failure). Zink never
+# allows an alpha-only render target, so every shadow-map framebuffer comes back unsupported: no
+# shadows, and SOMA crashes once the first shadow-casting light streams in. Mesa exposes the
+# extension in every compatibility context; without it HPL builds depth-only shadow maps, which work.
+HPL_SHADOW_GAMES = {
+    "282140": "SOMA",
+    "57300": "Amnesia: The Dark Descent",
+    "239200": "Amnesia: A Machine for Pigs",
+}
+
+
+@fix
+def hpl_shadow_maps(game):
+    name = HPL_SHADOW_GAMES.get(game.app_id or "")
+    if name:
+        return ({"MESA_EXTENSION_OVERRIDE": "-GL_ATI_fragment_shader"}, [],
+                "%s (HPL engine): GL_ATI_fragment_shader hidden, so its shadow maps work on Zink" % name,
+                "%s (HPL engine): GL_ATI_fragment_shader left as the player set it in MESA_EXTENSION_OVERRIDE "
+                "(nothing added)" % name)
+
+
+# Games whose GPU waits on the render thread under DXVK's tiler mode on the Mali bridge. Stray (UE4):
+# with tiler mode on, DXVK holds the frame's work back and the GPU idles while the render thread
+# records; off, it reaches the GPU earlier. Same-spot A/B on the S11 Ultra: 14.0 -> 19.9-20.2 fps,
+# present->shown unchanged, same picture. Measured per game: in CPU-bound Dark Souls III it gave no fps
+# for ~13% more GPU time, which could cost fps where the GPU is the limit, so no general rule.
+TILER_OFF_GAMES = {
+    "1332010": "Stray",
+}
+
+
+@fix
+def dxvk_tiler_mode_off(game):
+    name = TILER_OFF_GAMES.get(game.app_id or "")
+    if name and game.bridge:
+        return ({"DXVK_CONFIG": "dxvk.tilerMode=False"}, [],
+                "%s: DXVK tiler mode off on the Mali bridge, so the GPU doesn't wait on the render thread" % name,
+                "%s: DXVK tiler mode left as the player set it in DXVK_CONFIG (nothing added)" % name)
+
+
+def add_words(own, words):
+    """[own] (a player's MESA_EXTENSION_OVERRIDE) with the fix's [words] added after it. A word
+    naming an extension the player already lists (+X, -X or X) is left out: theirs stays."""
+    own_words = (own or "").split()
+    named = {w.lstrip("+-") for w in own_words}
+    added = [w for w in words.split() if w.lstrip("+-") not in named]
+    return " ".join(own_words + added)
+
+
+def add_dxvk_options(own, options):
+    """[own] (a player's DXVK_CONFIG, "key = value" entries split by ';') with the fix's [options]
+    added after it. DXVK lets a later entry win, so an option the player already sets is left out:
+    theirs stays."""
+    def key(entry):
+        return entry.split("=", 1)[0].strip()
+    own = (own or "").strip().rstrip(";").strip()
+    named = {key(e) for e in own.split(";") if e.strip()}
+    added = [e.strip() for e in options.split(";") if e.strip() and key(e) not in named]
+    return "; ".join(([own] if own else []) + added)
+
+
+# Variables whose fix value is added to what the player has, not set in its place, and how. Mesa
+# reads MESA_EXTENSION_OVERRIDE as space-separated +/- extension names; DXVK_CONFIG is a list of
+# options.
+ADDED_FIXES = {
+    "MESA_EXTENSION_OVERRIDE": add_words,
+    "DXVK_CONFIG": add_dxvk_options,
+}
+
+
+# The FEX choices DROIDDECK_CPU_PRESETS=off turns off (the .NET one predates the switch and stays).
+CPU_FIXES = (re_engine_memory_ordering,)
+
+
+@fix
+def godot_vulkan(game):
+    if is_godot(game) and not game.has_arg("--rendering-driver"):
+        return {}, ["--rendering-driver", "vulkan"], "Godot: Vulkan renderer"
+
+
+@fix
+def godot_sentry(game):
+    sentry = sorted(n[:-4] for n in game.files if n.startswith("libsentry.windows.") and n.endswith(".dll"))
+    if is_godot(game) and sentry:
+        return {"WINEDLLOVERRIDES": ";".join(n + "=d" for n in sentry)}, [], "Godot: Sentry crash handler off"
+
+
+def skip_red_launcher(command):
+    """Cyberpunk 2077's prelauncher opens REDlauncher, a Qt WebEngine window that hands over to the
+    game half a minute later and then stays up beside it, well over a core busy for as long as the
+    game runs. The game is started itself instead; the prelauncher's own --launcher-skip started it
+    twice."""
+    if len(command) > 2 and os.path.basename(command[2]).lower() == "redprelauncher.exe":
+        game = os.path.join(os.path.dirname(command[2]), "bin", "x64", "Cyberpunk2077.exe")
+        if os.path.isfile(game):
+            print("droiddeck-game-env: REDlauncher skipped", file=sys.stderr)
+            return command[:2] + [game] + command[3:]
+    return command
+
+
+CPU_PRESETS = "DROIDDECK_CPU_PRESETS"
+CPU_LEVELS = ("off", "on", "fast")
+
+# Main TSO and the half barriers on, the slow vector and memcpy ordering off: the ordering a game
+# needs when its threads hand data to each other without the fences x86 never needed.
+ORDERED_FEX = {"FEX_TSOENABLED": "1", "FEX_HALFBARRIERTSOENABLED": "1"}
+# No TSO at all: x86 ordering is left to luck. FEX's own config calls this likely to break a
+# multithreaded program, so it is only ever asked for (DROIDDECK_CPU_PRESETS=fast), never a default.
+UNORDERED_FEX = {"FEX_TSOENABLED": "0", "FEX_VECTORTSOENABLED": "0", "FEX_MEMCPYSETTSOENABLED": "0",
+                 "FEX_HALFBARRIERTSOENABLED": "0", "FEX_MULTIBLOCK": "1"}
+
+FROMSOFT = ("darksoulsii", "darksoulsiii", "darksoulsremastered", "sekiro", "eldenring", "armoredcore6")
+UNREAL_CPU_BOUND = ("astro-win64-shipping",)
+
+
+def cpu_preset_level(env, app_id, path):
+    """DROIDDECK_CPU_PRESETS from the game's own environment, else the shared one, else the
+    session's: off (no per-engine FEX choice), on (the default: only what keeps a game from
+    hanging) or fast (also the unordered ones, for an A/B)."""
+    value = env.get(CPU_PRESETS)
+    try:
+        with open(path, encoding="utf-8") as source:
+            config = json.load(source)
+        value = config.get("shared", {}).get(CPU_PRESETS, value)
+        value = config.get("games", {}).get(app_id, {}).get(CPU_PRESETS, value)
+    except (OSError, ValueError, AttributeError):
+        pass
+    value = (value or "on").strip().lower() if isinstance(value, str) or value is None else "on"
+    value = {"0": "off", "false": "off", "no": "off", "1": "on", "true": "on", "yes": "on"}.get(value, value)
+    return value if value in CPU_LEVELS else "on"
+
+
+def is_re_engine(game):
+    return "re_chunk_000.pak" in game.files
+
+
+def is_unity(game):
+    return "unityplayer.dll" in game.files or game.stem + "_data" in game.files
+
+
+SPEED_FIXES = []
+
+
+def speed(function):
+    SPEED_FIXES.append(function)
+    return function
+
+
+@speed
+def cpu_bound_unordered(game):
+    if is_re_engine(game) or "coreclr.dll" in game.files:
+        return None
+    if is_unity(game):
+        kind = "Unity"
+    elif game.stem in FROMSOFT:
+        kind = "FromSoftware"
+    elif game.stem in UNREAL_CPU_BOUND:
+        kind = "CPU-bound Unreal title"
+    else:
+        return None
+    return UNORDERED_FEX, [], "%s, %s=fast: FEX without TSO (experimental; set it back to on if the game hangs or crashes)" % (kind, CPU_PRESETS)
+
+
+class Note(str):
+    """A fix's line for the session log. A fix that only adds to the player's own value (ADDED_FIXES)
+    may carry a [kept] line, said instead when the player's value already names everything it would
+    add, so the log doesn't claim a change that was not made."""
+    def __new__(cls, text, names=(), kept=None):
+        note = super().__new__(cls, text)
+        note.names = frozenset(names)
+        note.kept = kept
+        return note
+
+    def line(self, kept_names):
+        """The line to log, given the ADDED_FIXES names apply_config added nothing to."""
+        added = [name for name in self.names if name in ADDED_FIXES]
+        if self.kept and added and all(name in kept_names for name in added):
+            return self.kept
+        return str(self)
+
+
+def engine_fixes(exe, args, level="on", app_id=None, bridge=False):
+    """Environment and extra arguments a game needs because of what it is built with. The speed
+    fixes come first, so a safety fix that also matches always has the last word. [bridge]: the
+    session runs on the Mali bridge (BL_VKBRIDGE=1)."""
+    game = Game(exe, args, app_id, bridge)
+    env, extra, notes = {}, [], []
+    checks = list(FIXES) if level != "off" else [f for f in FIXES if f not in CPU_FIXES]
+    if level == "fast":
+        checks = SPEED_FIXES + checks
+    for check in checks:
+        found = check(game)
+        if found:
+            env.update(found[0])
+            extra += found[1]
+            notes.append(Note(found[2], found[0], found[3] if len(found) > 3 else None))
+    return env, extra, notes
+
+
+def win_components(compat, app_id):
+    """The game's Windows components put into its prefix; returns their WINEDLLOVERRIDES entries."""
+    if not compat:
+        return ""
+    try:
+        module = runpy.run_path(str(Path(__file__).resolve().parent / "droiddeck-wincomponents"))
+        names, notes = module["apply"](compat.rstrip("/"), app_id)
+        for note in notes:
+            print("droiddeck-game-env: " + note, file=sys.stderr)
+        return module["overrides_value"](names)
+    except Exception as error:
+        print("droiddeck-game-env: Windows components not applied (%s)" % error, file=sys.stderr)
+        return ""
+
+
+def apply_config(env, config, app_id, fixes=None, kept=None):
+    """[kept]: a set that gets the ADDED_FIXES names whose fix value added nothing (the player's
+    value already names it)."""
+    if config.get("version") != 1:
+        raise ValueError("unsupported environment configuration")
+    result = env.copy()
+    entries = dict(config.get("shared", {}))
+    fixes = dict(fixes or {})
+    added = {name: fixes.pop(name) for name in ADDED_FIXES if name in fixes}
+    for name, value in fixes.items():
+        if name == "WINEDLLOVERRIDES" and entries.get(name, env.get(name)):
+            value = entries.get(name, env.get(name)) + ";" + value
+        entries[name] = value
+    entries.update(config.get("games", {}).get(app_id, {}))
+    for name, value in entries.items():
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            raise ValueError("invalid environment name")
+        if value is None:
+            result.pop(name, None)
+        elif isinstance(value, str) and "\0" not in value and len(value) <= 8192:
+            result[name] = value
+        else:
+            raise ValueError("invalid environment value")
+    for name, value in added.items():
+        own = result.get(name)
+        result[name] = ADDED_FIXES[name](own, value)
+        if kept is not None and result[name] == ADDED_FIXES[name](own, ""):
+            kept.add(name)
+    game_dxvk = config.get("dxvkConfigGames", {})
+    if not isinstance(game_dxvk, dict):
+        raise ValueError("invalid game dxvk configuration")
+    dxvk = game_dxvk.get(app_id, config.get("dxvkConfig"))
+    if dxvk is not None:
+        if not isinstance(dxvk, str) or "\0" in dxvk or len(dxvk) > 8192:
+            raise ValueError("invalid dxvk configuration")
+        if dxvk:
+            own = result.get("DXVK_CONFIG", "").strip().rstrip(";").strip()
+            result["DXVK_CONFIG"] = own + "; " + dxvk if own else dxvk
+    return result
+
+
+def bridge_feature_level(env):
+    """On the Mali bridge, a vkd3d-proton feature level past 12_0 is capped at 12_0. 12_1 and 12_2
+    claim ROVs, conservative rasterization, ray tracing and mesh shaders, which the GPU behind the
+    bridge has none of; the shared default (12_2, chosen for Turnip) made Deep Rock Galactic build
+    ray tracing pipelines on D3D12 and crash. Returns a note when it changed something."""
+    if env.get("BL_VKBRIDGE") != "1" or env.get("VKD3D_FEATURE_LEVEL") not in ("12_1", "12_2"):
+        return None
+    was = env["VKD3D_FEATURE_LEVEL"]
+    env["VKD3D_FEATURE_LEVEL"] = "12_0"
+    return "Mali bridge: VKD3D_FEATURE_LEVEL %s capped at 12_0 (no ray tracing or mesh shaders)" % was
+
+
+def sync_config(config, app_id):
+    games = config.get("games", {})
+    return {
+        "version": config.get("version"),
+        "shared": {name: value for name, value in config.get("shared", {}).items() if name in SYNC_KEYS},
+        "games": {app_id: {name: value for name, value in games.get(app_id, {}).items() if name in SYNC_KEYS}},
+    }
+
+
+def load_sync():
+    try:
+        return runpy.run_path(str(Path(__file__).resolve().parent / "droiddeck-esync"))
+    except Exception as error:
+        print("droiddeck-game-env: sync selection failed (%s); stock launch" % error, file=sys.stderr)
+        return None
+
+
+def select_sync(command, env, sync=None):
+    try:
+        sync = sync if sync is not None else load_sync()
+        if sync is None:
+            return command, env
+        chosen, chosen_env = sync["select"](command, env)
+        if chosen and all(isinstance(value, str) for value in chosen) and isinstance(chosen_env, dict):
+            return list(chosen), dict(chosen_env)
+    except Exception as error:
+        print("droiddeck-game-env: sync selection failed (%s); stock launch" % error, file=sys.stderr)
+    return command, env
+
+
+def record_stock(sync, command, env):
+    try:
+        if sync is not None and "record" in sync:
+            sync["record"](command, env)
+    except Exception as error:
+        print("droiddeck-game-env: stock launch not recorded (%s)" % error, file=sys.stderr)
+
+
+def without_pack(chosen_env, env):
+    result = dict(chosen_env)
+    for name in PACK_KEYS:
+        if name in env:
+            result[name] = env[name]
+        else:
+            result.pop(name, None)
+    return result
+
+
+SSBS_LIB = "/usr/local/lib/libssbs.so"
+
+
+def force_ssbs(command, env):
+    """DROIDDECK_FORCE_SSBS=1 (a game's or the shared environment): preload libssbs.so into this
+    Proton's Wine, which then keeps PSTATE.SSBS set across signal returns - speculative store
+    bypass stays allowed, as force_ssbs.diff does inside a rebuilt ntdll. ARM64 Protons only: the
+    library is aarch64 and only arm64 Wine has the signal path it fixes."""
+    if env.get("DROIDDECK_FORCE_SSBS", "").lower() not in ("1", "on", "true", "yes"):
+        return env
+    proton = os.path.dirname(command[0]) if command else ""
+    if not os.path.isdir(os.path.join(proton, "files/lib/wine/aarch64-unix")):
+        print("droiddeck-game-env: force SSBS asked for, but this Proton is not an ARM64 one; left off", file=sys.stderr)
+        return env
+    if not os.path.isfile(SSBS_LIB):
+        print("droiddeck-game-env: force SSBS asked for, but %s is missing; left off" % SSBS_LIB, file=sys.stderr)
+        return env
+    parts = [p for p in re.split(r"[:\s]+", env.get("LD_PRELOAD", "")) if p]
+    if SSBS_LIB not in parts:
+        env = dict(env, LD_PRELOAD=":".join(parts + [SSBS_LIB]))
+        print("droiddeck-game-env: force SSBS on (libssbs.so preloaded)", file=sys.stderr)
+    return env
+
+
+def umu_capable(proton):
+    """Whether this Proton's script has umu's launch without Steam: GE-Proton, Proton-CachyOS and
+    DroidDeck-Proton run umu.exe in place of steam.exe when UMU_ID is set; Valve's Proton does not."""
+    try:
+        with open(proton, encoding="utf-8", errors="replace") as source:
+            text = source.read()
+    except OSError:
+        return False
+    return "UMU_ID" in text and "umu.exe" in text
+
+
+def start_without_steam(command, env, app_id):
+    """DROIDDECK_NO_STEAM=1 (a game's Start without Steam): launch the game without Proton's
+    steam.exe, for games that close right away because of what it sets up. A Proton with umu's
+    launch gets UMU_ID - Proton still sets up the prefix, and a Steam game keeps its protonfixes
+    under its own id; any other Proton runs the game straight in the prefix (runinprefix)."""
+    if env.get("DROIDDECK_NO_STEAM", "").lower() not in ("1", "on", "true", "yes"):
+        return command, env
+    if len(command) < 3 or command[1] != "waitforexitandrun":
+        return command, env
+    if umu_capable(command[0]):
+        if not env.get("UMU_ID"):
+            steam_game = app_id is not None and int(app_id) < 2**31
+            env = dict(env, UMU_ID=app_id if steam_game else "0")
+        print("droiddeck-game-env: starting without Steam (umu.exe in place of steam.exe, UMU_ID=%s)" % env["UMU_ID"], file=sys.stderr)
+        return command, env
+    print("droiddeck-game-env: starting without Steam (this Proton has no umu launch: runinprefix)", file=sys.stderr)
+    return [command[0], "runinprefix"] + command[2:], env
+
+
+EVALUATOR_SCRIPT = re.compile(r"(?:^|[\\/])evaluatorscript_[0-9]+\.vdf$", re.IGNORECASE)
+
+
+INSTALL_SCRIPT = re.compile(r"^installscript.*\.vdf$", re.IGNORECASE)
+LIBRARY_PATH = re.compile(r'"path"\s+"((?:[^"\\]|\\.)*)"')
+GAME_LIBRARIES = ("/mnt/droiddeck", "/mnt/droiddeck-sd")
+
+
+def runs(command, program):
+    return any(arg.lower().replace("\\", "/").endswith(program) for arg in command)
+
+
+def game_folder(root, env):
+    """The installed game's folder, for a client helper Proton is given no install path for."""
+    given = env.get("STEAM_COMPAT_INSTALL_PATH", "")
+    if given and os.path.isdir(given):
+        return given
+    app = game_id(env)
+    if not app:
+        return None
+    libraries = [root] + list(GAME_LIBRARIES)
+    try:
+        with open(os.path.join(root, "steamapps", "libraryfolders.vdf"), encoding="utf-8", errors="replace") as f:
+            libraries += [path.replace("\\\\", "\\") for path in LIBRARY_PATH.findall(f.read())]
+    except OSError:
+        pass
+    for library in dict.fromkeys(libraries):
+        try:
+            with open(os.path.join(library, "steamapps", "appmanifest_%s.acf" % app), encoding="utf-8", errors="replace") as f:
+                found = re.search(r'"installdir"\s+"([^"]+)"', f.read(), re.IGNORECASE)
+        except OSError:
+            continue
+        if found:
+            folder = os.path.join(library, "steamapps", "common", found.group(1))
+            if os.path.isdir(folder):
+                return folder
+    return None
+
+
+def game_install_scripts(folder, depth=4):
+    found = []
+    base = folder.rstrip("/").count("/")
+    for directory, dirs, files in os.walk(folder):
+        if directory.count("/") - base >= depth:
+            dirs[:] = []
+        found += [os.path.join(directory, name) for name in files if INSTALL_SCRIPT.match(name)]
+    return sorted(found)
+
+
+def mark_install_scripts(command, env):
+    """The client is about to run a game's install scripts: mark every process in them but a Vulkan
+    runtime installer as already run first, so no redistributable installer starts - on first
+    launch the shared ones may still be downloading, and on ARM64 Proton the VC++ ones stop with an
+    error. Two client helpers run them: iscriptevaluator.exe, given the script, and the service
+    helper (legacycompat steamservice.exe /runfunc, Just Cause 2), given none - its scripts are the
+    game's own installscript*.vdf."""
+    root = env.get("STEAM_COMPAT_CLIENT_INSTALL_PATH") or str(Path.home() / ".local/share/Steam")
+    if runs(command, "iscriptevaluator.exe"):
+        scripts = [str(Path(root) / arg.replace("\\", "/")) for arg in command if EVALUATOR_SCRIPT.search(arg)]
+    elif runs(command, "steamservice.exe") and any(arg.lower() == "/runfunc" for arg in command):
+        folder = game_folder(root, env)
+        scripts = game_install_scripts(folder) if folder else []
+        print("droiddeck-game-env: the client's service helper runs install steps for app %s; %d install script(s) to mark" % (
+            game_id(env) or "?", len(scripts)), file=sys.stderr)
+        if not scripts:
+            # Still worth a pass: the shared redistributables may have landed since the last beat.
+            scripts = [""]
+    else:
+        return
+    scripts = [path for path in scripts if not path or os.path.isfile(path)]
+    if not scripts:
+        return
+    try:
+        subprocess.run([SEED_REDISTS, root], env=dict(env, DROIDDECK_SEED_SCRIPTS="\n".join(p for p in scripts if p)),
+                       stdout=sys.stderr, timeout=60, check=False)
+    except (OSError, subprocess.SubprocessError) as error:
+        print("droiddeck-game-env: install scripts not marked (%s)" % error, file=sys.stderr)
+
+
+def main():
+    command = sys.argv[1:]
+    if not command:
+        return 2
+    env = os.environ.copy()
+    mic_enabled = env.get("BL_MIC_ENABLED")
+    mark_install_scripts(command, env)
+    app_id = game_id(env)
+    if app_id:
+        waiting = len(command) > 1 and command[1] == "waitforexitandrun"
+        fixes, notes, kept = {}, [], set()
+        if waiting:
+            command = skip_red_launcher(command)
+            level = cpu_preset_level(env, app_id, Path.home() / ".config/droiddeck/game-environment.json")
+            fixes, extra, notes = engine_fixes(command[2], command[3:], level, app_id,
+                                                env.get("BL_VKBRIDGE") == "1") if len(command) > 2 else ({}, [], [])
+            command += extra
+            components = win_components(env.get("STEAM_COMPAT_DATA_PATH", ""), app_id)
+            if components:
+                own = fixes.get("WINEDLLOVERRIDES")
+                fixes["WINEDLLOVERRIDES"] = components + ";" + own if own else components
+        path = Path.home() / ".config/droiddeck/game-environment.json"
+        try:
+            with path.open(encoding="utf-8") as source:
+                config = json.load(source)
+            if waiting:
+                env = apply_config(env, config, app_id, fixes, kept)
+            else:
+                env = apply_config(env, sync_config(config, app_id), app_id)
+        except FileNotFoundError:
+            if waiting:
+                env = apply_config(env, {"version": 1}, app_id, fixes, kept)
+        except (OSError, ValueError, TypeError, AttributeError):
+            print("droiddeck-game-env: invalid configuration; using inherited environment", file=sys.stderr)
+        # After the configuration: a fix that only adds to the player's value says whether it did.
+        for note in notes:
+            print("droiddeck-game-env: " + note.line(kept), file=sys.stderr)
+    if mic_enabled == "0":
+        env["BANNER_AUDIO_DIRECT_MIC"] = "0"
+    note = bridge_feature_level(env)
+    if note:
+        print("droiddeck-game-env: " + note, file=sys.stderr)
+    env = force_ssbs(command, env)
+    command, env = start_without_steam(command, env, app_id)
+    sync = load_sync()
+    launch, launch_env = select_sync(command, env, sync)
+    if launch[0] != command[0]:
+        try:
+            os.execvpe(launch[0], launch, launch_env)
+        except OSError as error:
+            print("droiddeck-game-env: %s could not start (%s); stock launch" % (launch[0], error), file=sys.stderr)
+            launch, launch_env = command, without_pack(launch_env, env)
+            record_stock(sync, launch, launch_env)
+    os.execvpe(launch[0], launch, launch_env)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

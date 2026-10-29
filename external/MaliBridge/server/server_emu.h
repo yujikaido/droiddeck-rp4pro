@@ -1,0 +1,199 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Copyright (C) 2026 ASEbrahim and MaliBridge contributors */
+#ifndef VKB_SERVER_EMU_H
+#define VKB_SERVER_EMU_H
+
+#include "vkb_server.h"
+
+/* Emulations that are implemented (the rest are never offered to the client). */
+#define VKB_EMU_IMPLEMENTED (VKB_EMU_MAINT5 | VKB_EMU_CLIP_DISTANCE | VKB_EMU_CULL_DISTANCE | VKB_EMU_POINT_SIZE | VKB_EMU_BCN | \
+                             VKB_EMU_DIVISOR | VKB_EMU_DEPTH_CLIP | VKB_EMU_ROBUSTNESS2 | \
+                             VKB_EMU_DMABUF_EXPORT | VKB_EMU_DUAL_SRC | VKB_EMU_FILL_MODE | VKB_EMU_MULTI_VIEWPORT | \
+                             VKB_EMU_MAINT6 | VKB_EMU_LOADSTORE_NONE | VKB_EMU_PUSH_DESC | VKB_EMU_TEXEL_ALIGN | \
+                             VKB_EMU_DESC_LIMITS | VKB_EMU_OPAQUE_FD | VKB_EMU_MULTI_DRAW | VKB_EMU_ROBUST2_ACCESS | \
+                             VKB_EMU_DYN_RENDER | VKB_EMU_BGR10_VTX | VKB_EMU_UF11_VTX)
+
+#define VKB_EMU_BUCKETS 1024
+
+typedef struct vkb_emu_image {
+    VkImage image;
+    VkImageType type;
+    VkFormat format;          /* what the driver holds */
+    VkFormat client_format;   /* what the app asked for (differs for emulated formats) */
+    VkExtent3D extent;
+    uint32_t mips, layers;
+    void *emu;                /* per-emulation state (BCn: decode resources) */
+    int64_t stat_bytes, stat_bc_src, stat_ideal; /* accounting: driver's size; BC: the original's, the decoded texels' */
+    uint32_t drop;            /* VKBRIDGE_TEX_MAXDIM: the app's top levels not created (app level m is level m - drop here) */
+    int linear_mod;           /* a modifier-list dma-buf image made plain LINEAR (reports the LINEAR modifier) */
+    struct vkb_emu_image *next;
+} vkb_emu_image;
+
+typedef struct vkb_emu_buffer {
+    VkBuffer buffer;
+    VkDeviceSize size;
+    struct vkb_emu_buffer *next;
+} vkb_emu_buffer;
+
+typedef struct vkb_emu_device {
+    uint32_t flags;
+    vkb_srv_table *dev;
+    pthread_mutex_t lock;
+    vkb_emu_image *images[VKB_EMU_BUCKETS];
+    vkb_emu_buffer *buffers[VKB_EMU_BUCKETS];
+    void *bcn;       /* server_emu_bcn.c */
+    void *cmdstate;  /* server_emu_cmdstate.c */
+    void *divisor;   /* server_emu_divisor.c */
+    void *shaders;   /* server_emu_shader.c */
+    void *polygon;   /* server_emu_polygon.c */
+    void *texcap;    /* server_texcap.c */
+} vkb_emu_device;
+
+/* command buffer state (server_emu_cmdstate.c) */
+void vkb_emu_cmdstate_install(vkb_srv_table *dev);
+void vkb_emu_cmdstate_uninstall(vkb_srv_table *dev);
+void vkb_emu_restore_compute(vkb_emu_device *e, VkCommandBuffer cb);
+void *vkb_emu_cb_gfx(vkb_emu_device *e, VkCommandBuffer cb, size_t size);
+VkDescriptorSet vkb_emu_cb_scratch_set(vkb_emu_device *e, VkCommandBuffer cb, VkDescriptorSetLayout dsl);
+void *vkb_emu_cb_bcn(vkb_emu_device *e, VkCommandBuffer cb, size_t size);
+void *vkb_emu_cb_poly(vkb_emu_device *e, VkCommandBuffer cb, size_t size);
+void *vkb_emu_cb_dynrend(vkb_emu_device *e, VkCommandBuffer cb, size_t size);
+/* dynamic rendering as render passes (server_emu_dynrend.c) */
+void vkb_emu_dynrend_install(vkb_srv_table *dev);
+void vkb_emu_dynrend_uninstall(vkb_srv_table *dev);
+void vkb_emu_dynrend_cb_reset(vkb_emu_device *e, void *fbs);
+void vkb_emu_dynrend_cb_free(vkb_emu_device *e, void *fbs);
+VkCommandPool vkb_emu_cb_origin(vkb_emu_device *e, VkCommandBuffer cb, int *secondary, uint32_t *begin_flags);
+/* polygon mode LINE / POINT without fillModeNonSolid (server_emu_polygon.c) */
+typedef struct poly_info poly_info;
+size_t vkb_emu_polygon_info_size(void);
+void vkb_emu_polygon_pipeline(vkb_emu_device *e, const VkGraphicsPipelineCreateInfo *ci, poly_info *out);
+void vkb_emu_polygon_created(vkb_emu_device *e, VkDevice device, VkPipelineCache cache, const VkGraphicsPipelineCreateInfo *ci,
+                             VkPipeline p, poly_info *info);
+void vkb_emu_polygon_buffer_usage(vkb_emu_device *e, VkBufferCreateInfo *ci);
+void vkb_emu_polygon_install(vkb_srv_table *dev);
+void vkb_emu_polygon_uninstall(vkb_srv_table *dev);
+/* A command buffer reset or begun again (cb's pool: pool) / forgotten. */
+void vkb_emu_polygon_cb_reset(vkb_emu_device *e, VkCommandBuffer cb, VkCommandPool pool, void **poly);
+void vkb_emu_polygon_cb_free(vkb_emu_device *e, void *poly);
+VkDeviceSize vkb_emu_buffer_size(vkb_emu_device *e, VkBuffer b); /* 0: not tracked */
+/* vertex attribute divisor (server_emu_divisor.c) */
+typedef struct div_info div_info;
+size_t vkb_emu_divisor_info_size(void);
+void vkb_emu_divisor_pipeline(vkb_emu_device *e, VkDevice device, VkGraphicsPipelineCreateInfo *ci, div_info *out);
+void vkb_emu_divisor_created(vkb_emu_device *e, VkDevice device, VkPipelineCache cache, const VkGraphicsPipelineCreateInfo *ci,
+                             VkPipeline p, div_info *info);
+void vkb_emu_divisor_install(vkb_srv_table *dev);
+void vkb_emu_divisor_uninstall(vkb_srv_table *dev);
+void vkb_emu_gfx_bind_pipeline(vkb_emu_device *e, VkCommandBuffer cb, VkPipeline p);
+void vkb_emu_gfx_reset(void *gfx);
+void vkb_emu_gfx_free(void *gfx);
+/* BCn (server_emu_bcn.c) */
+void vkb_emu_bcn_install(vkb_srv_table *dev);
+void vkb_emu_bcn_uninstall(vkb_srv_table *dev);
+void vkb_emu_bcn_quiesce(vkb_srv_table *dev);
+VkFormat vkb_emu_bcn_view_format(vkb_emu_device *e, VkImage image, VkFormat requested);
+void vkb_emu_bcn_buffer_usage(vkb_emu_device *e, VkBufferCreateInfo *ci);
+int vkb_emu_bcn_blocks_readback(vkb_emu_device *e, VkImage img);
+/* The command buffer's decode scratch goes back to the device (the buffer is begun again, reset or freed). */
+void vkb_emu_bcn_cb_release(vkb_emu_device *e, void *cb_scratch);
+VkDeviceSize vkb_emu_bcn_scratch_live(void);
+/* the startup probe builds each transcoder on the driver (server_probe.c) */
+int vkb_emu_bcn_transcoders(void);
+const char *vkb_emu_bcn_transcoder_name(int i, uint32_t *probe_flag);
+VkResult vkb_emu_bcn_build_transcoder(const vkb_dispatch *r, VkDevice d, VkPipelineCache cache, int i, double *ms);
+
+/* layer (server_emu_layer.c) */
+void vkb_emu_depth_clip_pipeline(vkb_emu_device *e, VkGraphicsPipelineCreateInfo *ci);
+void vkb_emu_depth_clip_install(vkb_srv_table *dev);
+vkb_emu_device *vkb_emu_cur(void);
+const vkb_dispatch *vkb_emu_real(void);
+void *vkb_emu_chain_take(const void *head, VkStructureType t);
+int vkb_emu_strip_opaque(const void *head, VkStructureType t);
+vkb_emu_image *vkb_emu_find_image(vkb_emu_device *e, VkImage img);
+void vkb_emu_track_image(vkb_emu_device *e, VkImage img, const VkImageCreateInfo *ci, VkFormat client_format);
+
+/* feature hooks (server_emu_features.c and friends) */
+int vkb_emu_bcn_supported(const vkb_dispatch *idt, VkPhysicalDevice pd);
+/* BC images transcoded to ETC2 / EAC / ASTC where the GPU has them (VKBRIDGE_BC_TRANSCODE=0: decoded). */
+int vkb_emu_bcn_transcode_wanted(void);
+void vkb_emu_install(vkb_srv_table *dev);
+void vkb_emu_uninstall(vkb_srv_table *dev);
+void vkb_emu_install_features(vkb_srv_table *dev);
+void vkb_emu_uninstall_features(vkb_srv_table *dev);
+void vkb_emu_image_create_info(vkb_emu_device *e, VkImageCreateInfo *ci);
+void vkb_emu_image_release(vkb_emu_device *e, vkb_emu_image *img);
+/* Rewrites a graphics pipeline's shaders; temporary modules are appended to mods. */
+void vkb_emu_shader_pipeline(vkb_emu_device *e, VkDevice device, VkGraphicsPipelineCreateInfo *ci, VkShaderModule *mods,
+                             uint32_t *nmods, uint32_t cap);
+/* DXVK's pass-through stream output GS folded into the VS (Mali's geometry shaders are slow). */
+void vkb_emu_shader_xfb_fold(vkb_emu_device *e, VkDevice device, VkGraphicsPipelineCreateInfo *ci, VkShaderModule *mods,
+                             uint32_t *nmods, uint32_t cap);
+void vkb_emu_shader_install(vkb_srv_table *dev);
+int vkb_emu_dumping(void);
+void vkb_emu_shader_drop_second_output(vkb_emu_device *e, VkDevice device, VkGraphicsPipelineCreateInfo *ci, VkShaderModule *mods,
+                                       uint32_t *nmods, uint32_t cap);
+int vkb_emu_bgr10_for(const vkb_srv_table *inst, VkPhysicalDevice pd); /* VKB_EMU_BGR10_VTX for this instance's clients */
+int vkb_emu_driver_vi_dyn(const vkb_dispatch *d, VkPhysicalDevice pd); /* the driver has VK_EXT_vertex_input_dynamic_state */
+void vkb_emu_shader_call_end(void); /* frees the stages rewritten during this vkCreateGraphicsPipelines */
+void vkb_emu_shader_bgr10(vkb_emu_device *e, VkDevice device, VkGraphicsPipelineCreateInfo *ci, VkShaderModule *mods, uint32_t *nmods,
+                          uint32_t cap);
+void vkb_emu_shader_uf11(vkb_emu_device *e, VkDevice device, VkGraphicsPipelineCreateInfo *ci, VkShaderModule *mods, uint32_t *nmods,
+                         uint32_t cap); /* VKB_EMU_UF11_VTX */
+void vkb_emu_compat_pipeline(vkb_emu_device *e, VkDevice device, VkGraphicsPipelineCreateInfo *ci, VkShaderModule *mods, uint32_t *nmods,
+                             uint32_t cap);
+void vkb_emu_compat_install(vkb_srv_table *dev);
+void vkb_emu_push_install(vkb_srv_table *dev);
+void vkb_emu_push_uninstall(vkb_srv_table *dev);
+/* descriptor limits (server_emu_desc.c): [update after bind][sampled image, storage image, storage buffer] */
+void vkb_emu_desc_limits_get(const vkb_dispatch *d, VkPhysicalDevice pd, uint32_t out[2][3]);
+void vkb_emu_desc_install(vkb_srv_table *dev);
+void vkb_emu_desc_uninstall(vkb_srv_table *dev);
+/* 1 when VKBRIDGE_FAKE_MISSING names t (host tests imitating Mali). */
+int vkb_emu_faked(const char *t);
+/* VKBRIDGE_FAKE_MISSING=planarext: a multi-planar image with extended usage, refused as on the Mali-G925 */
+int vkb_emu_planar_ext_refused(VkFormat f, VkImageCreateFlags flags);
+/* VKBRIDGE_FAKE_MISSING=dmabufmod: a DRM-modifier dma-buf storage / mutable image (query or modifier-list create chain), refused as r32p1 likely does */
+int vkb_emu_dmabufmod_refused(VkImageTiling tiling, VkImageUsageFlags usage, VkImageCreateFlags flags, const void *chain);
+void vkb_emu_vb_sizes_resolve(vkb_emu_device *e, uint32_t n, const VkBuffer *buffers, const VkDeviceSize *offsets,
+                              const VkDeviceSize *sizes);
+int vkb_emu_ext_hidden(const char *name); /* VKBRIDGE_FAKE_MISSING / VKBRIDGE_SERVER_HIDE_EXTS */
+int vkb_emu_hiding_exts(void);
+void vkb_emu_instance_install(vkb_srv_table *t); /* clients see the device extensions without the hidden ones */
+void vkb_emu_compat_uninstall(vkb_srv_table *dev);
+/* OPAQUE_FD on dma-bufs (server_opaque.c) */
+int vkb_opaque_wanted(const vkb_dispatch *idt, VkPhysicalDevice pd, uint32_t emu);
+int vkb_opaque_buffer(vkb_emu_device *e, VkBufferCreateInfo *ci);
+int vkb_opaque_image(vkb_emu_device *e, VkImageCreateInfo *ci);
+int vkb_opaque_retry(const void *ci, VkStructureType t);
+VkResult vkb_emu_driver_module(VkDevice device, const VkShaderModuleCreateInfo *ci, VkShaderModule *out);
+VkShaderModule vkb_emu_shader_zero_base_instance(vkb_emu_device *e, VkDevice device, const VkPipelineShaderStageCreateInfo *vs);
+void vkb_emu_shader_uninstall(vkb_srv_table *dev);
+/* 1 = handled (the emulation recorded its own commands instead). */
+int vkb_emu_copy_image(vkb_emu_device *e, VkCommandBuffer cb, VkImage src, VkImageLayout sl, VkImage dst, VkImageLayout dl,
+                       uint32_t n, const VkImageCopy *regions);
+int vkb_emu_copy_image2(vkb_emu_device *e, VkCommandBuffer cb, const VkCopyImageInfo2 *info);
+int vkb_emu_copy_buffer_to_image(vkb_emu_device *e, VkCommandBuffer cb, VkBuffer src, VkImage dst, VkImageLayout dl, uint32_t n,
+                                 const VkBufferImageCopy *regions);
+int vkb_emu_copy_buffer_to_image2(vkb_emu_device *e, VkCommandBuffer cb, const VkCopyBufferToImageInfo2 *info);
+
+/* VKBRIDGE_TEX_MAXDIM (server_texcap.c): textures created without their top mip levels. create_info
+ * caps an image's create info (returns the levels dropped, 0: not capped); the copy functions turn
+ * the app's levels into the driver's in place and return how many regions are left (out: the image
+ * is read: regions of dropped levels are logged). */
+void vkb_texcap_install(vkb_srv_table *dev);
+void vkb_texcap_uninstall(vkb_srv_table *dev);
+uint32_t vkb_texcap_create_info(vkb_emu_device *e, VkImageCreateInfo *ci);
+void vkb_texcap_created(vkb_emu_device *e, vkb_emu_image *r, uint32_t drop, const VkExtent3D *app, uint32_t app_mips);
+void vkb_texcap_destroyed(vkb_emu_image *r);
+uint32_t vkb_texcap_buffer_image(vkb_emu_device *e, VkImage img, int out, VkBufferImageCopy *r, uint32_t n);
+uint32_t vkb_texcap_buffer_image2(vkb_emu_device *e, VkImage img, int out, VkBufferImageCopy2 *r, uint32_t n);
+uint32_t vkb_texcap_image_copy(vkb_emu_device *e, VkImage src, VkImage dst, VkImageCopy *r, uint32_t n);
+uint32_t vkb_texcap_image_copy2(vkb_emu_device *e, VkImage src, VkImage dst, VkImageCopy2 *r, uint32_t n);
+uint32_t vkb_texcap_blit(vkb_emu_device *e, VkImage src, VkImage dst, VkImageBlit *r, uint32_t n);
+uint32_t vkb_texcap_blit2(vkb_emu_device *e, VkImage src, VkImage dst, VkImageBlit2 *r, uint32_t n);
+uint32_t vkb_texcap_resolve(vkb_emu_device *e, VkImage dst, VkImageResolve *r, uint32_t n);
+uint32_t vkb_texcap_resolve2(vkb_emu_device *e, VkImage dst, VkImageResolve2 *r, uint32_t n);
+int vkb_texcap_spirv_sized(const uint32_t *w, size_t words);
+
+#endif
