@@ -20,6 +20,10 @@ Microsoft's own `d3dx9` library, which gets them wrong under FEX (the x86 emulat
 gets them right, so DroidDeck now switches Oath to it by itself (its known-games table). Icebound Cave runs at
 69 fps.
 
+| Before: only the HUD on black | After fix45: 69 fps |
+|---|---|
+| ![Oath before](screenshots/14-ys-oath-icebound-cave-before-black.jpg) | ![Oath after](screenshots/15-ys-oath-icebound-cave-after-fix45-69fps.jpg) |
+
 **fix44: Tales of Symphonia starts.** It used to close at once and drop back to the Steam page. The game asks
 for 2x anti-aliasing (MSAA), and this GPU only does 1x and 4x. DXVK tells the game 2x is there, then can't
 make it, so the game quits. A new bridge erratum, `msaa2_as_4`, offers 2x and quietly makes it with 4 samples,
