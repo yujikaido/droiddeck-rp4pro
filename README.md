@@ -12,7 +12,13 @@ Claude Code, so they live on the fork branches below instead. Maintainers are we
 Tested on my personal Retroid Pocket 4 Pro only. The fixes switch themselves on for the r32 Mali driver, so the build
 is safe on other phones, but nothing else has been tested on them.
 
-## New in fix42 to fix44
+## New in fix42 to fix45
+
+**fix45: Ys: The Oath in Felghana draws its world.** In the DirectX 9 version, a loaded save showed only the
+HUD on black. The game was drawing the world, but every world matrix came out as NaN: they come from
+Microsoft's own `d3dx9` library, which gets them wrong under FEX (the x86 emulator). Wine's built-in `d3dx9`
+gets them right, so DroidDeck now switches Oath to it by itself (its known-games table). Icebound Cave runs at
+69 fps.
 
 **fix44: Tales of Symphonia starts.** It used to close at once and drop back to the Steam page. The game asks
 for 2x anti-aliasing (MSAA), and this GPU only does 1x and 4x. DXVK tells the game 2x is there, then can't
@@ -66,6 +72,7 @@ public databases, never the games themselves.
 | **White rooms** in Ys Origin (any room with lighting effects, 12 fps) | The game keeps dead particles with NaN matrices in its draw list; a PC GPU drops them, r32p1 draws each as a sheet over the whole screen | New MaliBridge erratum `nan_position`: every vertex shader gets a guard that moves a NaN, Inf or zero-w position outside the clip volume |
 | **Press Play twice**: the first launch with frame generation on crashes the app | The Win-FG engine destroys its images and resets its descriptor pool while a frame is still in flight, and reuses descriptor sets from a destroyed pool at the same frame size | Waits for the GPU before both teardowns; the scratch cache is dropped with its pool |
 | **Tales of Symphonia quits at start**, back to the Steam page (fix44) | The game wants a 2x MSAA render target; r32p1 multisamples at 1x and 4x only, and DXVK 1.10's D3D9 offers 2x anyway, then fails the texture ("Cannot create texture ... Samples: 2") | New MaliBridge erratum `msaa2_as_4`: 2x is offered wherever 4x exists, and 2x images, render passes and pipelines are made with 4 samples |
+| **Ys: The Oath in Felghana shows only the HUD** after a save loads, DirectX 9 version (fix45) | An apitrace shows the world drawn with every world matrix (vertex constants c24-c31) NaN; they come from Microsoft's native `d3dx9_41`/`d3dx9_43`, which return NaN under FEX. The DirectX 8 version, without `d3dx9`, is fine | DroidDeck's known-games table sets `WINEDLLOVERRIDES=d3dx9_41,d3dx9_43=b` for this game (Wine's built-in `d3dx9`), applied by itself at session start |
 | **LSFG unavailable** ("device Vulkan version below 1.2") | The LSFG engine has a Vulkan 1.1 route through three KHR extensions, but the compositor never switched it on, handed the driver a 1.2-only feature struct and did not enable the extensions | fix14: the 1.1 route is on, the memory-model feature goes through its KHR struct, and the three extensions are enabled on the compositor's device |
 
 ## Screenshots
@@ -112,6 +119,8 @@ game you try; "Playable" means a full session without crashes or rendering fault
 | Ys Origin | SD card | Playable | 60-69 in rooms, 61 title | D3D9 32-bit; white rooms fixed by `nan_position`; refractive floors 50-60; Win-FG 2x and LSFG 2x (fix14) work |
 | Ys I & II Chronicles+ (Ys I) | SD card | Playable | 60 field and dialog | D3D9 via DXVK plus Zink; dialog scenes ran at 5-11 fps until the FEX preset for this game was set to **Performance** (TSO off), see Device tips |
 | Tales of Symphonia | SD card | Starts (fix44); play not tested yet | 30 in the opening movie | D3D9 via DXVK; quit at start until fix44 (`msaa2_as_4`) |
+| Ys: The Oath in Felghana | SD card | Save loads and draws (fix45); play not tested yet | 69 standing in Icebound Cave | D3D9 via DXVK; showed only the HUD until fix45 switched it to Wine's built-in `d3dx9`. The DirectX 8 version also works (45 fps) |
+| Ys VI: The Ark of Napishtim | SD card | Save loads and draws; play not tested yet | about 73 standing in the field | D3D9 via DXVK; works as installed. Steam asks which version to start: pick "Play Ys VI" |
 | | | | | |
 | | | | | |
 | | | | | |
@@ -121,7 +130,7 @@ whether the game is on internal storage or the SD card, and the frame-generation
 
 ## Installing
 
-`DroidDeck-MaliBridge-v0.5.4.1-rp4pro-fix44.apk` (on the [Releases](../../releases) page) is DroidDeck Mali
+`DroidDeck-MaliBridge-v0.5.4.1-rp4pro-fix45.apk` (on the [Releases](../../releases) page) is DroidDeck Mali
 v0.5.4.1 built from source with these fixes and the Retro tab. fix14, the earlier build on v0.5.4, is still
 there too. Both are signed with a **personal debug key**, not the author's. Because of that:
 
@@ -219,7 +228,7 @@ Steam's **Quick Access** menu, the same as on a Steam Deck.
 
 ## Source and commit history
 
-This repository holds the build, the write-ups and the evidence. The app that fix44 is built from is on this
+This repository holds the build, the write-ups and the evidence. The app that fix45 is built from is on this
 repository's **[`source`](../../commits/source)** branch: the v0.5.4.1 source release as its first commit, then
 one commit per change, the Retro tab included. The bridge and compositor fixes, with their history, are also on
 branches of the two forks, where each commit is one fix with its reasoning in the message:
@@ -260,7 +269,7 @@ rooms, then the second launch. The pull requests in `docs/` tell each story in f
 | `patches/` | the compositor and frame-generation patches against the `mali-test-build` fork |
 | `tools/` | the Vulkan probes run inside the DroidDeck rootfs during the investigation (`vk*.py`), the apitrace frame replay (`ys_replay.py`), and the preload build / APK repack scripts |
 | `docs/` | the pull-request write-ups sent upstream, and [`PROGRESS-LOG.md`](docs/PROGRESS-LOG.md), the day-by-day investigation log |
-| branch [`source`](../../tree/source) | the whole app fix44 is built from (DroidDeck Mali v0.5.4.1 with the fixes and the Retro tab) |
+| branch [`source`](../../tree/source) | the whole app fix45 is built from (DroidDeck Mali v0.5.4.1 with the fixes and the Retro tab) |
 
 ## Credits
 
