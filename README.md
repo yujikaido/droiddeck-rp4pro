@@ -12,7 +12,12 @@ Claude Code, so they live on the fork branches below instead. Maintainers are we
 Tested on my personal Retroid Pocket 4 Pro only. The fixes switch themselves on for the r32 Mali driver, so the build
 is safe on other phones, but nothing else has been tested on them.
 
-## New in fix42 and fix43
+## New in fix42 to fix44
+
+**fix44: Tales of Symphonia starts.** It used to close at once and drop back to the Steam page. The game asks
+for 2x anti-aliasing (MSAA), and this GPU only does 1x and 4x. DXVK tells the game 2x is there, then can't
+make it, so the game quits. A new bridge erratum, `msaa2_as_4`, offers 2x and quietly makes it with 4 samples,
+so any game that asks for 2x is covered. On fix43 it shows up in the app's **Updates** page.
 
 fix42 is built from source on DroidDeck Mali v0.5.4.1, so it replaces the whole app. It's signed with the same
 personal debug key as fix14, so it installs over it.
@@ -60,6 +65,7 @@ public databases, never the games themselves.
 | Games installed on the SD card hang at a black screen (Ys Origin) | Android mounts the SD card noexec; DroidDeck's noexec shim only covered FEX processes, not Wine's ARM64EC ones | The shim covers Wine's processes too (`tools/linuxfs/preload/noexec.c`) |
 | **White rooms** in Ys Origin (any room with lighting effects, 12 fps) | The game keeps dead particles with NaN matrices in its draw list; a PC GPU drops them, r32p1 draws each as a sheet over the whole screen | New MaliBridge erratum `nan_position`: every vertex shader gets a guard that moves a NaN, Inf or zero-w position outside the clip volume |
 | **Press Play twice**: the first launch with frame generation on crashes the app | The Win-FG engine destroys its images and resets its descriptor pool while a frame is still in flight, and reuses descriptor sets from a destroyed pool at the same frame size | Waits for the GPU before both teardowns; the scratch cache is dropped with its pool |
+| **Tales of Symphonia quits at start**, back to the Steam page (fix44) | The game wants a 2x MSAA render target; r32p1 multisamples at 1x and 4x only, and DXVK 1.10's D3D9 offers 2x anyway, then fails the texture ("Cannot create texture ... Samples: 2") | New MaliBridge erratum `msaa2_as_4`: 2x is offered wherever 4x exists, and 2x images, render passes and pipelines are made with 4 samples |
 | **LSFG unavailable** ("device Vulkan version below 1.2") | The LSFG engine has a Vulkan 1.1 route through three KHR extensions, but the compositor never switched it on, handed the driver a 1.2-only feature struct and did not enable the extensions | fix14: the 1.1 route is on, the memory-model feature goes through its KHR struct, and the three extensions are enabled on the compositor's device |
 
 ## Screenshots
@@ -105,6 +111,7 @@ game you try; "Playable" means a full session without crashes or rendering fault
 | Teenage Mutant Ninja Turtles: Shredder's Revenge | SD card | Playable | 60 average | D3D11 via DXVK, 1280x720, frame generation on; about 20 s black screen at start while shaders compile (normal) |
 | Ys Origin | SD card | Playable | 60-69 in rooms, 61 title | D3D9 32-bit; white rooms fixed by `nan_position`; refractive floors 50-60; Win-FG 2x and LSFG 2x (fix14) work |
 | Ys I & II Chronicles+ (Ys I) | SD card | Playable | 60 field and dialog | D3D9 via DXVK plus Zink; dialog scenes ran at 5-11 fps until the FEX preset for this game was set to **Performance** (TSO off), see Device tips |
+| Tales of Symphonia | SD card | Starts (fix44); play not tested yet | 30 in the opening movie | D3D9 via DXVK; quit at start until fix44 (`msaa2_as_4`) |
 | | | | | |
 | | | | | |
 | | | | | |
@@ -114,15 +121,15 @@ whether the game is on internal storage or the SD card, and the frame-generation
 
 ## Installing
 
-`DroidDeck-MaliBridge-v0.5.4.1-rp4pro-fix43.apk` (on the [Releases](../../releases) page) is DroidDeck Mali
+`DroidDeck-MaliBridge-v0.5.4.1-rp4pro-fix44.apk` (on the [Releases](../../releases) page) is DroidDeck Mali
 v0.5.4.1 built from source with these fixes and the Retro tab. fix14, the earlier build on v0.5.4, is still
 there too. Both are signed with a **personal debug key**, not the author's. Because of that:
 
 - If you have the official DroidDeck Mali installed, **uninstall it first**. Android refuses to install over
   a different signature. You lose the app's settings and have to sign in to Steam again; your Steam library
   on the SD card stays.
-- Updates from inside the app will offer the official builds, which will not install over this one either.
-  When the fixes land upstream, uninstall this and go back to the official APK.
+- From fix43 on, the app's Updates page follows this repository's releases. The official builds will not
+  install over this one. When the fixes land upstream, uninstall this and go back to the official APK.
 
 ## What is inside
 
@@ -212,7 +219,7 @@ Steam's **Quick Access** menu, the same as on a Steam Deck.
 
 ## Source and commit history
 
-This repository holds the build, the write-ups and the evidence. The app that fix43 is built from is on this
+This repository holds the build, the write-ups and the evidence. The app that fix44 is built from is on this
 repository's **[`source`](../../commits/source)** branch: the v0.5.4.1 source release as its first commit, then
 one commit per change, the Retro tab included. The bridge and compositor fixes, with their history, are also on
 branches of the two forks, where each commit is one fix with its reasoning in the message:
@@ -229,6 +236,7 @@ branches of the two forks, where each commit is one fix with its reasoning in th
 | 2026-10-27 | server: nan_position (MK-45), vertex positions guarded on Mali-G77 r32p1 (the white rooms) |
 | 2026-10-28 | server: cached upload memory (VKBRIDGE_CACHED_UPLOAD, opt-in, per game) |
 | 2026-10-28 | server: cached upload per process, coalesced cleans |
+| 2026-10-29 | server: msaa2_as_4 (MK-46), 2x multisampling made with 4 samples (Tales of Symphonia); on the `source` branch only for now |
 
 **[yujikaido/DroidDeck](https://github.com/yujikaido/DroidDeck/branches), branches `rp4pro-noexec-arm64ec`, `rp4pro-framegen-session-reset` and `rp4pro-lsfg-vk11`**
 
@@ -252,7 +260,7 @@ rooms, then the second launch. The pull requests in `docs/` tell each story in f
 | `patches/` | the compositor and frame-generation patches against the `mali-test-build` fork |
 | `tools/` | the Vulkan probes run inside the DroidDeck rootfs during the investigation (`vk*.py`), the apitrace frame replay (`ys_replay.py`), and the preload build / APK repack scripts |
 | `docs/` | the pull-request write-ups sent upstream, and [`PROGRESS-LOG.md`](docs/PROGRESS-LOG.md), the day-by-day investigation log |
-| branch [`source`](../../tree/source) | the whole app fix43 is built from (DroidDeck Mali v0.5.4.1 with the fixes and the Retro tab) |
+| branch [`source`](../../tree/source) | the whole app fix44 is built from (DroidDeck Mali v0.5.4.1 with the fixes and the Retro tab) |
 
 ## Credits
 
