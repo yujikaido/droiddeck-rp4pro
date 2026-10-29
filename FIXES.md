@@ -1,7 +1,8 @@
 # What is fixed, and how
 
+[README](README.md) · [Games](GAMES.md) · [Changelog](CHANGELOG.md) · **Fixes** · [License](LICENSE)
+
 The problems this build fixes, with their causes, the screenshots, the known limits and where the source is.
-Back to the [README](README.md).
 
 ## What is fixed
 

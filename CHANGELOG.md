@@ -1,7 +1,9 @@
 # Changelog
 
+[README](README.md) · [Games](GAMES.md) · **Changelog** · [Fixes](FIXES.md) · [License](LICENSE)
+
 Newest first. Each build is on the [Releases](../../releases) page; from fix43 on, the app's **Updates** page
-offers new ones by itself. Back to the [README](README.md).
+offers new ones by itself.
 
 ## fix45: Ys: The Oath in Felghana draws its world
 

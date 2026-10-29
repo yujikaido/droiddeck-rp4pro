@@ -1,5 +1,7 @@
 # DroidDeck Mali for the Retroid Pocket 4 Pro ( personal build) 
 
+**README** · [Games](GAMES.md) · [Changelog](CHANGELOG.md) · [Fixes](FIXES.md) · [License](LICENSE)
+
  [DroidDeck Mali](https://github.com/ASEbrahim/MaliBridge) (DroidDeck + MaliBridge) for the
 **Retroid Pocket 4 Pro** (MediaTek Dimensity 1100, Mali-G77 MC9, Android 13, Arm driver r32p1). The stock
 v0.5.4 build does not start on this device and two games showed GPU bugs; this build fixes those. Everything
