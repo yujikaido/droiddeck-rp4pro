@@ -14,7 +14,9 @@ Claude Code, so they live on the fork branches below instead. Maintainers are we
 Tested on my personal Retroid Pocket 4 Pro only. The fixes switch themselves on for the r32 Mali driver, so the build
 is safe on other phones, but nothing else has been tested on them.
 
-## What's different from DroidDeck Mali
+## A dedicated build for the Retroid Pocket 4 Pro
+
+This isn't the general DroidDeck Mali build; it's made and tested for the RP4 Pro. What that changes:
 
 - **It runs on the RP4 Pro.** The stock build never gets Steam started on this device's Mali-G77; this one
   does, and games run from the SD card too.
