@@ -11,10 +11,12 @@ The problems this build fixes, with their causes, the screenshots, the known lim
 | Steam never starts: gamescope dies at once | Mali r32p1 refuses an image-format query with `MUTABLE_FORMAT_BIT` on dma-buf images; gamescope needs it for every flippable image | The bridge retries the query without the flag and answers that (MaliBridge `server_opaque.c`) |
 | The whole bridge goes down, or images read back wrong | r32p1 crashes in `vkGetImageSubresourceLayout` on an unbound AHardwareBuffer image, and reports `rowPitch 0` for linear images on AHardwareBuffer pages | A plain "twin" image answers requirements and layouts; linear tiling is hidden under the AHardwareBuffer memory strategy |
 | Games installed on the SD card hang at a black screen (Ys Origin) | Android mounts the SD card noexec; DroidDeck's noexec shim only covered FEX processes, not Wine's ARM64EC ones | The shim covers Wine's processes too (`tools/linuxfs/preload/noexec.c`) |
-| **White rooms** in Ys Origin (any room with lighting effects, 12 fps) | The game keeps dead particles with NaN matrices in its draw list; a PC GPU drops them, r32p1 draws each as a sheet over the whole screen | New MaliBridge erratum `nan_position`: every vertex shader gets a guard that moves a NaN, Inf or zero-w position outside the clip volume |
+| **White rooms** in Ys Origin (any room with lighting effects, 12 fps) | Effect and particle draws get NaN world matrices from Microsoft's native `d3dx9_43`, which computes them wrong under FEX (as in Oath). A PC GPU drops a NaN position; r32p1 draws it as a sheet over the whole screen. (First thought to be the game's dead particles: that was wrong, found at fix48) | First the MaliBridge erratum `nan_position` (every vertex shader moves a NaN, Inf or zero-w position outside the clip volume). Since fix48, DroidDeck's known-games table switches the game to Wine's built-in `d3dx9_43`, and the effects the guard had hidden are back (brazier fire, statue glow) |
 | **Press Play twice**: the first launch with frame generation on crashes the app | The Win-FG engine destroys its images and resets its descriptor pool while a frame is still in flight, and reuses descriptor sets from a destroyed pool at the same frame size | Waits for the GPU before both teardowns; the scratch cache is dropped with its pool |
 | **Tales of Symphonia quits at start**, back to the Steam page (fix44) | The game wants a 2x MSAA render target; r32p1 multisamples at 1x and 4x only, and DXVK 1.10's D3D9 offers 2x anyway, then fails the texture ("Cannot create texture ... Samples: 2") | New MaliBridge erratum `msaa2_as_4`: 2x is offered wherever 4x exists, and 2x images, render passes and pipelines are made with 4 samples |
 | **Ys: The Oath in Felghana shows only the HUD** after a save loads, DirectX 9 version (fix45) | An apitrace shows the world drawn with every world matrix (vertex constants c24-c31) NaN; they come from Microsoft's native `d3dx9_41`/`d3dx9_43`, which return NaN under FEX. The DirectX 8 version, without `d3dx9`, is fine | DroidDeck's known-games table sets `WINEDLLOVERRIDES=d3dx9_41,d3dx9_43=b` for this game (Wine's built-in `d3dx9`), applied by itself at session start |
+| **Tales of Symphonia battles at 15 fps** (fix49) | The game locks its main thread to Windows "CPU 0". On the Dimensity 1100 that is a Cortex-A55 (slow core); the thread sat at 91 % with the GPU 11-23 % busy | DroidDeck's known-games table sets `WINE_CPU_TOPOLOGY=8:4,5,6,7,0,1,2,3`, so Windows CPU 0-3 are the A78s: 30 fps (the game's cap), 60 shown with LSFG 2x |
+| **The Frame limit did not cap DirectX games** (fix48) | Steam -> Settings -> Display -> Frame limit only set the compositor's rate; a game without vsync kept rendering faster and wasting power | The session also sets DXVK's own limiter (`DXVK_FRAME_RATE`) a little above the limit: a 60 limit holds 60.0 fps, and Ys Origin's GPU drops to its lowest clock |
 | **LSFG unavailable** ("device Vulkan version below 1.2") | The LSFG engine has a Vulkan 1.1 route through three KHR extensions, but the compositor never switched it on, handed the driver a 1.2-only feature struct and did not enable the extensions | fix14: the 1.1 route is on, the memory-model feature goes through its KHR struct, and the three extensions are enabled on the compositor's device |
 
 ## Screenshots
@@ -68,7 +70,7 @@ Ys: The Oath in Felghana before and after fix45 is in the [CHANGELOG](CHANGELOG.
 ## What is inside
 
 fix42 and later are built whole from this repository's [`source`](../../tree/source) branch: ASEbrahim's DroidDeck Mali
-v0.5.4.1 source release, with MaliBridge `rp4pro-fixes` in `external/MaliBridge`, the compositor fixes from
+source release (v0.5.4.1 for fix42 to fix45, v0.5.4.2 from fix46), with MaliBridge `rp4pro-fixes` in `external/MaliBridge`, the compositor fixes from
 fix13 and fix14, and the Retro tab, one commit per change.
 
 fix14 and earlier were the stock v0.5.4 APK with three libraries replaced:
@@ -84,14 +86,15 @@ DroidDeck branches for `main`.
 
 ## Source and commit history
 
-This repository holds the build, the write-ups and the evidence. The app that fix45 is built from is on this
+This repository holds the build, the write-ups and the evidence. The app that fix49 is built from is on this
 repository's **[`source`](../../commits/source)** branch: the v0.5.4.1 source release as its first commit, then
-one commit per change, the Retro tab included. The bridge and compositor fixes, with their history, are also on
+one commit per change (ASEbrahim's v0.5.4.2 came in as one commit, fix46), the Retro tab included. The bridge and compositor fixes, with their history, are also on
 branches of the two forks, where each commit is one fix with its reasoning in the message:
 
 **[yujikaido/MaliBridge](https://github.com/yujikaido/MaliBridge/commits/rp4pro-fixes), branch `rp4pro-fixes`**
-(now on v0.5.4.1; the v0.5.4 version that fix14 was built from is kept as `rp4pro-fixes-v054`). PR
-[ASEbrahim/MaliBridge#35](https://github.com/ASEbrahim/MaliBridge/pull/35) was updated to the v0.5.4.1 base.
+(now on v0.5.4.2; the v0.5.4.1 version is kept as `rp4pro-fixes-v0541` and the v0.5.4 one that fix14 was built
+from as `rp4pro-fixes-v054`). PR [ASEbrahim/MaliBridge#35](https://github.com/ASEbrahim/MaliBridge/pull/35) was
+updated to the v0.5.4.2 base, with a correction on `nan_position`'s cause.
 
 | Date | Commit |
 |---|---|
@@ -101,7 +104,7 @@ branches of the two forks, where each commit is one fix with its reasoning in th
 | 2026-10-27 | server: nan_position (MK-45), vertex positions guarded on Mali-G77 r32p1 (the white rooms) |
 | 2026-10-28 | server: cached upload memory (VKBRIDGE_CACHED_UPLOAD, opt-in, per game) |
 | 2026-10-28 | server: cached upload per process, coalesced cleans |
-| 2026-10-29 | server: msaa2_as_4 (MK-46), 2x multisampling made with 4 samples (Tales of Symphonia); on the `source` branch only for now |
+| 2026-10-29 | server: msaa2_as_4 (MK-46), 2x multisampling made with 4 samples (Tales of Symphonia) |
 
 **[yujikaido/DroidDeck](https://github.com/yujikaido/DroidDeck/branches), branches `rp4pro-noexec-arm64ec`, `rp4pro-framegen-session-reset` and `rp4pro-lsfg-vk11`**
 
@@ -116,5 +119,5 @@ branches of the two forks, where each commit is one fix with its reasoning in th
 The order is the order the problems appeared: nothing started, then games from the SD card, then the white
 rooms, then the second launch. The pull requests in `docs/` tell each story in full, and
 [`docs/PROGRESS-LOG.md`](docs/PROGRESS-LOG.md) is the unpolished day-by-day log, dead ends included. The
-fix44 and fix45 changes (the `msaa2_as_4` erratum and the known-games entry for Oath) are on the `source`
-branch.
+fix44 to fix49 changes (the `msaa2_as_4` erratum, the known-games entries for Oath, Ys Origin and Tales of
+Symphonia, the anti-aliasing switch and the Frame limit change) are on the `source` branch.
