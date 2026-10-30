@@ -5,6 +5,20 @@
 Newest first. Each build is on the [Releases](../../releases) page; from fix43 on, the app's **Updates** page
 offers new ones by itself.
 
+## fix51: leaving a Retro game closes its emulator
+
+Leaving a Retro game with Home used to keep the emulator open in the background, with the game paused. It held
+its memory while Steam games ran (memory is tight on the RP4 Pro with a Steam game up), and when DroidDeck itself
+closed, for an update for example, Android brought that game back to the front.
+
+DroidDeck now remembers which emulator a Retro game started in and closes it 5 seconds after you're back on any
+DroidDeck screen, the Steam screen included. The emulator has written its save by then; if you go back into it
+within those 5 seconds, it stays open. Tested with My Boy!.
+
+One thing it can't do: Android keeps the emulator's entry in its recent-apps list, and can reopen it when DroidDeck
+itself closes. One app can't remove another app's entry, so if a game ever pops up after an update, swipe the
+emulator away in Android's recent apps.
+
 ## fix50: fast cores first for every game
 
 Older PC games lock their main thread to Windows "CPU 0". On a PC that is a fast core; on the RP4 Pro's

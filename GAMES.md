@@ -2,7 +2,7 @@
 
 [README](README.md) · **Games** · [Changelog](CHANGELOG.md) · [Fixes](FIXES.md) · [License](LICENSE)
 
-Retroid Pocket 4 Pro, fix13 to fix50, Proton Experimental, default DroidDeck settings unless noted. Add a row
+Retroid Pocket 4 Pro, fix13 to fix51, Proton Experimental, default DroidDeck settings unless noted. Add a row
 for each game you try; "Playable" means a full session without crashes or rendering faults.
 
 | Game | Install | Status | FPS | Notes |
