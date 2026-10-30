@@ -50,10 +50,11 @@ internal class DriverMenus(private val activity: Activity, private val ui: Handl
         autoStatus = autoStatus, releaseStatus = releaseStatus.ifEmpty { activity.getString(R.string.drivers_not_checked) }, checking = releaseChecking,
         linuxRows = linuxRows, linuxSelected = linuxSelected, androidRows = androidRows, androidSelected = androidSelected,
         linuxDownloads = linuxDownloads, androidDownloads = androidDownloads, canRestoreBundled = canRestoreBundled,
-        activeBundle = activeBundle,
+        activeBundle = activeBundle, panVk = panVk,
     )
     var androidRows by mutableStateOf<List<DriverRow>>(emptyList())
     var androidSelected by mutableStateOf("")
+    var panVk by mutableStateOf(false)
 
     fun refreshDrivers() {
         val lm = LinuxVulkanDriverManager(activity)
@@ -88,6 +89,10 @@ internal class DriverMenus(private val activity: Activity, private val ui: Handl
         }
         canRestoreBundled = td.hiddenBundled().isNotEmpty()
         androidSelected = SessionPrefs.androidDriver(activity)
+        val panVkId = td.enumerateImported().firstOrNull {
+            td.libraryName(it)?.startsWith("libvulkan_panfrost") == true
+        }
+        panVk = panVkId != null && androidSelected == panVkId
         activeBundle = DriverBundle.active(activity)?.label
         refreshReleaseRows()
         refreshPairs()
@@ -286,6 +291,25 @@ internal class DriverMenus(private val activity: Activity, private val ui: Handl
                 refreshDrivers()
             }
         }, "import-driver").start()
+    }
+
+    fun applyPanVk(on: Boolean) {
+        val td = TurnipDriver(activity)
+        val id = td.enumerateImported().firstOrNull {
+            td.libraryName(it)?.startsWith("libvulkan_panfrost") == true
+        }
+        if (on && id == null) {
+            android.widget.Toast.makeText(activity, activity.getString(R.string.gpu_panvk_missing), android.widget.Toast.LENGTH_LONG).show()
+            return
+        }
+        SessionPrefs.setAndroidDriver(activity, if (on) id!! else TurnipDriver.AUTO)
+        setMode(false)
+        refreshDrivers()
+        android.widget.Toast.makeText(
+            activity,
+            activity.getString(if (on) R.string.gpu_panvk_on_toast else R.string.gpu_panvk_off_toast),
+            android.widget.Toast.LENGTH_LONG,
+        ).show()
     }
 
     fun selectDriver(id: String, linux: Boolean) {

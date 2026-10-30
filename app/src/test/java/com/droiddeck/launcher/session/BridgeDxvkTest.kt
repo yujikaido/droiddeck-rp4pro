@@ -3,6 +3,7 @@ package com.droiddeck.launcher.session
 import android.content.Context
 import com.droiddeck.launcher.gpu.AppVulkan
 import com.droiddeck.launcher.gpu.GpuInfo
+import com.droiddeck.launcher.gpu.VkBridgeComponent
 import com.droiddeck.launcher.runtime.LinuxRuntime
 import com.github.luben.zstd.ZstdOutputStream
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry
@@ -80,6 +81,25 @@ class BridgeDxvkTest {
         assertEquals(g710File, AppVulkan.fromBridgeFile(old, "Mali-G710 MC10"))
         // and a file written for another driver version is stale
         assertNull(AppVulkan.fromBridgeFile(off, "Mali-G710 MC10", "1.3.212"))
+    }
+
+    @Test fun importedDriverUsesItsOwnReportNotTheSystemDriver() {
+        val system = mapOf("device" to "Mali-G77 MC9", "api" to "1.1.177", "shader_int64" to "no", "max_push_constants" to "256")
+        val panvk = "device=Mali-G77 MC9\napi=1.3.363\ndriver_api=1.3.363\npromotion=off\nshader_int64=1\nmax_push_constants=256\n"
+        assertEquals(AppVulkan(1, 3, true, 256, "bridge"), AppVulkan.selectReport(system, panvk, imported = true))
+        assertNull(ComponentsManager.bridgeDxvk(AppVulkan.selectReport(system, panvk, imported = true)))
+        assertNull(AppVulkan.selectReport(system, null, imported = true))
+        assertEquals(AppVulkan.fromDriver(system), AppVulkan.selectReport(system, panvk, imported = false))
+    }
+
+    @Test fun importedDriverCacheIsKeyedByLibraryContents() {
+        val library = File(context.cacheDir, "test-icd.so")
+        library.writeText("first driver")
+        val first = VkBridgeComponent.importedCacheName(library)
+        assertEquals(first, VkBridgeComponent.importedCacheName(library))
+        library.writeText("second driver")
+        assertNotEquals(first, VkBridgeComponent.importedCacheName(library))
+        library.delete()
     }
 
     @Test fun anAdrenoSessionIsNotTouched() {

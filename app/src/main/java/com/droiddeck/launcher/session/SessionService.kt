@@ -454,6 +454,16 @@ class SessionService : Service() {
         }
         components.forEach { it.start() }
 
+        // An imported ICD may have been probed for the first time just now. Re-evaluate the
+        // automatic DXVK choice before the guest starts, using the bridge's actual driver report.
+        if (steamHere && com.droiddeck.launcher.gpu.VkBridgeComponent.selectedDriverLibrary(this) != null) {
+            runCatching { ComponentsManager.ensureForcedPackages(this) }
+                .onSuccess { if (it != null) Log.i(TAG, it) }
+                .onFailure { Log.w(TAG, "forced components after ICD probe", it) }
+            runCatching { ComponentsManager.republish(this) }
+                .onFailure { Log.w(TAG, "component launch table after ICD probe", it) }
+        }
+
         val line = command.joinToString(" ") {
             it.replace("\\", "\\\\").replace(" ", "\\ ")
         }
@@ -606,7 +616,9 @@ class SessionService : Service() {
     private fun startVkBridge(guest: MutableList<String>, sessionDir: File) {
         if (!com.droiddeck.launcher.core.DeviceSupport.vkBridge(this)) return
         // Under the files dir, which the session binds at its own path: one string for both sides.
-        val socket = File(filesDir, "vkbridge/server.sock")
+        val imported = com.droiddeck.launcher.gpu.VkBridgeComponent.selectedDriverLibrary(this) != null
+        // Keep the optional long-lived in-app system server's socket intact when using an ICD.
+        val socket = File(filesDir, if (imported) "vkbridge/imported.sock" else "vkbridge/server.sock")
         val bridge = com.droiddeck.launcher.gpu.VkBridgeComponent(socket, File(sessionDir, "vkbridge-server.log"))
         bridge.attach(this)
         components.add(bridge)

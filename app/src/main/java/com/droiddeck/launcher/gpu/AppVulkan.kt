@@ -10,13 +10,13 @@ import java.io.File
  * The Vulkan that games see through the Mali bridge: the version, shaderInt64 and the push-constant
  * room, which is what decides the newest DXVK that can start on it (ComponentsManager.bridgeDxvk).
  *
- * Read from <bridge cache dir>/apps-vulkan, which a bridge server with Vulkan promotion writes after
- * its self-test, as left by the last session; else from the phone's own driver (VulkanInfo), which is
- * what a bridge without promotion offers. The file's version counts only with promotion=on (the
+ * Read from <bridge cache dir>/apps-vulkan, written by the bridge after its self-test. For an
+ * imported ICD, the cache is keyed by the selected library and no system-driver fallback is used;
+ * otherwise fall back to the phone's own driver (VulkanInfo). The file's version counts only with promotion=on (the
  * server offers it above the driver's); otherwise, and in files without the field (servers from
  * before it, which wrote the promoted version even where it was not trusted), its driver_api does.
- * A file whose driver_api is not the driver's own version is stale (a driver update, a server
- * rolled back) and left out. null for missing values: a rule must not guess from them.
+ * For the system driver, a file whose driver_api differs from the system driver is stale and left
+ * out. null for missing values: a rule must not guess from them.
  */
 data class AppVulkan(
     val major: Int,
@@ -38,12 +38,21 @@ data class AppVulkan(
         /** null when this session does not draw through the bridge, or nothing could be read. */
         fun detect(context: Context): AppVulkan? {
             if (!DeviceSupport.vkBridge(context)) return null
-            val native = VulkanInfo.query()
+            val imported = VkBridgeComponent.selectedDriverLibrary(context) != null
+            val native = if (imported) emptyMap() else VulkanInfo.query()
             val file = File(VkBridgeComponent.cacheDir(context), BRIDGE_FILE)
-            val fromBridge = FileUtils.readString(file)?.let { fromBridgeFile(it, native["device"], native["api"]) }
-            val found = fromBridge ?: fromDriver(native)
+            // Imported ICDs have their own content-keyed cache; the Android system loader reports
+            // a different driver and must not reject that ICD's report or substitute its features.
+            val found = selectReport(native, FileUtils.readString(file), imported)
             Log.i(TAG, found?.label ?: "unknown (driver query: ${native["error"] ?: "no api line"})")
             return found
+        }
+
+        internal fun selectReport(native: Map<String, String>, bridge: String?, imported: Boolean): AppVulkan? {
+            val fromBridge = bridge?.let {
+                fromBridgeFile(it, if (imported) null else native["device"], if (imported) null else native["api"])
+            }
+            return fromBridge ?: if (imported) null else fromDriver(native)
         }
 
         /**

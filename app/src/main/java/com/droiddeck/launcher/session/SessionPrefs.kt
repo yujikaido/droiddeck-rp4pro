@@ -374,6 +374,8 @@ object SessionPrefs {
     }
 
     fun mangoapp(context: Context): Boolean = prefs(context).getBoolean("mangoapp", true)
+    fun vsyncThread(context: Context): Boolean = prefs(context).getBoolean("vsyncThread", true)
+    fun renderOnCommit(context: Context): Boolean = prefs(context).getBoolean("renderOnCommit", true)
     fun setMangoapp(context: Context, on: Boolean) { prefs(context).edit().putBoolean("mangoapp", on).apply() }
 
     fun zinkLazy(context: Context): Boolean = prefs(context).getBoolean("zinkLazy", true)

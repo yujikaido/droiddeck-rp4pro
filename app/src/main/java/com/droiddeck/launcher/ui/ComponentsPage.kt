@@ -912,6 +912,7 @@ fun ComponentsPage(
                         onSelect = gpuActions.onSelectAndroid, onDelete = gpuActions.onRemoveAndroid, onRefresh = gpuActions.onRefresh,
                         onDownload = gpuActions.onDownloadDriver, onImport = gpuActions.onImportAndroid, onRestore = gpuActions.onRestoreBundled,
                         onBack = { driverPage = null },
+                        panVk = gpu.panVk, onTogglePanVk = gpuActions.onTogglePanVk,
                     )
                 }
             }

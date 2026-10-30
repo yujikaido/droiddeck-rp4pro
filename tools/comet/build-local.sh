@@ -8,6 +8,7 @@ docker run --rm --platform linux/amd64 -v "$repo:/src" \
     set -euo pipefail
     apt-get update -qq
     apt-get install -y -qq curl git unzip ca-certificates pkg-config >/dev/null
+    git config --global --add safe.directory "*"
     export PATH=/rust/cargo/bin:$PATH
     if ! command -v cargo >/dev/null; then
       curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.90.0

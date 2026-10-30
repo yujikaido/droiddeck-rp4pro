@@ -1266,6 +1266,10 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
                 probe.maxLuminance, probe.maxAverageLuminance, probe.minLuminance,
                 probe.ratioAvailable, probe.ratio, Build.VERSION.SDK_INT,
             )
+            // Zero-copy is not only an HDR feature: games present their own gralloc buffers on the
+            // display layer instead of being copied through the screen swapchain (flicker/edge
+            // artifacts). Enable it for every session; the compositor falls back if the driver refuses.
+            WaylandCompositor.nativeSetZeroCopy(true)
             val wanted = SessionPrefs.hdr(this, mode)
             val on = wanted && probe.reason == null
             SessionState.hdr = on
@@ -1282,7 +1286,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         }
         com.droiddeck.launcher.gpu.DriverSetupLog.write(this, "compositor.start driver=$driverId")
         CompositorHost.startOrAttach(
-            holder.surface, runtimeDir.path,
+            this, holder.surface, runtimeDir.path,
             driverId?.let { turnip.driverPath(it) }, driverId?.let { turnip.libraryName(it) },
             applicationInfo.nativeLibraryDir, size.first, size.second, refreshHz(), SessionState.fpsLimit,
         )

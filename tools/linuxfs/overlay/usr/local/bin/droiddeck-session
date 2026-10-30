@@ -193,7 +193,7 @@ if [ "${BL_VKBRIDGE:-0}" = 1 ]; then
     # lines in /root/.vkbridge-env, written with adb run-as; ignored when absent.
     if [ -r /root/.vkbridge-env ]; then
       while IFS='=' read -r _k _v; do
-        case "$_k" in VKBRIDGE_*|BL_VKBRIDGE_*) export "$_k=$_v" ;; esac
+        case "$_k" in VKBRIDGE_*|BL_VKBRIDGE_*|BL_GAMESCOPE_ARGS) export "$_k=$_v" ;; esac
       done < /root/.vkbridge-env
       [ -z "${BL_INSIDE:-}" ] && echo "== vkbridge: development settings from /root/.vkbridge-env: $(cut -d= -f1 /root/.vkbridge-env | tr '\n' ' ')"
     fi

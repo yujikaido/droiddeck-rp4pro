@@ -418,6 +418,15 @@
     <string name="comp_display_driver">Display driver</string>
     <string name="comp_display_driver_hint">Draws frames to the screen in both modes. Restart the app to apply.</string>
     <string name="comp_import_adrenotools">Import an AdrenoTools zip…</string>
+    <string name="gpu_panvk_title">Graphics mode</string>
+    <string name="gpu_panvk_label">PanVK (Vulkan 1.3)</string>
+    <string name="gpu_panvk_desc_on">On: games use the imported PanVK driver. Restart the session to apply.</string>
+    <string name="gpu_panvk_desc_off">Off: games use the phone\'s Mali driver through MaliBridge.</string>
+    <string name="gpu_panvk_enable">Enable PanVK</string>
+    <string name="gpu_panvk_disable">Switch to Mali</string>
+    <string name="gpu_panvk_missing">Import a PanVK driver (adpkg) first</string>
+    <string name="gpu_panvk_on_toast">Switched to PanVK; restart the session to apply</string>
+    <string name="gpu_panvk_off_toast">Back on the system Mali driver; restart the session to apply</string>
     <string name="comp_never">never</string>
     <string name="comp_nightlies_checked">Nightlies checked %1$s</string>
     <string name="comp_title">Components</string>

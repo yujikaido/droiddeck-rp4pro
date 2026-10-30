@@ -217,6 +217,17 @@ android {
     }
 
     signingConfigs {
+        // Lab signing key: keystore/lab-release.jks is local-only; passwords come from environment variables.
+        lab {
+            storeFile rootProject.file('keystore/lab-release.jks')
+            storeType "PKCS12"
+            storePassword System.getenv('LAB_STORE_PASSWORD') ?: ''
+            keyAlias System.getenv('LAB_KEY_ALIAS') ?: 'lab'
+            keyPassword System.getenv('LAB_KEY_PASSWORD') ?: ''
+            enableV1Signing = true
+            enableV2Signing = true
+            enableV3Signing = true
+        }
         testkey {
             storeFile file("${rootDir}/keystore/testkey.p12")
             storeType "PKCS12"
@@ -232,11 +243,11 @@ android {
     buildTypes {
         debug {
             minifyEnabled false
-            signingConfig signingConfigs.testkey
+            signingConfig rootProject.file('keystore/lab-release.jks').exists() ? signingConfigs.lab : signingConfigs.testkey
         }
         release {
             minifyEnabled false
-            signingConfig signingConfigs.testkey
+            signingConfig rootProject.file('keystore/lab-release.jks').exists() ? signingConfigs.lab : signingConfigs.testkey
             // Mali bridge development fork: debuggable so `adb shell run-as` reaches the session
             // logs and VkBridgeNative's development override (-Pdroiddeck.notDebuggable to drop).
             debuggable !project.hasProperty('droiddeck.notDebuggable')

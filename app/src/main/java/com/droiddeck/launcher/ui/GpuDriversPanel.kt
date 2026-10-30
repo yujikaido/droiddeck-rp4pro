@@ -96,6 +96,7 @@ class GpuDriversState(
     val androidDownloads: List<DownloadRow> = emptyList(),
     val canRestoreBundled: Boolean = false,
     val activeBundle: String? = null,
+    val panVk: Boolean = false,
 ) {
     val activePair: PairRow? get() = pairs.firstOrNull { it.active }
 }
@@ -113,6 +114,7 @@ class GpuDriversActions(
     val onImportAndroid: () -> Unit = {},
     val onImportZip: () -> Unit = {},
     val onRestoreBundled: () -> Unit = {},
+    val onTogglePanVk: (Boolean) -> Unit = {},
 )
 
 @Composable

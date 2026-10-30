@@ -73,6 +73,8 @@ fun DriverPage(
     onImport: () -> Unit,
     onRestore: () -> Unit,
     onBack: () -> Unit,
+    panVk: Boolean = false,
+    onTogglePanVk: (Boolean) -> Unit = {},
 ) {
     val host = rememberMenuHost()
     val colors = MaterialTheme.colorScheme
@@ -108,6 +110,16 @@ fun DriverPage(
             }
         },
     ) {
+        SettingsGroup(stringResource(R.string.gpu_panvk_title)) {
+            SettingsRow(
+                stringResource(R.string.gpu_panvk_label),
+                stringResource(if (panVk) R.string.gpu_panvk_desc_on else R.string.gpu_panvk_desc_off),
+            ) {
+                SecondaryButton(stringResource(if (panVk) R.string.gpu_panvk_disable else R.string.gpu_panvk_enable)) {
+                    onTogglePanVk(!panVk)
+                }
+            }
+        }
         SettingsGroup(stringResource(R.string.driver_installed)) {
             val focusRow = rows.firstOrNull { it.id == selected } ?: rows.firstOrNull()
             rows.forEachIndexed { i, row ->

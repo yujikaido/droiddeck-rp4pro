@@ -416,6 +416,15 @@
     <string name="comp_display_driver">显示驱动</string>
     <string name="comp_display_driver_hint">在两种模式下都将帧绘制到屏幕。重启应用以生效。</string>
     <string name="comp_import_adrenotools">导入 AdrenoTools zip 包…</string>
+    <string name="gpu_panvk_title">图形模式</string>
+    <string name="gpu_panvk_label">PanVK（Vulkan 1.3）</string>
+    <string name="gpu_panvk_desc_on">已启用：游戏走导入的 PanVK 驱动，重启会话后生效。</string>
+    <string name="gpu_panvk_desc_off">已关闭：游戏通过 MaliBridge 使用手机自带 Mali 驱动。</string>
+    <string name="gpu_panvk_enable">启用 PanVK</string>
+    <string name="gpu_panvk_disable">切回系统 Mali</string>
+    <string name="gpu_panvk_missing">请先导入 PanVK 驱动（adpkg）</string>
+    <string name="gpu_panvk_on_toast">已切换到 PanVK，重启会话后生效</string>
+    <string name="gpu_panvk_off_toast">已切回系统 Mali 驱动，重启会话后生效</string>
     <string name="comp_never">从未</string>
     <string name="comp_nightlies_checked">每夜构建检查时间：%1$s</string>
     <string name="comp_title">组件</string>
