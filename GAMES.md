@@ -12,14 +12,28 @@ for each game you try; "Playable" means a full session without crashes or render
 | Ys I & II Chronicles+ (Ys I) | SD card | Playable | 60 field and dialog | D3D9 via DXVK plus Zink; dialog scenes ran at 5-11 fps until the FEX preset for this game was set to **Performance** (TSO off), see [Device tips](README.md#other-tips) |
 | Tales of Symphonia | SD card | Playable (fix49) | 30 in battle (the game's cap), 60 shown with LSFG 2x | D3D9 via DXVK; quit at start until fix44 (`msaa2_as_4`); battles ran 15 fps until fix49 moved the game off a slow core. Use Retroid **Performance** mode or higher: on Standard, battles drop to about 12 |
 | Ys: The Oath in Felghana | SD card | Save loads and draws (fix45); play not tested yet | 69 standing in Icebound Cave | D3D9 via DXVK; showed only the HUD until fix45 switched it to Wine's built-in `d3dx9`. The DirectX 8 version also works (45 fps) |
-| Ys VI: The Ark of Napishtim | SD card | Save loads and draws; play not tested yet | about 73 standing in the field | D3D9 via DXVK; works as installed. Steam asks which version to start: pick "Play Ys VI" |
-| Tales of Eternia Remastered | SD card (FAT32) | Does not install | - | Steam stops with "Not enough disk space" although the card has room: one folder holds 9,362 files, more than a FAT32 folder can list. Use internal storage or an exFAT card |
+| Ys VI: The Ark of Napishtim | Internal storage (SD card before) | Starts and runs | about 73 standing in the field | D3D9 via DXVK; works as installed. Steam asks which version to start: pick "Play Ys VI". If it closes a second after starting, see the tip below the table |
+| Tales of Eternia Remastered | SD card (exFAT) | Playable | about 53 in towns and battles | Needs an **exFAT** card or internal storage: on FAT32, Steam stops with "Not enough disk space" (one folder holds 9,362 files, more than a FAT32 folder can list). Copied from a PC instead of downloaded, see the tip below. About a minute to start from a slow card |
+| STAR OCEAN THE SECOND STORY R | | Next to test | - | |
 | | | | | |
 | | | | | |
 | | | | | |
 
 Status words: Playable / Playable with issues / Starts, not playable / Does not start. Please also say
 whether the game is on internal storage or the SD card, and the frame-generation setting if it was on.
+
+## Tips
+
+- **Every game closes about a second after starting?** Steam updated Proton while it was running, and the update
+  put back a graphics layer (DXVK 3) that the Mali chip can't run. Close Steam in DroidDeck and open it again:
+  DroidDeck puts its Mali version (DXVK 1.10.3) back when Steam starts.
+- **Slow downloads to the SD card:** Steam writes downloads in scattered pieces, which many cards handle slowly.
+  Internal storage is much faster, and Steam's *Local Network Game Transfers* can copy a game from another PC at
+  home that has it installed. To fill the card from a PC instead, copy the game's folder from
+  `steamapps\common` **and** its `appmanifest_<id>.acf` file into
+  `Android\data\com.droiddeck.launcher.mali\files\steam\steamapps` on the card (close Steam on the handheld
+  first). Steam then sees the game as installed and downloads nothing. Without the `.acf` file it downloads it all
+  again.
 
 ## Per-game notes
 
