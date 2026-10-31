@@ -14,7 +14,7 @@ for each game you try; "Playable" means a full session without crashes or render
 | Ys: The Oath in Felghana | SD card | Save loads and draws (fix45); play not tested yet | 69 standing in Icebound Cave | D3D9 via DXVK; showed only the HUD until fix45 switched it to Wine's built-in `d3dx9`. The DirectX 8 version also works (45 fps) |
 | Ys VI: The Ark of Napishtim | Internal storage (SD card before) | Starts and runs | about 73 standing in the field | D3D9 via DXVK; works as installed. Steam asks which version to start: pick "Play Ys VI". If it closes a second after starting, see the tip below the table |
 | Tales of Eternia Remastered | SD card (exFAT) | Playable | about 53 in towns and battles | Needs an **exFAT** card or internal storage: on FAT32, Steam stops with "Not enough disk space" (one folder holds 9,362 files, more than a FAT32 folder can list). Copied from a PC instead of downloaded, see the tip below. About a minute to start from a slow card |
-| STAR OCEAN THE SECOND STORY R | | Next to test | - | |
+| STAR OCEAN THE SECOND STORY R | SD card (exFAT) | Playable | about 14 at Ultra + 8x AA; much better with AA off and lower settings | Downloaded in DroidDeck Steam. Graphics settings may carry over from a PC (here it started at Ultra + 8x AA); if it is slow, open **Config**, turn anti-aliasing off and lower the graphics. PC saves load through Steam Cloud. A save loads in about 30-40 seconds from the card |
 | | | | | |
 | | | | | |
 | | | | | |
