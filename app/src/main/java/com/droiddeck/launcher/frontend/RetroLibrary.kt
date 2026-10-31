@@ -182,7 +182,7 @@ object RetroLibrary {
         return byPlatform.mapNotNull { (id, folders) ->
             val platform = Platforms.byId(context, id) ?: return@mapNotNull null
             val players = Platforms.installedPlayers(context, platform).filter { AndroidLaunch.usable(it) }
-            val chosen = playerId(context, id)?.let { pid -> players.firstOrNull { it.id == pid } } ?: byFolderName(players, folders) ?: players.firstOrNull()
+            val chosen = playerId(context, id)?.let { pid -> players.firstOrNull { it.id == pid } } ?: byFolderName(platform, players, folders) ?: players.firstOrNull()
             val games = folders.flatMap { games(context, platform, chosen, it) }
             if (games.isEmpty()) return@mapNotNull null
             val info = HashMap<String, GameInfo.Info>()
@@ -195,9 +195,13 @@ object RetroLibrary {
         }.sortedWith(compareBy({ it.platform.id in arcade }, { it.platform.name.lowercase() })).also { NoIntro.save(context) }
     }
 
-    /** A RetroArch core the folder is named after ("Arcade - Mame 2003 Plus" -> mame2003_plus), the longest such name. */
-    private fun byFolderName(players: List<Platforms.Player>, folders: List<File>): Platforms.Player? {
-        val names = folders.map { it.name.lowercase().replace(Regex("[^a-z0-9]"), "") }
+    /**
+     * A RetroArch core the folder is named after ("Arcade - Mame 2003 Plus" -> mame2003_plus), the longest such name.
+     * A folder named just for the platform ("scummvm") names no core: its first player stays the choice.
+     */
+    private fun byFolderName(platform: Platforms.Platform, players: List<Platforms.Player>, folders: List<File>): Platforms.Player? {
+        val own = setOf(platform.id, platform.shortname).map { it.lowercase().replace(Regex("[^a-z0-9]"), "") }
+        val names = folders.map { it.name.lowercase().replace(Regex("[^a-z0-9]"), "") }.filter { it !in own }
         return players.filter { p -> p.core != null && names.any { n -> p.core.lowercase().replace(Regex("[^a-z0-9]"), "").let { c -> c.length >= 4 && n.contains(c) } } }
             .maxByOrNull { it.core!!.length }
     }

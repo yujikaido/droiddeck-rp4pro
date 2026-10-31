@@ -13,10 +13,23 @@ import java.io.File
 /**
  * A Daijishō player's `am start` arguments as an Intent for one ROM. {file.path} is the ROM's path; {file.uri} a
  * content URI from this app's FileProvider (`<applicationId>.roms`), read access granted to the player's package.
- * A player that needs anything else ({tags.*}: Steam app ids, title ids) is not usable here.
+ * {tags.scummvm_id} is the ScummVM game id written in the file (`kq6-cd-win`, or Daijishō's `[scummvm_id] kq6-cd-win`),
+ * else its name. A player that needs any other tag (Steam app ids, title ids) is not usable here.
  */
 object AndroidLaunch {
     private const val TAG = "AndroidLaunch"
+    const val SCUMMVM_ID = "{tags.scummvm_id}"
+
+    private fun scummvmId(rom: File): String {
+        val lines = runCatching { rom.bufferedReader().use { r -> r.lineSequence().take(20).toList() } }.getOrDefault(emptyList())
+        for (raw in lines) {
+            val line = raw.trim()
+            if (line.isEmpty() || line.startsWith("#")) continue
+            Regex("^\\[scummvm_id]\\s*(\\S+)", RegexOption.IGNORE_CASE).find(line)?.let { return it.groupValues[1] }
+            if (!line.startsWith("[") && line.none { it.isWhitespace() }) return line
+        }
+        return rom.nameWithoutExtension
+    }
 
     class Launch(val intent: Intent, val uri: Uri?)
 
@@ -37,7 +50,7 @@ object AndroidLaunch {
         return out
     }
 
-    fun usable(player: Platforms.Player): Boolean = !player.args.contains("{tags.")
+    fun usable(player: Platforms.Player): Boolean = !player.args.replace(SCUMMVM_ID, "").contains("{tags.")
 
     fun romUri(context: Context, rom: File): Uri =
         FileProvider.getUriForFile(context, "${context.packageName}.roms", rom)
@@ -54,6 +67,7 @@ object AndroidLaunch {
                 val u = uri ?: romUri(context, rom).also { uri = it }
                 v = v.replace("{file.uri}", u.toString())
             }
+            if (v.contains(SCUMMVM_ID)) v = v.replace(SCUMMVM_ID, scummvmId(rom))
             return v.replace("{file.path}", rom.absolutePath).replace("{file.mime}", mime(rom))
                 .replace("{file.name}", rom.name).replace("{file.basename}", rom.nameWithoutExtension)
         }

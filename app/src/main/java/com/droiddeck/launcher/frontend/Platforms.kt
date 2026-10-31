@@ -61,7 +61,11 @@ object Platforms {
                 val list = j.optJSONArray("playerList")
                 val players = (0 until (list?.length() ?: 0)).map { i ->
                     val o = list!!.getJSONObject(i)
-                    Player(o.optString("uniqueId"), o.optString("name"), o.optString("amStartArguments"), regex(o.optString("acceptedFilenameRegex")))
+                    val args = o.optString("amStartArguments")
+                    // ScummVM's own app takes a game id; RetroArch's ScummVM core files (.scummvm) hold one too.
+                    val accept = if (args.contains(AndroidLaunch.SCUMMVM_ID)) Regex("^(.*)\\.(?:dpt|scummvm)$", RegexOption.IGNORE_CASE)
+                        else regex(o.optString("acceptedFilenameRegex"))
+                    Player(o.optString("uniqueId"), o.optString("name"), args, accept)
                 }.filter { it.pkg != null }
                 Platform(p.getString("uniqueId"), p.getString("name"), p.optString("shortname", p.getString("uniqueId")),
                     regex(p.optString("acceptedFilenameRegex")), libretro?.replace(' ', '_'), libretro, players)
