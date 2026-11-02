@@ -8,3 +8,5 @@ build/
 !tests/corpus/*.spv
 __pycache__/
 *.pyc
+build-*/
+tools/lagprobe.exe

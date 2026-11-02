@@ -6,6 +6,7 @@
 #define _GNU_SOURCE
 #include "vkb_server.h"
 #include "server_emu.h"
+#include "vkb_caps.h"
 #include "vkb_ext_alias.h"
 
 #include <pthread.h>
@@ -21,6 +22,16 @@ static int has_ext(const VkExtensionProperties *e, uint32_t n, const char *name)
     for (uint32_t i = 0; i < n; i++)
         if (!strcmp(e[i].extensionName, name)) return 1;
     return 0;
+}
+
+static int ext_faked(const char *name, void *user)
+{
+    (void)user;
+    /* VKBRIDGE_FAKE_MISSING=eds (host tests): the EDS1/EDS2 names go, as on a driver without them */
+    if (!strncmp(name, "VK_EXT_extended_dynamic_state", 29) && strcmp(name, "VK_EXT_extended_dynamic_state3") &&
+        vkb_emu_faked("eds"))
+        return 1;
+    return vkb_emu_faked(name);
 }
 
 const vkb_pd_knowledge *vkb_pd_lookup(const vkb_dispatch *dt, VkPhysicalDevice pd)
@@ -253,16 +264,19 @@ void vkb_sv_vkCreateInstance(vkb_srv_call *c)
         t->proc = c->conn->proc;
         t->api_version = ci->pApplicationInfo ? ci->pApplicationInfo->apiVersion : VK_API_VERSION_1_0;
         t->zink = ci->pApplicationInfo && ci->pApplicationInfo->pEngineName && !strncmp(ci->pApplicationInfo->pEngineName, "mesa zink", 9);
+        t->vkd3d = ci->pApplicationInfo && ci->pApplicationInfo->pEngineName && !strcmp(ci->pApplicationInfo->pEngineName, "vkd3d");
         t->promote_ui = ci->pApplicationInfo && ci->pApplicationInfo->pApplicationName &&
                         !strcmp(ci->pApplicationInfo->pApplicationName, "gamescope");
         vkb_dispatch_load_instance(&t->real, vkb_gipa, inst);
         t->dt = t->real;
         vkb_opaque_instance_install(t);
+        vkb_dab_instance_install(t); /* dma-bufs over AHardwareBuffers: their queries */
         vkb_mem_instance_install(t);
         vkb_emu_instance_install(t);
+        vkb_sparse_instance_install(t);
         vkb_promote_instance_install(t);
         vkb_vidyn_instance_install(t); /* over the promotion's feature query */
-        vkb_errata_gs_instance_install(t); /* issue #11: over all of them, its processes only */
+        vkb_errata_gs_instance_install(t); /* over all of them, its processes only */
         vkb_errata_msaa2_instance_install(t); /* MK-46: 2x sample counts over every other query */
         id = vkb_table_register(t);
         if (!id) {
@@ -315,11 +329,31 @@ void vkb_sv_vkbQueryServer(vkb_srv_call *c)
     if (k) info = k->info;
     else VKB_WARN("query for a physical device the self-test did not see");
     info.client_knobs = vkb_preset_client_knobs(); /* the client's switches: the game's preset file, <cache dir>/env, ... */
+    info.client_knobs |= vkb_syncfd_client_knobs(info.driver_id); /* server_syncfd.c */
+    /* The bridge's own timeline semaphores (server_timeline.c, Mali r18p0/r19p0): the sync mirror's
+     * fence slot waits on a timeline of its own in a second batch, which the bridge's timelines turn
+     * into a CPU wait for the GPU inside every submit with a fence (gamescope's every frame). The
+     * mirror stays off there; VKBRIDGE_SYNC_MIRROR=1 in the guest still turns it on. */
+    if (vkb_timeline_missing(c->dt, pd)) {
+        info.client_knobs = (info.client_knobs & ~(3u << VKB_KNOB_SYNC_MIRROR_SHIFT)) | (VKB_KNOB_OFF << VKB_KNOB_SYNC_MIRROR_SHIFT);
+        VKB_ONCE(VKB_LOG_INFO, "sync mirror off: the timeline semaphores are the bridge's (fence and event status on the wire)");
+    }
     vkb_preset_client_values(&info);               /* the heap cap and GPU identity the app is shown, the same way */
+    info.hitch_ms = vkb_hitch_ms_setting();        /* the per-hitch line (server_hitch.c), the same way */
+    if (info.hitch_ms) vkb_hitch_enable(c->conn->proc, info.hitch_ms);
+    info.latlog = vkb_lat_setting();               /* the latency log (server_latency.c), the same way */
+    info.frame_queue = vkb_frame_queue_setting();  /* the frame queue cap (client/wsi.c), the same way */
+    info.present_wait = vkb_present_wait_setting(); /* present ids and waits offered (client/wsi.c), the same way */
     vkb_mem_cached_gate(&info, mode); /* server_memory.c: cached readback per VKBRIDGE_CACHED_READBACK and the mode */
     info.api_cap = vkb_steam_api_cap(c->table, pd); /* server_apicap.c: the Vulkan version cap for Steam mode's processes */
     if ((info.emu & (VKB_EMU_BGR10_VTX | VKB_EMU_UF11_VTX)) && !vkb_emu_bgr10_for(c->table, pd))
         info.emu &= ~(VKB_EMU_BGR10_VTX | VKB_EMU_UF11_VTX);
+    {
+        /* outside the Steam-mode fix (a game's DXVK, vkd3d, native Vulkan): the driver's dynamic rendering */
+        uint32_t not_a1 = vkb_emu_a1_not_for(c->table);
+        info.emu &= ~not_a1;
+        info.missing &= ~not_a1;
+    }
     vkb_enc_raw(&c->r, &info, sizeof(info));
 }
 
@@ -353,6 +387,7 @@ void vkb_sv_vkCreateDevice(vkb_srv_call *c)
     uint32_t strategy = k ? k->info.strategy : VKB_MEM_NONE;
     uint32_t emu = k ? k->info.emu : 0;
     if ((emu & (VKB_EMU_BGR10_VTX | VKB_EMU_UF11_VTX)) && !vkb_emu_bgr10_for(inst, pd)) emu &= ~(VKB_EMU_BGR10_VTX | VKB_EMU_UF11_VTX);
+    emu &= ~vkb_emu_a1_not_for(inst); /* the driver's dynamic rendering outside the Steam-mode fix */
     {
         /* VKBRIDGE_EMU_OFF=<hex mask of VKB_EMU_* bits>: this device runs without those emulations
          * (the client still reports their features: for bisecting, not for games). */
@@ -374,29 +409,16 @@ void vkb_sv_vkCreateDevice(vkb_srv_call *c)
     uint32_t extra_n = 0;
     char not_passed[600] = "";
     const char *const *extra = vkb_mem_required_extensions(strategy, &extra_n);
-    const char **exts = vkb_dec_alloc(&c->d, (ci->enabledExtensionCount + extra_n + 24) * sizeof(char *));
-    uint32_t n = 0;
-    for (uint32_t i = 0; i < ci->enabledExtensionCount; i++) {
-        const char *e = ci->ppEnabledExtensionNames[i];
-        /* VKBRIDGE_FAKE_MISSING may name extensions the driver is to be taken as lacking (host tests). */
-        if (!has_ext(avail, avail_n, e) || vkb_emu_faked(e)) {
-            /* An EXT name the driver has only as KHR (vkb_ext_alias.h): the KHR one in its place. */
-            const char *k = NULL;
-            for (size_t j = 0; j < VKB_EXT_ALIAS_COUNT && !k; j++)
-                if (!strcmp(vkb_ext_aliases[j].app, e) && has_ext(avail, avail_n, vkb_ext_aliases[j].driver))
-                    k = vkb_ext_aliases[j].driver;
-            if (k) {
-                VKB_INFO("vkCreateDevice: %s enabled as %s", e, k);
-                if (!list_has(exts, n, k)) exts[n++] = k;
-                continue;
-            }
-            VKB_DBG("device extension %s is emulated or client-side; not passed to the driver", e);
-            size_t nl = strlen(not_passed);
-            if (nl + strlen(e) + 2 < sizeof(not_passed)) snprintf(not_passed + nl, sizeof(not_passed) - nl, "%s%s", nl ? " " : "", e);
-            continue;
-        }
-        if (!list_has(exts, n, e)) exts[n++] = e;
-    }
+    uint32_t max_exts = ci->enabledExtensionCount + extra_n + 24;
+    const char **exts = vkb_dec_alloc(&c->d, max_exts * sizeof(char *));
+    /* What the driver actually gets:
+     * 1. only the extensions it has,
+     * 2. the app's EXT names translated to the driver's KHR names if necessary,
+     * 3. the emulated and client-side ones dropped */
+    uint32_t n = vkb_caps_filter_device_extensions(emu, avail, avail_n,
+                                                   ci->ppEnabledExtensionNames, ci->enabledExtensionCount,
+                                                   exts, max_exts, ext_faked, NULL,
+                                                   not_passed, sizeof(not_passed));
     for (uint32_t i = 0; i < extra_n; i++)
         if (has_ext(avail, avail_n, extra[i]) && !list_has(exts, n, extra[i])) exts[n++] = extra[i];
     /* What the client's presentation code uses on every device (dma-buf swapchains, sync fds). */
@@ -406,6 +428,13 @@ void vkb_sv_vkCreateDevice(vkb_srv_call *c)
     };
     for (size_t i = 0; add_wsi && i < sizeof(wsi_exts) / sizeof(wsi_exts[0]); i++)
         if (has_ext(avail, avail_n, wsi_exts[i]) && !list_has(exts, n, wsi_exts[i])) exts[n++] = wsi_exts[i];
+    /* dma-bufs over AHardwareBuffers (server_dmabuf_ahb.c): the driver's AHardwareBuffer import */
+    if (emu & VKB_EMU_DMABUF_AHB) {
+        uint32_t dn;
+        const char *const *de = vkb_dab_driver_exts(&dn);
+        for (uint32_t i = 0; i < dn; i++)
+            if (has_ext(avail, avail_n, de[i]) && !list_has(exts, n, de[i])) exts[n++] = de[i];
+    }
     /* VK_KHR_load_store_op_none is the driver's EXT one under another name (same enumerants). */
     if ((emu & VKB_EMU_LOADSTORE_NONE) && has_ext(avail, avail_n, "VK_EXT_load_store_op_none") &&
         !list_has(exts, n, "VK_EXT_load_store_op_none"))
@@ -421,9 +450,6 @@ void vkb_sv_vkCreateDevice(vkb_srv_call *c)
     if ((emu & VKB_EMU_BCN) && vkb_emu_bcn_astc_hdr(&inst->real, pd, inst->api_version) == 2 &&
         !list_has(exts, n, "VK_EXT_texture_compression_astc_hdr"))
         exts[n++] = "VK_EXT_texture_compression_astc_hdr";
-    /* The BC decoder binds its buffer and image with push descriptors. */
-    if ((emu & VKB_EMU_BCN) && has_ext(avail, avail_n, "VK_KHR_push_descriptor") && !list_has(exts, n, "VK_KHR_push_descriptor"))
-        exts[n++] = "VK_KHR_push_descriptor";
     /* The hang detector asks the driver what faulted once the device is lost. */
     if (vkb_hang_wanted() && has_ext(avail, avail_n, "VK_EXT_device_fault") && !list_has(exts, n, "VK_EXT_device_fault")) {
         VkPhysicalDeviceFaultFeaturesEXT *ff = vkb_dec_alloc(&c->d, sizeof(*ff));
@@ -494,6 +520,40 @@ void vkb_sv_vkCreateDevice(vkb_srv_call *c)
     }
     /* Vulkan 1.2 / 1.3 on a driver below it: the extensions' structures and names (server_promote.c). */
     exts = vkb_promote_device_create_info(inst, pd, ci, exts, &n, c->d.arena);
+    /* Timeline semaphores on wherever the driver has them: the client's fence mirror
+     * (client/syncmirror.c) orders its status write after a submit with one. Turning a feature on
+     * that the app did not ask for changes nothing the app sees. */
+    if (inst->real.vkGetPhysicalDeviceFeatures2) {
+        VkPhysicalDeviceTimelineSemaphoreFeatures have = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES};
+        VkPhysicalDeviceFeatures2 f2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &have};
+        inst->real.vkGetPhysicalDeviceFeatures2(pd, &f2);
+        VkPhysicalDeviceProperties dp;
+        inst->real.vkGetPhysicalDeviceProperties(pd, &dp);
+        int core = dp.apiVersion >= VK_API_VERSION_1_2 && inst->api_version >= VK_API_VERSION_1_2;
+        int ext = has_ext(avail, avail_n, "VK_KHR_timeline_semaphore");
+        VkBaseOutStructure *v12 = NULL, *tl = NULL;
+        for (VkBaseOutStructure *b = (VkBaseOutStructure *)ci->pNext; b; b = b->pNext) {
+            if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES) v12 = b;
+            if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES) tl = b;
+        }
+        if (!have.timelineSemaphore) {
+            /* nothing to turn on */
+        } else if (v12) {
+            ((VkPhysicalDeviceVulkan12Features *)v12)->timelineSemaphore = VK_TRUE;
+        } else if (tl) {
+            ((VkPhysicalDeviceTimelineSemaphoreFeatures *)tl)->timelineSemaphore = VK_TRUE;
+        } else if (core || ext) {
+            VkPhysicalDeviceTimelineSemaphoreFeatures *tf = vkb_dec_alloc(&c->d, sizeof(*tf));
+            if (tf) {
+                memset(tf, 0, sizeof(*tf));
+                tf->sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
+                tf->timelineSemaphore = VK_TRUE;
+                tf->pNext = (void *)ci->pNext;
+                ci->pNext = tf;
+                if (!core && !list_has(exts, n, "VK_KHR_timeline_semaphore")) exts[n++] = "VK_KHR_timeline_semaphore";
+            }
+        }
+    }
     int vidyn = vkb_vidyn_device_create_info(inst, pd, emu, ci, exts, &n); /* Zink's vertex input dynamic state (server_vidyn.c) */
     ci->enabledExtensionCount = n;
     ci->ppEnabledExtensionNames = exts;
@@ -512,7 +572,7 @@ void vkb_sv_vkCreateDevice(vkb_srv_call *c)
     }
     vkb_emu_device_create_info(inst, pd, emu, ci, c->d.arena);
     vkb_errata_fp16_device_create_info(inst, pd, ci); /* MK-20: what an app enables anyway */
-    vkb_errata_gs_device_create_info(inst, pd, ci);   /* issue #11: likewise */
+    vkb_errata_gs_device_create_info(inst, pd, ci);   /* likewise */
     vkb_emu_device_clamp_features(inst, pd, ci, avail, avail_n); /* last: what the driver lacks never reaches it */
 
     {
@@ -557,15 +617,19 @@ void vkb_sv_vkCreateDevice(vkb_srv_call *c)
             dev = VK_NULL_HANDLE;
             r = VK_ERROR_OUT_OF_HOST_MEMORY;
         } else {
+            vkb_qlock_device_init(t); /* beneath everything: every submit, the layers' own too, takes its queue's lock */
             vkb_mem_device_install(t); /* host: another driver's image requirements, beneath every layer */
             vkb_spvfix_fake_init(t); /* host: a driver refusing compute pipelines with YCbCr samplers */
             vkb_guard_device_init(t); /* first: every layer's compiles reach the driver through it */
             vkb_nocomp_device_init(t, nocomp);
             vkb_hang_device_init(t);  /* next: sees the driver-level calls of every layer above it */
             vkb_quirks_device_init(t);
+            vkb_timeline_device_init(t, emu); /* beneath the errata and emulations: the driver sees binary semaphores only */
             vkb_emu_driver_imitate_init(t); /* host: a driver without maintenance5, beneath the errata fixes */
             vkb_errata_device_init(t); /* driver-near: the emulations' own calls reach the fixes too */
+            vkb_dab_device_init(t, emu); /* before the emulations' image records: they note dma-buf images in it */
             vkb_emu_device_init(t, emu);
+            vkb_sparse_device_init(t); /* vkd3d-proton's reserved buffers: real memory beneath the layers above */
             vkb_pcache_device_init(t);
             vkb_pools_device_init(t);
             vkb_nulldesc_device_init(t); /* beneath the set names: it maps the driver's sets to their layouts */
@@ -579,6 +643,7 @@ void vkb_sv_vkCreateDevice(vkb_srv_call *c)
             vkb_cbfail_device_init(t); /* submits leave out command buffers the driver would not begin (server_conn.c) */
             vkb_cu_device_init(t); /* cached upload: cache maintenance around submits and waits (server_cached_upload.c) */
             vkb_syncfd_device_init(t); /* sync-fd exports answered within a deadline (server_syncfd.c) */
+            vkb_syncfb_device_init(t); /* a fence the client's mirror saw done is signalled before it is reset (server_syncfb.c) */
             vkb_report_device_init(t); /* outermost: device losses and long waits as the client sees them */
             vkb_mem_export_install(t);
             VKB_INFO("device %u created on %s (pid %d, %u extensions, memory sharing %s)", id, k ? k->name : "?",
@@ -614,6 +679,8 @@ void vkb_sv_vkDestroyDevice(vkb_srv_call *c)
     vkb_vidyn_device_destroy(t);
     vkb_emu_device_quiesce(t);
     vkb_cbfail_device_destroy(t);
+    vkb_sparse_device_destroy(t);
+    vkb_syncfb_device_destroy(t);
     vkb_bvmap_device_destroy(t);
     vkb_gprof_device_destroy(t);
     vkb_trace_device_destroy(t);
@@ -624,12 +691,15 @@ void vkb_sv_vkDestroyDevice(vkb_srv_call *c)
     vkb_pcache_device_destroy(t);
     vkb_emu_device_destroy(t);
     vkb_errata_device_destroy(t);
+    vkb_timeline_device_destroy(t);
     vkb_promote_device_destroy(t);
     vkb_hang_device_destroy(t);
     vkb_guard_device_destroy(t);
     vkb_report_device_destroy(t);
     vkb_mem_free_all(t);
+    vkb_dab_device_destroy(t);
     t->real.vkDestroyDevice(dev, NULL);
+    vkb_qlock_device_destroy(t); /* server_qlock.c: the device's queue locks */
     VKB_INFO("device %u destroyed", t->id);
     pthread_mutex_destroy(&t->lock);
     free(t);
