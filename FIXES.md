@@ -72,7 +72,9 @@ Ys: The Oath in Felghana before and after fix45 is in the [CHANGELOG](CHANGELOG.
 
 fix42 and later are built whole from this repository's [`source`](../../tree/source) branch: ASEbrahim's DroidDeck Mali
 source release (v0.5.4.1 for fix42 to fix45, v0.5.4.2 from fix46), with MaliBridge `rp4pro-fixes` in `external/MaliBridge`, the compositor fixes from
-fix13 and fix14, and the Retro tab, one commit per change.
+fix13 and fix14, and the Retro tab, one commit per change. From fix53, `external/MaliBridge` is ASEbrahim's
+MaliBridge v0.5.5.1 with the same server fixes moved onto it, and the Linux-side bridge library in the APK
+(`assets/linuxfs/usr/local/lib/vkbridge/libvulkan_droidbridge.so`) is built from that tree too.
 
 fix14 and earlier were the stock v0.5.4 APK with three libraries replaced:
 
@@ -87,9 +89,9 @@ DroidDeck branches for `main`.
 
 ## Source and commit history
 
-This repository holds the build, the write-ups and the evidence. The app that fix51 is built from is on this
+This repository holds the build, the write-ups and the evidence. The app that fix53 is built from is on this
 repository's **[`source`](../../commits/source)** branch: the v0.5.4.1 source release as its first commit, then
-one commit per change (ASEbrahim's v0.5.4.2 came in as one commit, fix46), the Retro tab included. The bridge and compositor fixes, with their history, are also on
+one commit per change (ASEbrahim's v0.5.4.2 came in as one commit, fix46, and his v0.5.5.1 bridge as one, fix53), the Retro tab included. The bridge and compositor fixes, with their history, are also on
 branches of the two forks, where each commit is one fix with its reasoning in the message:
 
 **[yujikaido/MaliBridge](https://github.com/yujikaido/MaliBridge/commits/rp4pro-fixes), branch `rp4pro-fixes`**
@@ -120,5 +122,6 @@ updated to the v0.5.4.2 base, with a correction on `nan_position`'s cause.
 The order is the order the problems appeared: nothing started, then games from the SD card, then the white
 rooms, then the second launch. The pull requests in `docs/` tell each story in full, and
 [`docs/PROGRESS-LOG.md`](docs/PROGRESS-LOG.md) is the unpolished day-by-day log, dead ends included. The
-fix44 to fix51 changes (the `msaa2_as_4` erratum, the known-games entries for Oath and Ys Origin, the
-anti-aliasing switch, the Frame limit change, fast cores first and closing Retro emulators) are on the `source` branch.
+fix44 to fix53 changes (the `msaa2_as_4` erratum, the known-games entries for Oath and Ys Origin, the
+anti-aliasing switch, the Frame limit change, fast cores first, closing Retro emulators, ScummVM on the Retro tab
+and the v0.5.5.1 bridge) are on the `source` branch.

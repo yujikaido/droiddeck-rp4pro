@@ -2,7 +2,7 @@
 
 [README](README.md) · **Games** · [Changelog](CHANGELOG.md) · [Fixes](FIXES.md) · [License](LICENSE)
 
-Retroid Pocket 4 Pro, fix13 to fix51, Proton Experimental, default DroidDeck settings unless noted. Add a row
+Retroid Pocket 4 Pro, fix13 to fix53, Proton Experimental, default DroidDeck settings unless noted. Add a row
 for each game you try; "Playable" means a full session without crashes or rendering faults.
 
 | Game | Install | Status | FPS | Notes |
@@ -15,7 +15,7 @@ for each game you try; "Playable" means a full session without crashes or render
 | Ys VI: The Ark of Napishtim | Internal storage (SD card before) | Starts and runs | about 73 standing in the field | D3D9 via DXVK; works as installed. Steam asks which version to start: pick "Play Ys VI". If it closes a second after starting, see the tip below the table |
 | Tales of Eternia Remastered | SD card (exFAT) | Playable | about 53 in towns and battles | Needs an **exFAT** card or internal storage: on FAT32, Steam stops with "Not enough disk space" (one folder holds 9,362 files, more than a FAT32 folder can list). Copied from a PC instead of downloaded, see the tip below. About a minute to start from a slow card |
 | STAR OCEAN THE SECOND STORY R | SD card (exFAT) | Playable | about 14 at Ultra + 8x AA; much better with AA off and lower settings | Downloaded in DroidDeck Steam. Graphics settings may carry over from a PC (here it started at Ultra + 8x AA); if it is slow, open **Config**, turn anti-aliasing off and lower the graphics. PC saves load through Steam Cloud. A save loads in about 30-40 seconds from the card |
-| Tales of Vesperia: Definitive Edition | Internal storage | Playable | about 60 in battle, 51-57 in the field, about 42 in towns (with anti-aliasing off, no frame generation) | With anti-aliasing on it ran about 27 in battle and 17 in towns. No graphics menu was found in the game: with the game closed, set `antialiasing=0` in `settings.ini` (in the game prefix under `AppData\Local\BANDAI NAMCO Entertainment\Tales of Vesperia`). Frame generation off feels smoother at these speeds. Short stutters on first visits to new areas |
+| Tales of Vesperia: Definitive Edition | Internal storage | Playable | about 60 in battle, 51-57 in the field, about 42 in towns (fix53: about 46) (with anti-aliasing off, no frame generation) | With anti-aliasing on it ran about 27 in battle and 17 in towns. No graphics menu was found in the game: with the game closed, set `antialiasing=0` in `settings.ini` (in the game prefix under `AppData\Local\BANDAI NAMCO Entertainment\Tales of Vesperia`). Frame generation off feels smoother at these speeds. Short stutters on first visits to new areas |
 | | | | | |
 | | | | | |
 | | | | | |

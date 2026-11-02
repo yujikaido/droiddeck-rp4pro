@@ -5,6 +5,43 @@
 Newest first. Each build is on the [Releases](../../releases) page; from fix43 on, the app's **Updates** page
 offers new ones by itself.
 
+## fix53: the MaliBridge v0.5.5.1 bridge
+
+ASEbrahim released MaliBridge v0.5.5 and v0.5.5.1 on November 1. fix53 takes the new **bridge** (the part that
+carries the games' graphics to the GPU) and moves this build's RP4 Pro fixes onto it: the Steam start-up fix, the
+Ys Origin vertex guard, Tales of Symphonia's 2x multisampling and the cached upload switch. The app around it stays
+as it was, so the Retro tab, the per-game settings and fast cores first are unchanged.
+
+What the new bridge brings for this device, from its notes and code:
+- Rendering speedups (ASEbrahim measured 5-14 % on his tablets).
+- Fixes for black screens and flicker on older Mali drivers, and for Steam's menus and Balatro's missing text on
+  r32p1, this device's driver.
+- Its start-up GPU checks are no longer cut short when gamescope starts. Before, that could switch off texture
+  decoding on the GPU on the RP4 Pro.
+
+Tested on the RP4 Pro (top Performance mode, anti-aliasing off, no frame generation):
+
+| | fix52 | fix53 |
+|---|---|---|
+| Steam start | works | works, Big Picture in about 20 s, no bridge errors |
+| Ys Origin, a room | holds the 60 cap | 59.9 (60 cap), GPU about 30 % busy |
+| Ys: The Oath in Felghana, the world | holds the 60 cap | 59.6 (60 cap), GPU about 20 % busy |
+| Tales of Symphonia | reaches the opening movie | reaches the opening movie |
+| Tales of Vesperia, town | about 42 | about 46 (33-53 by spot) |
+| Tales of Vesperia, battle | about 60 | 55-60 |
+| Sleep and resume | works | works, back to 59.7 fps |
+
+Not tested yet: Tales of Symphonia's battles, Ys I's dialog, and a ScummVM game on this build.
+
+## fix52: ScummVM games on the Retro tab
+
+Point-and-click adventure games (King's Quest, Space Quest, Police Quest and the rest of what ScummVM plays) now
+show on the Retro tab and start in the **ScummVM** app from the Play Store, where the touch screen works as the
+mouse. Each game is a small file in a `scummvm` folder of your ROMs folder, named after the game, holding
+ScummVM's id for it (`kq6-cd-win`; Game Options > ID in ScummVM shows it). Add the game in ScummVM once first.
+
+The Retro tab used to pick a RetroArch core for a folder named just `scummvm`; it now keeps the ScummVM app there.
+
 ## fix51: leaving a Retro game closes its emulator
 
 Leaving a Retro game with Home used to keep the emulator open in the background, with the game paused. It held
