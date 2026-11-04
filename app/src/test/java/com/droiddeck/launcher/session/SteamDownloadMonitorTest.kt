@@ -67,6 +67,55 @@ class SteamDownloadMonitorTest {
         }
     }
 
+    @Test fun quietDiskStepsStayActiveUntilTheyEnd() {
+        val root = Files.createTempDirectory("droiddeck-steam-download-").toFile()
+        try {
+            val steam = File(root, "root/.local/share/Steam")
+            val contentLog = File(steam, "logs/content_log.txt").apply {
+                check(parentFile?.mkdirs() != false)
+                writeText("[2026-11-03 21:49:36] AppID 45 App update changed : Running Update,Preallocating,\n")
+            }
+            val monitor = SteamDownloadMonitor()
+
+            // Reserving space on an SD card logs nothing for many minutes.
+            assertTrue(monitor.poll(root, now = 1_000L))
+            assertTrue(monitor.poll(root, now = 20L * 60L * 1000L))
+
+            contentLog.appendText("[2026-11-03 22:01:46] AppID 45 App update changed : Running Update,Committing,\n")
+            assertTrue(monitor.poll(root, now = 21L * 60L * 1000L))
+            assertTrue(monitor.poll(root, now = 40L * 60L * 1000L))
+
+            contentLog.appendText("[2026-11-03 22:20:00] AppID 45 App update changed : None\n")
+            assertFalse(monitor.poll(root, now = 41L * 60L * 1000L))
+
+            contentLog.appendText("[2026-11-04 06:55:01] AppID 46 state changed : Fully Installed,Moving Folder,\n")
+            assertTrue(monitor.poll(root, now = 42L * 60L * 1000L))
+            assertTrue(monitor.poll(root, now = 60L * 60L * 1000L))
+            contentLog.appendText("[2026-11-04 07:05:00] AppID 46 state changed : Fully Installed,\n")
+            assertFalse(monitor.poll(root, now = 61L * 60L * 1000L))
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test fun aDiskStepLeftBehindEndsAfterTheCap() {
+        val root = Files.createTempDirectory("droiddeck-steam-download-").toFile()
+        try {
+            val steam = File(root, "root/.local/share/Steam")
+            File(steam, "logs/content_log.txt").apply {
+                check(parentFile?.mkdirs() != false)
+                writeText("[2026-11-03 22:01:46] AppID 47 App update changed : Running Update,Committing,\n")
+            }
+            val monitor = SteamDownloadMonitor()
+
+            assertTrue(monitor.poll(root, now = 1_000L))
+            assertTrue(monitor.poll(root, now = 1_000L + SteamDownloadMonitor.DISK_STEP_MAX_MS))
+            assertFalse(monitor.poll(root, now = 1_001L + SteamDownloadMonitor.DISK_STEP_MAX_MS))
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
     @Test fun receivedTrafficBridgesSteamRateLines() {
         val root = Files.createTempDirectory("droiddeck-steam-download-").toFile()
         try {

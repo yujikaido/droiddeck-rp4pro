@@ -373,11 +373,18 @@ __attribute__((constructor)) static void resolve(void) {
 }
 #pragma GCC diagnostic pop
 
-static DIR *hit(const struct stat *st, struct handle *h, long long now) {
+/* Steam stages a download with ~20 threads, each listing the folder to match names case-insensitively while
+ * the others create files in it. The folder is stat'ed under the lock, after the last patch, and while one of
+ * our own changes is in flight the listing still holds (the change has not returned yet; patch() or end()
+ * settles it). Before, every listing raced a create, was dropped, and 20 threads re-read 32,000 names on the
+ * card each time: Tales of Eternia staged under 2 files/s. */
+static DIR *hit(const char *path, struct handle *h, long long now) {
+  struct stat now_st, *st = &now_st;
   pthread_mutex_lock(&lock);
   if (!changing) pump(NULL, 0);
-  int slot = find(st->st_dev, st->st_ino);
-  if (slot >= 0 && same(table[slot], st) && now - table[slot]->filled < DIR_TTL_NS && records(table[slot]) == 0) {
+  int slot = stat(path, st) == 0 ? find(st->st_dev, st->st_ino) : -1;
+  if (slot >= 0 && (changing || same(table[slot], st)) && now - table[slot]->filled < DIR_TTL_NS &&
+      records(table[slot]) == 0) {
     h->snap = table[slot];
     h->snap->refs++;
     h->snap->used = now;
@@ -415,6 +422,8 @@ static void filling(struct handle *h, DIR *real, const struct stat *st, long lon
   }
 }
 
+static struct dirent64 *entry(struct handle *h);
+
 static void untrack(struct handle *h) {
   pthread_mutex_lock(&lock);
   int i = registered((DIR *)h);
@@ -439,21 +448,43 @@ DIR *opendir(const char *path) {
   h->wd = -1;
   h->path = copy;
   long long now = now_ns();
-  DIR *d = hit(&st, h, now);
+  DIR *d = hit(path, h, now);
   if (d) return d;
   if (!track(h, path)) {
     free(h->path);
     free(h);
     return next_opendir(path);
   }
+  /* Read the whole folder now, holding oplock so none of our own creates/renames/unlinks lands mid-read (each
+   * would mark the fill dirty and it would never be installed while Steam keeps changing the folder). */
+  pthread_mutex_lock(&oplock);
   DIR *real = stat(path, &st) == 0 ? next_opendir(path) : NULL;
   if (real == NULL) {
+    pthread_mutex_unlock(&oplock);
     untrack(h);
     free(h->path);
     free(h);
     return next_opendir(path);
   }
   filling(h, real, &st, now);
+  while (h->fill && entry(h)) {
+  }
+  pthread_mutex_unlock(&oplock);
+  pthread_mutex_lock(&lock);
+  int slot = find(st.st_dev, st.st_ino);
+  if (slot >= 0 && records(table[slot]) == 0) {
+    h->snap = table[slot];
+    h->snap->refs++;
+    h->snap->used = now;
+  }
+  pthread_mutex_unlock(&lock);
+  if (h->snap) {
+    next_closedir(h->real);
+    h->real = NULL;
+  } else {
+    NEXT(rewinddir);
+    next_rewinddir(h->real);
+  }
   return (DIR *)h;
 }
 
@@ -699,6 +730,8 @@ static int patch(struct side *s, int what, uint32_t event, int ok, int error, co
     return 0;
   }
   stamp(l, &now);
+  /* The listing matched the folder right before our change and now holds it: as fresh as a new fill. */
+  l->filled = now_ns();
   if (!expected) return 0;
   *x = (struct expect){l->wd, event, s->name};
   return 1;
