@@ -23,6 +23,13 @@
 #define MAX_ENTRIES 100000
 #define MAX_HANDLES 64
 #define FUSE_MAGIC 0x65735546
+/* A card library reached natively (/mnt/media_rw, "verified-native") is exFAT or FAT, not FUSE. Those keep
+ * no folder index either, so every listing of a big steamapps/downloading folder reads all of it again: the
+ * same quadratic "Reserving space" as on FUSE (Tales of Eternia, 33,835 files: 11 files/s falling to 5). */
+#define EXFAT_MAGIC 0x2011BAB0
+#define MSDOS_MAGIC 0x4d44
+#define NTFS3_MAGIC 0x7366746e
+#define NTFS_MAGIC 0x5346544e
 #define WATCHED (IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO | IN_DELETE_SELF | IN_MOVE_SELF | IN_ONLYDIR)
 
 #if __SIZEOF_POINTER__ == 8
@@ -115,7 +122,9 @@ static int on_fuse(dev_t dev, const char *path) {
   pthread_mutex_unlock(&lock);
   struct statfs fs;
   int saved = errno;
-  int fuse = statfs(path, &fs) == 0 && (unsigned long)fs.f_type == FUSE_MAGIC;
+  unsigned long type = statfs(path, &fs) == 0 ? (unsigned long)fs.f_type : 0;
+  int fuse = type == FUSE_MAGIC || type == EXFAT_MAGIC || type == MSDOS_MAGIC || type == NTFS3_MAGIC ||
+             type == NTFS_MAGIC;
   errno = saved;
   pthread_mutex_lock(&lock);
   if (ndevs < 8) {
