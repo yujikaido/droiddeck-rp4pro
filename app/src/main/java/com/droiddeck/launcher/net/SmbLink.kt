@@ -98,6 +98,15 @@ class SmbLink private constructor(
     }
 
     companion object {
+        internal const val NO_ENCRYPTION = "SMB_NO_ENCRYPTION"
+
+        /**
+         * A name from the server, safe to put in a device path: not empty, not . or .., and no / \ or control
+         * characters. A server can send any name it likes; one with ../ in it would land outside the folder picked.
+         */
+        fun safeName(name: String): Boolean =
+            name.isNotEmpty() && name != "." && name != ".." && name.none { it == '/' || it == '\\' || it.code < 0x20 || it.code == 0x7f }
+
         fun join(parent: String, name: String): String = if (parent.isEmpty()) name else "$parent\\$name"
 
         fun parent(path: String): String = path.substringBeforeLast('\\', "")
@@ -111,6 +120,7 @@ class SmbLink private constructor(
                 .withReadBufferSize(4 * 1024 * 1024)
                 .withWriteBufferSize(4 * 1024 * 1024)
                 .withTransactBufferSize(4 * 1024 * 1024)
+                .withEncryptData(share.encrypt)
                 .build()
             val client = SMBClient(config)
             try {
@@ -122,6 +132,7 @@ class SmbLink private constructor(
                 val auth = if (share.user.isBlank()) AuthenticationContext.guest()
                 else AuthenticationContext(share.user.trim(), password.toCharArray(), share.domain.trim().ifEmpty { null })
                 val session = connection.authenticate(auth)
+                if (share.encrypt && !session.shouldEncryptData()) throw IllegalStateException(NO_ENCRYPTION)
                 val disk = session.connectShare(share.share.trim().trim('\\', '/')) as? DiskShare
                     ?: throw IllegalStateException("\\\\$host\\${share.share} is not a folder share")
                 return SmbLink(client, connection, session, disk)
@@ -142,6 +153,8 @@ fun describeNetError(e: Throwable): String {
         "STATUS_BAD_NETWORK_NAME" in msg -> "No share by that name on the server"
         "STATUS_ACCESS_DENIED" in msg -> "The server refused access"
         "STATUS_DISK_FULL" in msg -> "The share is full"
+        SmbLink.NO_ENCRYPTION in msg -> "This server can't encrypt (it needs SMB 3). Turn off Encrypt traffic for it, or turn on SMB 3 on the server."
+        "STATUS_ACCESS_DENIED" in msg && "encrypt" in msg.lowercase() -> "The server wants encrypted traffic: turn on Encrypt traffic for this share"
         "ENOSPC" in msg || "No space left" in msg -> "This device's storage is full"
         all.any { it is java.net.UnknownHostException } -> "Can't find that server on the network"
         all.any { it is java.net.ConnectException || it is java.net.SocketTimeoutException || it is java.net.NoRouteToHostException } ||

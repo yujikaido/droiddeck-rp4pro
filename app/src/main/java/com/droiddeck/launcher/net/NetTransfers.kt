@@ -36,8 +36,13 @@ object NetTransfers {
     /** Room left over after a copy, so the device isn't filled to the last byte. */
     private const val SPARE = 256L shl 20
 
-    /** Not enough room on the other side: retrying won't help, so the job stops at once. */
+    /** Not enough room on the other side, or a file name that isn't safe: retrying won't help, so the job stops at once. */
     private class NoSpace(message: String) : java.io.IOException(message)
+
+    /** Files copied at a time (Settings). */
+    fun lanes(context: Context): Int = context.getSharedPreferences("net_shares", Context.MODE_PRIVATE).getInt("lanes", LANES).coerceIn(1, 8)
+
+    fun setLanes(context: Context, n: Int) = context.getSharedPreferences("net_shares", Context.MODE_PRIVATE).edit().putInt("lanes", n).apply()
 
     enum class Direction { DOWN, UP }
     enum class Status { QUEUED, SCANNING, COPYING, RETRYING, DONE, FAILED, CANCELLED }
@@ -165,7 +170,7 @@ object NetTransfers {
                 job.bytesDone = 0L
                 job.filesDone = 0
                 lanes(job, steps.filter { it.dir }, password, window, 1)
-                lanes(job, steps.filter { !it.dir && !it.last }, password, window, LANES)
+                lanes(job, steps.filter { !it.dir && !it.last }, password, window, lanes(context))
                 lanes(job, steps.filter { !it.dir && it.last }, password, window, 1)
                 job.status = if (job.cancelled) Status.CANCELLED else Status.DONE
                 job.current = ""
@@ -224,6 +229,7 @@ object NetTransfers {
         if (job.direction == Direction.DOWN) {
             fun walk(e: NetEntry, local: File) {
                 if (job.cancelled) return
+                if (!SmbLink.safeName(e.name)) throw NoSpace("The share sent a file name that isn't safe to copy: ${e.name.take(60)}")
                 if (e.dir) {
                     out += Step(e.path, local, 0L, e.modified, true)
                     link.list(e.path).forEach { walk(it, File(local, it.name)) }

@@ -38,6 +38,10 @@ object NetSteam {
     fun savePath(context: Context, share: NetShare, path: String) =
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString("steam:${share.id}", path).apply()
 
+    /** Forgets the chosen folder, so the Steam games tab looks for one again. */
+    fun forgetPath(context: Context, share: NetShare) =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().remove("steam:${share.id}").apply()
+
     /** A folder named steamapps at the share's root or one folder down (RP4Pro\steamapps), or null. */
     fun find(link: SmbLink): String? {
         val root = link.list("")
@@ -65,6 +69,8 @@ object NetSteam {
                     ?: acf.name.substring(12, acf.name.length - 4).toIntOrNull() ?: return@mapNotNull null
                 if (appId in com.droiddeck.launcher.frontend.Library.NOT_GAMES) return@mapNotNull null
                 val dir = INSTALL_DIR.find(text)?.groupValues?.get(1)?.trim().orEmpty()
+                // Steam on the device acts on installdir (plays, updates, uninstalls it): only a plain folder name will do
+                if (!SmbLink.safeName(dir) || !SmbLink.safeName(acf.name)) return@mapNotNull null
                 NetSteamGame(
                     appId, NAME.find(text)?.groupValues?.get(1)?.trim().orEmpty().ifEmpty { dir.ifEmpty { "App $appId" } }, dir,
                     SIZE.find(text)?.groupValues?.get(1)?.toLongOrNull() ?: 0L, acf, byName[dir.lowercase()], buildOf(text),

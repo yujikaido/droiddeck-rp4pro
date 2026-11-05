@@ -87,8 +87,17 @@ private class SteamCard(val appId: Int, val name: String, val net: NetSteamGame?
     val localAcf: File? get() = local?.gameFiles?.parentFile?.parentFile?.let { File(it, "appmanifest_$appId.acf") }
 }
 
-/** A device library a game can go into: Steam's own on internal storage, or the card's. */
-private class SteamTarget(val root: File, val label: String) {
+/** The library chosen in Settings for new installs (its folder's path), or null for the card's when there is one. */
+internal fun steamTargetPref(ctx: android.content.Context): String? =
+    ctx.getSharedPreferences("net_shares", android.content.Context.MODE_PRIVATE).getString("steam_target", null)
+
+/** The device libraries a game can go into, named as the Network page shows them. */
+internal fun steamTargets(ctx: android.content.Context): List<SteamTarget> =
+    Library.steamLibraries(ctx).filter { (root, _) -> root.isDirectory }
+        .map { (root, label) -> SteamTarget(root, if (label == "internal") ctx.getString(R.string.net_builtin) else label) }
+
+/** A device library a game can go into: Steam's own on built-in storage, or the card's. */
+internal class SteamTarget(val root: File, val label: String) {
     val free: Long get() = runCatching { (if (root.isDirectory) root else root.parentFile ?: root).usableSpace }.getOrDefault(0L)
 }
 
@@ -164,10 +173,7 @@ internal fun SteamShelfView(share: NetShare, s: FrontEndState, a: FrontEndAction
     val shareIds = onShare.map { it.appId }.toSet()
     val onlyHere = localById.values.filter { it.appId !in shareIds }.sortedBy { it.name.lowercase() }
         .map { SteamCard(it.appId, it.name, null, it, localBuilds[it.appId] ?: 0L) }
-    val targets = remember(localTick) {
-        Library.steamLibraries(ctx).filter { (root, _) -> root.isDirectory }
-            .map { (root, label) -> SteamTarget(root, if (label == "internal") ctx.getString(R.string.net_builtin) else label) }
-    }
+    val targets = remember(localTick) { steamTargets(ctx) }
 
     Column(modifier) {
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp)) {
@@ -297,7 +303,11 @@ private fun SteamGameDialog(card: SteamCard, share: NetShare, shelf: NetSteamShe
     val pal = LocalPalette.current
     val shown = rememberShown(onClose)
     val close = { shown.targetState = false }
-    var target by remember { mutableIntStateOf(targets.indexOfLast { it.label != ctx.getString(R.string.net_builtin) }.coerceAtLeast(0)) }
+    var target by remember {
+        val chosen = steamTargetPref(ctx)
+        mutableIntStateOf(targets.indexOfFirst { it.root.path == chosen }.takeIf { it >= 0 }
+            ?: targets.indexOfLast { it.label != ctx.getString(R.string.net_builtin) }.coerceAtLeast(0))
+    }
     val job = NetTransfers.jobs.lastOrNull { it.appId == card.appId && it.active }
     AppDialog(shown, close, "netSteamGame", wide = true, maxWidth = 760.dp) {
         DialogTitleRow(card.name, onClose = close)

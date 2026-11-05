@@ -2517,4 +2517,25 @@
     <string name="net_steam_backup_old_note">This device has a newer version (build %2$d; %1$s has %3$d). Update the backup to copy the changed files.</string>
     <string name="net_steam_install_update">Install update from %1$s</string>
     <string name="net_steam_close_first">Close Steam first: a game\'s files can\'t be updated while it\'s running.</string>
+    <string name="net_tab_settings">Settings</string>
+    <string name="net_save_password">Save password</string>
+    <string name="net_encrypt">Encrypt (SMB 3)</string>
+    <string name="net_sign_in">Sign in to %1$s</string>
+    <string name="net_sign_in_note">The password for %1$s isn\'t saved on this device. It\'s kept until DroidDeck closes.</string>
+    <string name="net_connect">Connect</string>
+    <string name="net_set_shares">Shares</string>
+    <string name="net_set_guest">guest</string>
+    <string name="net_set_encrypted">encrypted</string>
+    <string name="net_set_ask">password asked each time</string>
+    <string name="net_set_transfers">Transfers</string>
+    <string name="net_set_lanes">Files at a time</string>
+    <string name="net_set_lanes_hint">More is faster for games with many small files. Use 1 or 2 if the NAS is slow or busy.</string>
+    <string name="net_set_target">Install Steam games to</string>
+    <string name="net_set_target_hint">Where Install puts a game unless you pick another place.</string>
+    <string name="net_set_steam">Steam folder on %1$s</string>
+    <string name="net_set_steam_none">Not found yet: it\'s looked for at the top of the share and one folder down.</string>
+    <string name="net_set_find_again">Look again</string>
+    <string name="net_set_pick_in_files">Choose in Files</string>
+    <string name="net_set_safety">Keeping the NAS safe</string>
+    <string name="net_set_safety_note">Give DroidDeck its own NAS user that can reach only this share, not an admin account. Turn on snapshots for its folder so a bad copy can be undone, and never open SMB (port 445) to the internet. A saved password is locked to this device, but anyone with USB debugging access to it can read it: turn off Save password on the share to type it each time instead. Encrypt (SMB 3) protects what crosses the network, but copies more slowly.</string>
 </resources>

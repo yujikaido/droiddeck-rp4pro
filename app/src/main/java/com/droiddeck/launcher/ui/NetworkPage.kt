@@ -23,6 +23,7 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -42,6 +43,7 @@ import androidx.compose.material.icons.outlined.Description
 import androidx.compose.material.icons.outlined.Dns
 import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.Folder
+import androidx.compose.material.icons.outlined.Lock
 import androidx.compose.material.icons.outlined.SdCard
 import androidx.compose.material.icons.outlined.Smartphone
 import androidx.compose.material.icons.outlined.Visibility
@@ -115,16 +117,19 @@ internal fun NetworkPage(s: FrontEndState, a: FrontEndActions, modifier: Modifie
     val share = shares.firstOrNull { it.id == currentId } ?: shares.firstOrNull()
     var editing by remember { mutableStateOf<NetShare?>(null) }
     val narrow = LocalNarrowPane.current
-    // 0 Steam games, 1 Files; L1/R1 flip them wherever focus is (the rail too), as they do Retro's systems
-    var tab by rememberSaveable { mutableIntStateOf(prefs.getInt("tab", 0)) }
+    // 0 Steam games, 1 Files, 2 Settings; L1/R1 step through them wherever focus is (the rail too), as on Retro
+    var tab by rememberSaveable { mutableIntStateOf(prefs.getInt("tab", 0).coerceIn(0, 2)) }
     val pickTab: (Int) -> Unit = { t -> tab = t; prefs.edit().putInt("tab", t).apply() }
-    ShoulderKeys(active = share != null && editing == null) { pickTab((tab + 1) % 2) }
+    ShoulderKeys(active = share != null && editing == null) { d -> pickTab((tab + d + 3) % 3) }
+    // a share that doesn't save its password asks for it once per run, before its games and files
+    var unlockTick by remember { mutableIntStateOf(0) }
+    val locked = remember(share, unlockTick) { share != null && NetShares.needsPassword(ctx, share) }
 
     Column(modifier.padding(horizontal = if (narrow) 16.dp else 22.dp, vertical = if (narrow) 12.dp else 18.dp)) {
         PageHeader(stringResource(R.string.net_title)) {
             if (share != null) {
                 Spacer(Modifier.weight(1f))
-                TabStrip(listOf(stringResource(R.string.net_tab_steam), stringResource(R.string.net_tab_files)), tab, pickTab)
+                TabStrip(listOf(stringResource(R.string.net_tab_steam), stringResource(R.string.net_tab_files), stringResource(R.string.net_tab_settings)), tab, pickTab)
             }
         }
         if (share == null) {
@@ -132,7 +137,8 @@ internal fun NetworkPage(s: FrontEndState, a: FrontEndActions, modifier: Modifie
             Spacer(Modifier.height(14.dp))
             PrimaryButton(stringResource(R.string.net_add), icon = Icons.Outlined.Add) { editing = blankShare() }
         } else {
-            Row(
+            // adding and editing shares lives in Settings; the chips only pick one when there are several
+            if (shares.size > 1) Row(
                 verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp),
                 modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(bottom = 10.dp),
             ) {
@@ -142,12 +148,17 @@ internal fun NetworkPage(s: FrontEndState, a: FrontEndActions, modifier: Modifie
                         prefs.edit().putString("current", sh.id).apply()
                     }
                 }
-                SecondaryButton(stringResource(R.string.net_edit), compact = true, icon = Icons.Outlined.Edit) { editing = share }
-                SecondaryButton(stringResource(R.string.net_add_short), compact = true, icon = Icons.Outlined.Add) { editing = blankShare() }
             }
-            if (tab == 0) SteamShelfView(share, s, a, onEdit = { editing = share }, modifier = Modifier.weight(1f).fillMaxWidth())
-            else Browser(share, Modifier.weight(1f).fillMaxWidth(), onEdit = { editing = share }) { pickTab(0) }
-            Transfers(hint = tab == 1)
+            when {
+                tab == 2 -> NetworkSettings(
+                    shares, share, onEdit = { editing = it }, onAdd = { editing = blankShare() }, onPickInFiles = { pickTab(1) },
+                    modifier = Modifier.weight(1f).fillMaxWidth(),
+                )
+                locked -> SignIn(share, Modifier.weight(1f).fillMaxWidth()) { unlockTick++ }
+                tab == 0 -> SteamShelfView(share, s, a, onEdit = { editing = share }, modifier = Modifier.weight(1f).fillMaxWidth())
+                else -> Browser(share, Modifier.weight(1f).fillMaxWidth(), onEdit = { editing = share }) { pickTab(0) }
+            }
+            Transfers(hint = tab == 1 && !locked)
         }
     }
 
@@ -157,6 +168,7 @@ internal fun NetworkPage(s: FrontEndState, a: FrontEndActions, modifier: Modifie
             isNew = shares.none { it.id == e.id },
             onSaved = { saved ->
                 shares = NetShares.list(ctx)
+                unlockTick++
                 currentId = saved.id
                 prefs.edit().putString("current", saved.id).apply()
             },
@@ -171,6 +183,47 @@ internal fun NetworkPage(s: FrontEndState, a: FrontEndActions, modifier: Modifie
 }
 
 private fun blankShare() = NetShare(NetShares.newId(), "", "", "", "", "")
+
+/** A label beside an on/off switch, for the share dialog's two choices. */
+@Composable
+private fun Switched(label: String, on: Boolean, modifier: Modifier, onChange: (Boolean) -> Unit) {
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = modifier) {
+        ToggleSwitch(on, label = label, onChange = onChange)
+        Text(label, fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onBackground)
+    }
+}
+
+/** A share whose password isn't saved: asks for it, checks it, and keeps it in memory until DroidDeck closes. */
+@Composable
+private fun SignIn(share: NetShare, modifier: Modifier, onDone: () -> Unit) {
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val colors = MaterialTheme.colorScheme
+    var password by remember(share.id) { mutableStateOf("") }
+    var testing by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+    Column(modifier.padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(10.dp, Alignment.CenterVertically)) {
+        Icon(Icons.Outlined.Lock, null, tint = colors.onSurfaceVariant, modifier = Modifier.size(34.dp))
+        Text(stringResource(R.string.net_sign_in, share.title), fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = colors.onBackground)
+        Text(stringResource(R.string.net_sign_in_note, share.user), fontSize = 13.sp, color = colors.onSurfaceVariant, textAlign = TextAlign.Center)
+        OutlinedTextField(
+            password, { password = it }, singleLine = true, label = { Text(stringResource(R.string.net_field_password)) },
+            visualTransformation = PasswordVisualTransformation(), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+            modifier = Modifier.widthIn(max = 360.dp).fillMaxWidth(),
+        )
+        if (error != null) Text(error!!, fontSize = 13.sp, color = colors.error)
+        PrimaryButton(stringResource(if (testing) R.string.net_connecting else R.string.net_connect), enabled = !testing && password.isNotEmpty(), compact = true) {
+            testing = true
+            error = null
+            val pw = password
+            scope.launch {
+                val r = withContext(kotlinx.coroutines.Dispatchers.IO) { runCatching { SmbLink.open(share, pw).use { it.list("") } } }
+                testing = false
+                r.onSuccess { NetShares.rememberPassword(share.id, pw); onDone() }.onFailure { error = describeNetError(it) }
+            }
+        }
+    }
+}
 
 @Composable
 private fun ShareChip(label: String, on: Boolean, onClick: () -> Unit) {
@@ -574,6 +627,8 @@ private fun ShareDialog(share: NetShare, isNew: Boolean, onSaved: (NetShare) -> 
     var user by remember { mutableStateOf(share.user) }
     var password by remember { mutableStateOf("") }
     var showPassword by remember { mutableStateOf(false) }
+    var savePassword by remember { mutableStateOf(share.savePassword) }
+    var encrypt by remember { mutableStateOf(share.encrypt) }
     var testing by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     val colors = MaterialTheme.colorScheme
@@ -601,6 +656,11 @@ private fun ShareDialog(share: NetShare, isNew: Boolean, onSaved: (NetShare) -> 
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password), modifier = Modifier.weight(1f))
         }
         OutlinedTextField(name, { name = it }, singleLine = true, label = { Text(stringResource(R.string.net_field_name)) }, modifier = Modifier.fillMaxWidth())
+        // what each means (and the USB debugging caveat) is spelled out in Settings, under Keeping the NAS safe
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+            Switched(stringResource(R.string.net_save_password), savePassword, Modifier.weight(1f)) { savePassword = it }
+            Switched(stringResource(R.string.net_encrypt), encrypt, Modifier.weight(1f)) { encrypt = it }
+        }
         if (error != null) Text(error!!, fontSize = 13.sp, color = colors.error)
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
             if (!isNew) SecondaryButton(stringResource(R.string.net_remove), compact = true) { onRemoved(); close() }
@@ -609,7 +669,7 @@ private fun ShareDialog(share: NetShare, isNew: Boolean, onSaved: (NetShare) -> 
                 stringResource(if (testing) R.string.net_connecting else R.string.net_test_save),
                 enabled = !testing && host.isNotBlank() && shareName.isNotBlank(), compact = true,
             ) {
-                val candidate = NetShare(share.id, name.trim(), host.trim(), shareName.trim().trim('\\', '/'), user.trim(), share.domain)
+                val candidate = NetShare(share.id, name.trim(), host.trim(), shareName.trim().trim('\\', '/'), user.trim(), share.domain, encrypt, savePassword)
                 val pw = if (password.isEmpty() && !isNew) NetShares.password(ctx, share.id) else password
                 testing = true
                 error = null
