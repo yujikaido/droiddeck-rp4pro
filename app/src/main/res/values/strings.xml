@@ -2475,6 +2475,10 @@
         <item quantity="one">%1$d file</item>
         <item quantity="other">%1$d files</item>
     </plurals>
+    <plurals name="net_done_summary">
+        <item quantity="one">%1$d copy done: %2$s</item>
+        <item quantity="other">%1$d copies done: %2$s</item>
+    </plurals>
     <string name="net_status_failed">Failed: %1$s</string>
     <string name="net_status_cancelled">Cancelled</string>
     <string name="net_channel">Network copies</string>
@@ -2488,7 +2492,6 @@
     <string name="net_steam_missing">No steamapps folder on %1$s yet. Put your games in a steamapps folder (steamapps\\common\\&lt;game&gt; plus each game\'s appmanifest_&lt;id&gt;.acf), at the top of the share or one folder down. Or open the folder in Files and choose Use for Steam games.</string>
     <string name="net_steam_on_share">On %1$s</string>
     <string name="net_steam_share_empty">There are no appmanifest .acf files in this steamapps folder yet.</string>
-    <string name="net_steam_loose">These folders have no .acf, so Steam can\'t take them as installed: %1$s. Copy each game\'s appmanifest_&lt;id&gt;.acf from the PC\'s steamapps folder too.</string>
     <string name="net_steam_only_here">On this device, not backed up</string>
     <string name="net_steam_installed">Installed</string>
     <string name="net_steam_on_share_short">On the share</string>

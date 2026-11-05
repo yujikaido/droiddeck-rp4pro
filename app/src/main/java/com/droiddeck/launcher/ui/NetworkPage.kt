@@ -28,6 +28,7 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
@@ -453,17 +454,34 @@ private fun EntryRow(row: Row2, picked: Boolean, extra: Modifier, onA: () -> Uni
     }
 }
 
-/** The copy queue under the two sides: the latest few jobs, or the controls when there are none. */
+/**
+ * The copy queue under the two sides: copies still running (or failed, to retry) get a row each, finished ones fold
+ * into one line. Height is capped and scrolls, so a long queue never squeezes the games or files out of view.
+ */
 @Composable
 private fun Transfers() {
     val ctx = LocalContext.current
     val colors = MaterialTheme.colorScheme
     val pal = LocalPalette.current
-    val jobs = NetTransfers.jobs.toList().takeLast(3).reversed()
-    Column(Modifier.fillMaxWidth().padding(top = 10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        if (jobs.isEmpty()) {
-            Text(stringResource(R.string.net_hints), fontSize = 12.sp, color = colors.onSurfaceVariant)
-            return
+    val all = NetTransfers.jobs.toList()
+    if (all.isEmpty()) {
+        Text(stringResource(R.string.net_hints), fontSize = 12.sp, color = colors.onSurfaceVariant, modifier = Modifier.padding(top = 10.dp))
+        return
+    }
+    val jobs = all.filter { it.status != NetTransfers.Status.DONE }.reversed()
+    val done = all.filter { it.status == NetTransfers.Status.DONE }.reversed()
+    Column(
+        Modifier.fillMaxWidth().padding(top = 10.dp).heightIn(max = 150.dp).verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        if (done.isNotEmpty() || jobs.any { !it.active }) Row(
+            verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text(
+                if (done.isEmpty()) "" else pluralStringResource(R.plurals.net_done_summary, done.size, done.size, done.joinToString(", ") { it.label }),
+                fontSize = 12.sp, color = colors.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f),
+            )
+            SecondaryButton(stringResource(R.string.net_clear_finished), compact = true) { NetTransfers.clearFinished() }
         }
         jobs.forEach { job ->
             Row(
@@ -499,10 +517,6 @@ private fun Transfers() {
                         SecondaryButton(stringResource(R.string.net_retry), compact = true) { NetTransfers.retry(ctx, job) }
                 }
             }
-        }
-        if (jobs.any { !it.active }) Row {
-            Spacer(Modifier.weight(1f))
-            SecondaryButton(stringResource(R.string.net_clear_finished), compact = true) { NetTransfers.clearFinished() }
         }
     }
 }

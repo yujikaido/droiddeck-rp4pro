@@ -180,9 +180,6 @@ internal fun SteamShelfView(share: NetShare, s: FrontEndState, a: FrontEndAction
                     item(span = { GridItemSpan(maxLineSpan) }) { SectionTitle(stringResource(R.string.net_steam_on_share, share.title), onShare.size.toString()) }
                     if (onShare.isEmpty()) item(span = { GridItemSpan(maxLineSpan) }) { Note(stringResource(R.string.net_steam_share_empty)) }
                     items(onShare, key = { "n${it.appId}" }) { card -> Cover(card) { open = card } }
-                    if (shelf!!.loose.isNotEmpty()) item(span = { GridItemSpan(maxLineSpan) }) {
-                        Note(stringResource(R.string.net_steam_loose, shelf!!.loose.joinToString(", ")))
-                    }
                 }
                 if (onlyHere.isNotEmpty()) {
                     item(span = { GridItemSpan(maxLineSpan) }) { SectionTitle(stringResource(R.string.net_steam_only_here), onlyHere.size.toString()) }
