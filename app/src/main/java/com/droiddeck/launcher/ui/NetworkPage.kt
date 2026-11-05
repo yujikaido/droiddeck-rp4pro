@@ -112,14 +112,12 @@ internal fun NetworkPage(s: FrontEndState, a: FrontEndActions, modifier: Modifie
     val share = shares.firstOrNull { it.id == currentId } ?: shares.firstOrNull()
     var editing by remember { mutableStateOf<NetShare?>(null) }
     val narrow = LocalNarrowPane.current
-    // 0 Steam games, 1 Files; L1/R1 flip them as they do Retro's tabs
+    // 0 Steam games, 1 Files; L1/R1 flip them wherever focus is (the rail too), as they do Retro's systems
     var tab by rememberSaveable { mutableIntStateOf(prefs.getInt("tab", 0)) }
     val pickTab: (Int) -> Unit = { t -> tab = t; prefs.edit().putInt("tab", t).apply() }
+    ShoulderKeys(active = share != null && editing == null) { pickTab((tab + 1) % 2) }
 
-    Column(
-        modifier.padding(horizontal = if (narrow) 16.dp else 22.dp, vertical = if (narrow) 12.dp else 18.dp)
-            .bumpers(onPrevious = { if (share != null) pickTab((tab + 1) % 2) }, onNext = { if (share != null) pickTab((tab + 1) % 2) }),
-    ) {
+    Column(modifier.padding(horizontal = if (narrow) 16.dp else 22.dp, vertical = if (narrow) 12.dp else 18.dp)) {
         PageHeader(stringResource(R.string.net_title)) {
             if (share != null) {
                 Spacer(Modifier.weight(1f))
@@ -146,7 +144,7 @@ internal fun NetworkPage(s: FrontEndState, a: FrontEndActions, modifier: Modifie
             }
             if (tab == 0) SteamShelfView(share, s, a, Modifier.weight(1f).fillMaxWidth())
             else Browser(share, Modifier.weight(1f).fillMaxWidth()) { pickTab(0) }
-            Transfers()
+            Transfers(hint = tab == 1)
         }
     }
 
@@ -459,13 +457,13 @@ private fun EntryRow(row: Row2, picked: Boolean, extra: Modifier, onA: () -> Uni
  * into one line. Height is capped and scrolls, so a long queue never squeezes the games or files out of view.
  */
 @Composable
-private fun Transfers() {
+private fun Transfers(hint: Boolean) {
     val ctx = LocalContext.current
     val colors = MaterialTheme.colorScheme
     val pal = LocalPalette.current
     val all = NetTransfers.jobs.toList()
     if (all.isEmpty()) {
-        Text(stringResource(R.string.net_hints), fontSize = 12.sp, color = colors.onSurfaceVariant, modifier = Modifier.padding(top = 10.dp))
+        if (hint) Text(stringResource(R.string.net_hints), fontSize = 12.sp, color = colors.onSurfaceVariant, modifier = Modifier.padding(top = 10.dp))
         return
     }
     val jobs = all.filter { it.status != NetTransfers.Status.DONE }.reversed()
