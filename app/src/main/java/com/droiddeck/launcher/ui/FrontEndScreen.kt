@@ -189,6 +189,8 @@ class FrontEndActions(
     val onRetroFavorite: (Library.Rom) -> Unit = {},
     val onRetroAddRoot: () -> Unit = {},
     val onRetroRemoveRoot: (String) -> Unit = {},
+    /** The Retro page opened: look for ROMs added since the last scan. */
+    val onRetroOpen: () -> Unit = {},
     val onResume: () -> Unit,
     val onSteamSettings: () -> Unit,
     val onDesktopSettings: () -> Unit,

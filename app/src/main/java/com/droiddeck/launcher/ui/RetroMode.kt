@@ -85,6 +85,7 @@ internal fun RetroStart(s: FrontEndState, a: FrontEndActions, modifier: Modifier
         (played + all.shuffled(java.util.Random(7))).distinctBy { it.hostPath.path }.take(48)
     }
     val tabs = RETRO_SECTIONS.map { it to stringResource(sectionLabel(it)) }
+    LaunchedEffect(Unit) { a.onRetroOpen() }
     LiftHero(
         key = "retro", tabs = tabs,
         onOpen = {}, onPrimary = { RetroNav.open = true },

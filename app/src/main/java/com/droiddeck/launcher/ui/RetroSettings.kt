@@ -176,7 +176,9 @@ internal fun RetroEmulatorDialog(sys: RetroLibrary.System, a: FrontEndActions, o
     RetroChoiceDialog(
         sys.platform.name, players.map { it.label }, chosen,
         before = if (players.isEmpty()) stringResource(R.string.retro_no_player_hint, sys.platform.name,
-            sys.platform.players.map { it.label }.filter { it.isNotBlank() }.distinct().take(6).joinToString(", ")) else null,
+            sys.platform.players.map { it.label }.filter { it.isNotBlank() }.distinct().take(6).joinToString(", "))
+            // DroidDeck can't see which cores RetroArch has; one it lacks plays the game as a black screen
+            else if (players.any { it.core != null }) stringResource(R.string.retro_core_hint) else null,
         after = stringResource(R.string.retro_paths_title) + ": " + sys.folders.joinToString(", ") { it.path },
         onPick = { i -> if (i != chosen) a.onRetroPlayer(sys, players[i]) }, onDismiss = onDismiss,
     )

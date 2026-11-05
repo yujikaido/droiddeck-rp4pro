@@ -710,6 +710,7 @@ class MainActivity : ComponentActivity() {
                             com.droiddeck.launcher.frontend.RetroLibrary.removeRoot(this, path)
                             scanRetro()
                         },
+                        onRetroOpen = { retroOpened() },
                         onRetroWallpaperList = {
                             Thread({
                                 val packs = runCatching { com.droiddeck.launcher.frontend.WallpaperPacks.list(this) }.getOrDefault(emptyList())
@@ -1700,32 +1701,50 @@ class MainActivity : ComponentActivity() {
                     if (shrunk != null) ui.post { if (scanGeneration == libraryScanGeneration) retroList = shrunk }
                 }
             }
-            if (!OfflineMode.enabled(this) && online()) {
-                // game info (year, genre, developer) for platforms whose metadata is missing or a month old
-                var fetched = false
-                // arcade titles, years and genres: the MAME 2003-Plus metadata, downloaded once
-                if (retro.any { com.droiddeck.launcher.frontend.RetroLibrary.isArcade(it.platform.id) } && !com.droiddeck.launcher.frontend.ArcadeTitles.cached(this))
-                    fetched = com.droiddeck.launcher.frontend.ArcadeTitles.fetch(this) || fetched
-                for (sys in retro) {
-                    if (sys.platform.id in com.droiddeck.launcher.frontend.NoIntro.platforms && !com.droiddeck.launcher.frontend.NoIntro.fresh(this, sys.platform.id))
-                        fetched = com.droiddeck.launcher.frontend.NoIntro.fetch(this, sys.platform) || fetched
-                    if (sys.platform.id in setOf("mame", "neogeo")) continue
-                    if (!com.droiddeck.launcher.frontend.GameInfo.fresh(this, sys.platform.id))
-                        fetched = com.droiddeck.launcher.frontend.GameInfo.fetch(this, sys.platform) || fetched
-                }
-                if (fetched) runCatching { com.droiddeck.launcher.frontend.RetroLibrary.scan(this) }.getOrNull()?.let { r ->
-                    ui.post { if (scanGeneration == libraryScanGeneration) retroList = r }
-                }
-            }
-            if (!OfflineMode.enabled(this) && online()) {
-                // CoverArt fetches at most 40 a pass: keep going while passes find covers, refreshing the page each time
-                var rounds = 0
-                while (rounds++ < 30 && CoverArt.fetchMissing(this, retro.flatMap { it.games })) {
-                    val refreshed = runCatching { com.droiddeck.launcher.frontend.RetroLibrary.scan(this) }.getOrNull() ?: break
-                    ui.post { if (scanGeneration == libraryScanGeneration) retroList = refreshed }
-                }
-            }
+            retroExtras(retro) { scanGeneration == libraryScanGeneration }
         }, "library").start()
+    }
+
+    /** Game info and covers for the Retro page's games (on a background thread), showing the list again as they come. */
+    private fun retroExtras(retro: List<com.droiddeck.launcher.frontend.RetroLibrary.System>, current: () -> Boolean) {
+        if (OfflineMode.enabled(this) || !online()) return
+        // game info (year, genre, developer) for platforms whose metadata is missing or a month old
+        var fetched = false
+        // arcade titles, years and genres: the MAME 2003-Plus metadata, downloaded once
+        if (retro.any { com.droiddeck.launcher.frontend.RetroLibrary.isArcade(it.platform.id) } && !com.droiddeck.launcher.frontend.ArcadeTitles.cached(this))
+            fetched = com.droiddeck.launcher.frontend.ArcadeTitles.fetch(this) || fetched
+        for (sys in retro) {
+            if (sys.platform.id in com.droiddeck.launcher.frontend.NoIntro.platforms && !com.droiddeck.launcher.frontend.NoIntro.fresh(this, sys.platform.id))
+                fetched = com.droiddeck.launcher.frontend.NoIntro.fetch(this, sys.platform) || fetched
+            if (sys.platform.id in setOf("mame", "neogeo")) continue
+            if (!com.droiddeck.launcher.frontend.GameInfo.fresh(this, sys.platform.id))
+                fetched = com.droiddeck.launcher.frontend.GameInfo.fetch(this, sys.platform) || fetched
+        }
+        if (fetched) runCatching { com.droiddeck.launcher.frontend.RetroLibrary.scan(this) }.getOrNull()?.let { r ->
+            ui.post { if (current()) retroList = r }
+        }
+        // CoverArt fetches at most 40 a pass: keep going while passes find covers, refreshing the page each time
+        var rounds = 0
+        while (rounds++ < 30 && CoverArt.fetchMissing(this, retro.flatMap { it.games })) {
+            val refreshed = runCatching { com.droiddeck.launcher.frontend.RetroLibrary.scan(this) }.getOrNull() ?: break
+            ui.post { if (current()) retroList = refreshed }
+        }
+    }
+
+    /**
+     * The Retro page opened: look at the ROM folders again, so games copied in while DroidDeck stayed open (the
+     * Network page, a file manager) show without leaving the app. New games get their info and covers.
+     */
+    private fun retroOpened() {
+        val gen = libraryScanGeneration
+        val before = retroList.flatMap { s -> s.games.map { it.hostPath.path } }.toSet()
+        Thread({
+            val retro = runCatching { com.droiddeck.launcher.frontend.RetroLibrary.scan(this) }.getOrNull() ?: return@Thread
+            val now = retro.flatMap { s -> s.games.map { it.hostPath.path } }.toSet()
+            if (now == before) return@Thread
+            ui.post { if (gen == libraryScanGeneration) retroList = retro; refreshRetroState() }
+            if (!now.all { it in before }) retroExtras(retro) { gen == libraryScanGeneration }
+        }, "retro-open").start()
     }
 
     /** A validated internet connection: without one every cover lookup fails and would be remembered as missing. */
@@ -1770,7 +1789,12 @@ class MainActivity : ComponentActivity() {
         player.pkg?.let { pkg -> runCatching { (getSystemService(ACTIVITY_SERVICE) as android.app.ActivityManager).killBackgroundProcesses(pkg) } }
         ui.postDelayed({
             try {
-                startActivity(launch.intent)
+                if (launch.fileUri) {
+                    // Android throws FileUriExposedException for a file:// intent; allow it for this one launch
+                    val policy = android.os.StrictMode.getVmPolicy()
+                    android.os.StrictMode.setVmPolicy(android.os.StrictMode.VmPolicy.Builder().build())
+                    try { startActivity(launch.intent) } finally { android.os.StrictMode.setVmPolicy(policy) }
+                } else startActivity(launch.intent)
                 player.pkg?.let { com.droiddeck.launcher.frontend.RetroPlayerClose.started(this, it) }
                 com.droiddeck.launcher.frontend.RetroStats.played(this, rom.hostPath.path)
                 retroStats = com.droiddeck.launcher.frontend.RetroStats.all(this)

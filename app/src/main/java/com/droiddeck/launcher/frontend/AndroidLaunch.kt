@@ -31,7 +31,14 @@ object AndroidLaunch {
         return rom.nameWithoutExtension
     }
 
-    class Launch(val intent: Intent, val uri: Uri?)
+    /** [fileUri]: the intent carries a file:// URI, which Android refuses to send unless StrictMode lets it. */
+    class Launch(val intent: Intent, val uri: Uri?, val fileUri: Boolean = false)
+
+    /**
+     * Emulators that take a content URI and then don't play it: DraStic opens its own menu instead of the game. They
+     * get the ROM as a file:// URI (they read shared storage themselves).
+     */
+    private val wantsFilePath = setOf("com.dsemu.drastic")
 
     private fun tokens(args: String): List<String> {
         val out = ArrayList<String>()
@@ -61,8 +68,10 @@ object AndroidLaunch {
     fun build(context: Context, player: Platforms.Player, rom: File): Launch? {
         if (!usable(player)) return null
         var uri: Uri? = null
+        val asFile = player.pkg in wantsFilePath
         fun fill(s: String): String {
             var v = s
+            if (asFile) v = v.replace("{file.uri}", Uri.fromFile(rom).toString())
             if (v.contains("{file.uri}")) {
                 val u = uri ?: romUri(context, rom).also { uri = it }
                 v = v.replace("{file.uri}", u.toString())
@@ -116,6 +125,6 @@ object AndroidLaunch {
                 runCatching { context.grantUriPermission(pkg, u, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION) }
             }
         }
-        return Launch(intent, uri)
+        return Launch(intent, uri, asFile && intent.data?.scheme == "file")
     }
 }

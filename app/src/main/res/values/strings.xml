@@ -2380,6 +2380,7 @@
     <string name="retro_no_player_hint">No installed emulator plays %1$s. Install one of: %2$s</string>
     <string name="retro_player_unusable">%1$s needs details DroidDeck does not have; pick another emulator</string>
     <string name="retro_launch_failed">%1$s did not start</string>
+    <string name="retro_core_hint">A RetroArch choice needs its core downloaded in RetroArch first (Main Menu → Online Updater → Core Downloader). Without it the game opens to a black screen.</string>
     <string name="retro_wallpapers">Wallpapers</string>
     <string name="retro_wallpapers_hint">Platform wallpaper packs made by the Daijishō community. The one you pick downloads once.</string>
     <string name="retro_wallpapers_busy">Downloading %1$s…</string>

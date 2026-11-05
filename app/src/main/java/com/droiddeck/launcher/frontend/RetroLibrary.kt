@@ -156,7 +156,9 @@ object RetroLibrary {
     private fun games(context: Context, platform: Platforms.Platform, player: Platforms.Player?, folder: File): List<Library.Rom> {
         val accept = player?.accept ?: platform.accept
         val files = ArrayList<File>()
-        folder.walkTopDown().maxDepth(MAX_DEPTH).filter { it.isFile && !it.name.startsWith(".") }.forEach { files.add(it) }
+        // a "bios" folder beside the games (PS2/bios/scph39001.bin) holds the emulator's BIOS, not games
+        folder.walkTopDown().maxDepth(MAX_DEPTH).onEnter { it == folder || it.name.lowercase() != "bios" }
+            .filter { it.isFile && !it.name.startsWith(".") }.forEach { files.add(it) }
         val sheets = files.filter { it.extension.lowercase() in setOf("cue", "m3u", "gdi") }
         val named = sheets.flatMap { s -> runCatching { s.readLines().take(200) }.getOrDefault(emptyList()) }
             .flatMap { line -> Regex("[^\"\\\\/]+\\.[A-Za-z0-9]{2,4}").findAll(line).map { it.value.trim().lowercase() } }.toSet()
@@ -166,7 +168,9 @@ object RetroLibrary {
                 !(ext == "zip" && f.nameWithoutExtension.lowercase() in biosSets) &&
                 !(f.name.lowercase() in named && sheets.none { it == f })
         }.sortedBy { it.name.lowercase() }.map { f ->
-            val rom = Library.Rom(displayTitle(context, platform.id, f.nameWithoutExtension, f), f, f.absolutePath, ID_PREFIX + platform.id)
+            // a converted PS1 disc is always EBOOT.PBP; its folder carries the game's name
+            val stem = f.nameWithoutExtension.takeUnless { it.equals("EBOOT", true) && f.parentFile != folder } ?: f.parentFile!!.name
+            val rom = Library.Rom(displayTitle(context, platform.id, stem, f), f, f.absolutePath, ID_PREFIX + platform.id)
             CoverArt.cached(context, rom)?.let { Library.Rom(rom.name, rom.hostPath, rom.guestPath, rom.emulatorId, it) } ?: rom
         }
     }
