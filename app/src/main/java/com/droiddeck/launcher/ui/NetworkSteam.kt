@@ -135,11 +135,19 @@ internal fun SteamShelfView(share: NetShare, s: FrontEndState, a: FrontEndAction
         error = null
         missing = false
         val r = withContext(io) {
-            runCatching {
-                val l = link ?: SmbLink.open(share, NetShares.password(ctx, share.id))
-                link = l
+            // the connection kept from the last scan may have been dropped by the server while idle: on any failure
+            // with it, scan once more on a new one before calling the share unreachable
+            fun scan(l: SmbLink): NetSteamShelf? {
                 val path = NetSteam.savedPath(ctx, share)?.takeIf { p -> runCatching { l.list(p) }.isSuccess } ?: NetSteam.find(l)
-                path?.let { NetSteam.savePath(ctx, share, it); NetSteam.scan(l, it) }
+                return path?.let { NetSteam.savePath(ctx, share, it); NetSteam.scan(l, it) }
+            }
+            val kept = link
+            runCatching { scan(kept ?: throw IllegalStateException()) }.recoverCatching {
+                runCatching { kept?.close() }
+                link = null
+                val fresh = SmbLink.open(share, NetShares.password(ctx, share.id))
+                link = fresh
+                scan(fresh)
             }
         }
         busy = false

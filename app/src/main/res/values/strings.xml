@@ -2538,4 +2538,5 @@
     <string name="net_set_pick_in_files">Choose in Files</string>
     <string name="net_set_safety">Keeping the NAS safe</string>
     <string name="net_set_safety_note">Give DroidDeck its own NAS user that can reach only this share, not an admin account. Turn on snapshots for its folder so a bad copy can be undone, and never open SMB (port 445) to the internet. A saved password is locked to this device, but anyone with USB debugging access to it can read it: turn off Save password on the share to type it each time instead. Encrypt (SMB 3) protects what crosses the network, but copies more slowly.</string>
+    <string name="net_remove_confirm">Press again to remove</string>
 </resources>

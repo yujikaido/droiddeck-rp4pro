@@ -176,6 +176,7 @@ internal fun NetworkPage(s: FrontEndState, a: FrontEndActions, modifier: Modifie
                 NetShares.remove(ctx, e.id)
                 shares = NetShares.list(ctx)
                 currentId = shares.firstOrNull()?.id
+                prefs.edit().putString("current", currentId).apply()
             },
             onClose = { editing = null },
         )
@@ -280,9 +281,17 @@ private fun Browser(share: NetShare, modifier: Modifier, onEdit: () -> Unit, onS
         val l = link ?: return
         scope.launch {
             remoteError = null
-            val r = withContext(io) { runCatching { l.list(path) } }
+            // an idle connection can be dropped by the server: try once more on a new one before showing an error
+            var fresh: SmbLink? = null
+            val r = withContext(io) {
+                runCatching { l.list(path) }.recoverCatching {
+                    runCatching { l.close() }
+                    SmbLink.open(share, NetShares.password(ctx, share.id)).also { fresh = it }.list(path)
+                }
+            }
+            if (fresh != null) link = fresh
             r.onSuccess { remotePath = path; remoteEntries = it; remotePicked = emptySet() }
-                .onFailure { remoteError = describeNetError(it); runCatching { withContext(io) { l.close() } }; link = null }
+                .onFailure { remoteError = describeNetError(it); runCatching { withContext(io) { (fresh ?: l).close() } }; link = null }
         }
     }
 
@@ -412,16 +421,17 @@ internal fun adoptedCardName(ctx: Context): String? {
 
 /** The share didn't answer: what went wrong, then Retry and (when there's a share to fix) Edit share. */
 @Composable
-internal fun Unreachable(title: String, error: String, onRetry: () -> Unit, onEdit: (() -> Unit)?, modifier: Modifier = Modifier) {
+internal fun Unreachable(title: String, error: String, onRetry: () -> Unit, onEdit: (() -> Unit)?, modifier: Modifier = Modifier, compact: Boolean = false) {
     val colors = MaterialTheme.colorScheme
+    // compact: inside a Files pane, which is too short for the icon and the roomy spacing; it scrolls if still too short
     Column(
-        modifier.padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterVertically),
+        modifier.verticalScroll(rememberScrollState()).padding(if (compact) 10.dp else 16.dp), horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(if (compact) 5.dp else 8.dp, Alignment.CenterVertically),
     ) {
-        Icon(Icons.Outlined.CloudOff, null, tint = colors.onSurfaceVariant, modifier = Modifier.size(34.dp))
+        if (!compact) Icon(Icons.Outlined.CloudOff, null, tint = colors.onSurfaceVariant, modifier = Modifier.size(34.dp))
         Text(stringResource(R.string.net_unreachable, title), fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = colors.onBackground, textAlign = TextAlign.Center)
         Text(error, fontSize = 13.sp, color = colors.onSurfaceVariant, textAlign = TextAlign.Center)
-        Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.padding(top = 6.dp)) {
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.padding(top = if (compact) 2.dp else 6.dp)) {
             SecondaryButton(stringResource(R.string.net_retry), compact = true, icon = Icons.Outlined.Refresh, onClick = onRetry)
             if (onEdit != null) SecondaryButton(stringResource(R.string.net_edit), compact = true, icon = Icons.Outlined.Edit, onClick = onEdit)
         }
@@ -484,7 +494,7 @@ private fun Side(
                     CircularProgressIndicator(strokeWidth = 2.dp, color = pal.signal, modifier = Modifier.size(18.dp))
                     Text(stringResource(R.string.net_connecting), fontSize = 13.sp, color = colors.onSurfaceVariant)
                 }
-                error != null -> Unreachable(title, error, onRetry, onEdit)
+                error != null -> Unreachable(title, error, onRetry, onEdit, compact = true)
                 rows.isEmpty() -> Text(stringResource(R.string.net_empty_folder), fontSize = 13.sp, color = colors.onSurfaceVariant)
                 else -> LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
                     itemsIndexed(rows, key = { _, r -> r.key }) { _, row ->
@@ -631,6 +641,7 @@ private fun ShareDialog(share: NetShare, isNew: Boolean, onSaved: (NetShare) -> 
     var encrypt by remember { mutableStateOf(share.encrypt) }
     var testing by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
+    var confirmRemove by remember { mutableStateOf(false) }
     val colors = MaterialTheme.colorScheme
     AppDialog(shown, close, "netShare", wide = false, maxWidth = 640.dp) {
         DialogTitleRow(stringResource(if (isNew) R.string.net_add else R.string.net_edit), onClose = close)
@@ -663,7 +674,10 @@ private fun ShareDialog(share: NetShare, isNew: Boolean, onSaved: (NetShare) -> 
         }
         if (error != null) Text(error!!, fontSize = 13.sp, color = colors.error)
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
-            if (!isNew) SecondaryButton(stringResource(R.string.net_remove), compact = true) { onRemoved(); close() }
+            // a second press removes it: the first only asks, so a stray A on the button can't drop a share
+            if (!isNew) SecondaryButton(stringResource(if (confirmRemove) R.string.net_remove_confirm else R.string.net_remove), compact = true) {
+                if (confirmRemove) { onRemoved(); close() } else confirmRemove = true
+            }
             Spacer(Modifier.weight(1f))
             PrimaryButton(
                 stringResource(if (testing) R.string.net_connecting else R.string.net_test_save),
