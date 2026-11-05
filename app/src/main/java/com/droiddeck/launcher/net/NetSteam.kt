@@ -84,6 +84,9 @@ object NetSteam {
         return NetSteamShelf(steamapps, games, loose)
     }
 
+    /** SizeOnDisk in an .acf's text, or 0. */
+    fun sizeOf(acf: String): Long = SIZE.find(acf)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
+
     /** The buildid in an .acf's text, or 0. */
     fun buildOf(acf: String): Long = BUILD.find(acf)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
 

@@ -75,8 +75,10 @@ import java.io.File
 import java.util.concurrent.Executors
 
 /** One cover on the Steam games tab: a game on the share, on this device, or both. [localBuild]: the device .acf's buildid. */
-private class SteamCard(val appId: Int, val name: String, val net: NetSteamGame?, val local: Library.SteamGame?, val localBuild: Long = 0L) {
-    val size: Long get() = net?.size ?: 0L
+private class SteamCard(
+    val appId: Int, val name: String, val net: NetSteamGame?, val local: Library.SteamGame?, val localBuild: Long = 0L, val localSize: Long = 0L,
+) {
+    val size: Long get() = net?.size?.takeIf { it > 0L } ?: localSize
     private val both: Boolean get() = net != null && local != null && net.build > 0L && localBuild > 0L
     /** The share has a newer build than the device (updated on the PC). */
     val updateHere: Boolean get() = both && net!!.build > localBuild
@@ -120,6 +122,7 @@ internal fun SteamShelfView(share: NetShare, s: FrontEndState, a: FrontEndAction
     var tick by remember(share.id) { mutableIntStateOf(0) }
     var local by remember { mutableStateOf<List<Library.SteamGame>>(emptyList()) }
     var localBuilds by remember { mutableStateOf<Map<Int, Long>>(emptyMap()) }
+    var localSizes by remember { mutableStateOf<Map<Int, Long>>(emptyMap()) }
     var localTick by remember { mutableIntStateOf(0) }
     var open by remember { mutableStateOf<SteamCard?>(null) }
 
@@ -157,12 +160,14 @@ internal fun SteamShelfView(share: NetShare, s: FrontEndState, a: FrontEndAction
 
     LaunchedEffect(localTick) {
         val games = withContext(Dispatchers.IO) { runCatching { Library.steamGames(ctx) }.getOrDefault(emptyList()) }
-        localBuilds = withContext(Dispatchers.IO) {
+        val acfs = withContext(Dispatchers.IO) {
             games.mapNotNull { g ->
                 val acf = g.gameFiles?.parentFile?.parentFile?.let { File(it, "appmanifest_${g.appId}.acf") } ?: return@mapNotNull null
-                runCatching { g.appId to NetSteam.buildOf(acf.readText()) }.getOrNull()
+                runCatching { g.appId to acf.readText() }.getOrNull()
             }.toMap()
         }
+        localBuilds = acfs.mapValues { NetSteam.buildOf(it.value) }
+        localSizes = acfs.mapValues { NetSteam.sizeOf(it.value) }
         local = games
     }
 
@@ -177,10 +182,10 @@ internal fun SteamShelfView(share: NetShare, s: FrontEndState, a: FrontEndAction
     }
 
     val localById = local.filter { it.library != Library.ADDED }.associateBy { it.appId }
-    val onShare = shelf?.games.orEmpty().map { SteamCard(it.appId, it.name, it, localById[it.appId], localBuilds[it.appId] ?: 0L) }
+    val onShare = shelf?.games.orEmpty().map { SteamCard(it.appId, it.name, it, localById[it.appId], localBuilds[it.appId] ?: 0L, localSizes[it.appId] ?: 0L) }
     val shareIds = onShare.map { it.appId }.toSet()
     val onlyHere = localById.values.filter { it.appId !in shareIds }.sortedBy { it.name.lowercase() }
-        .map { SteamCard(it.appId, it.name, null, it, localBuilds[it.appId] ?: 0L) }
+        .map { SteamCard(it.appId, it.name, null, it, localBuilds[it.appId] ?: 0L, localSizes[it.appId] ?: 0L) }
     val targets = remember(localTick) { steamTargets(ctx) }
 
     Column(modifier) {

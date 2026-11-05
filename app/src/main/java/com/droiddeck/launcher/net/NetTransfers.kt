@@ -154,6 +154,8 @@ object NetTransfers {
         var steps: List<Step>? = null
         var attempt = 0
         val window = ArrayDeque<Pair<Long, Long>>()
+        // steps already done in an earlier pass: a retry leaves them alone and the progress carries on from them
+        val finished = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<Step, Boolean>())
         while (true) {
             val movedBefore = job.moved.get()
             try {
@@ -166,12 +168,13 @@ object NetTransfers {
                 }
                 job.status = Status.COPYING
                 job.error = null
-                // each pass counts from zero: files already there (whole or in part) add themselves as they're skipped
-                job.bytesDone = 0L
-                job.filesDone = 0
-                lanes(job, steps.filter { it.dir }, password, window, 1)
-                lanes(job, steps.filter { !it.dir && !it.last }, password, window, lanes(context))
-                lanes(job, steps.filter { !it.dir && it.last }, password, window, 1)
+                // each pass counts what earlier passes finished, then the rest add themselves as they're copied or skipped
+                job.bytesDone = finished.sumOf { it.size }
+                job.filesDone = finished.count { !it.dir }
+                val left = steps.filter { it !in finished }
+                lanes(job, left.filter { it.dir }, password, window, 1, finished)
+                lanes(job, left.filter { !it.dir && !it.last }, password, window, lanes(context), finished)
+                lanes(job, left.filter { !it.dir && it.last }, password, window, 1, finished)
                 job.status = if (job.cancelled) Status.CANCELLED else Status.DONE
                 job.current = ""
                 job.rate = 0L
@@ -196,7 +199,7 @@ object NetTransfers {
      * Copies [steps] on up to [count] threads, each with its own connection, taking the next step as each finishes.
      * The first failure stops the others and is thrown here; folders go on one lane so parents come first.
      */
-    private fun lanes(job: Job, steps: List<Step>, password: String, window: ArrayDeque<Pair<Long, Long>>, count: Int) {
+    private fun lanes(job: Job, steps: List<Step>, password: String, window: ArrayDeque<Pair<Long, Long>>, count: Int, finished: MutableSet<Step>) {
         if (steps.isEmpty() || job.cancelled) return
         val next = AtomicInteger(0)
         val failure = AtomicReference<Throwable?>(null)
@@ -210,6 +213,7 @@ object NetTransfers {
                             val step = steps[k]
                             if (!step.dir) job.current = step.local.name
                             if (job.direction == Direction.DOWN) fetch(job, link, step, window) else send(job, link, step, window)
+                            if (!job.cancelled) finished += step
                         }
                     }
                 } catch (e: Throwable) {
