@@ -43,6 +43,7 @@ import androidx.compose.material.icons.outlined.Description
 import androidx.compose.material.icons.outlined.Dns
 import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.Folder
+import androidx.compose.material.icons.outlined.FolderOpen
 import androidx.compose.material.icons.outlined.Lock
 import androidx.compose.material.icons.outlined.SdCard
 import androidx.compose.material.icons.outlined.Smartphone
@@ -88,7 +89,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.droiddeck.launcher.R
 import com.droiddeck.launcher.files.StorageRoots
+import com.droiddeck.launcher.net.NetDiscovery
 import com.droiddeck.launcher.net.NetEntry
+import com.droiddeck.launcher.net.NetServer
 import com.droiddeck.launcher.net.NetShare
 import com.droiddeck.launcher.net.NetShares
 import com.droiddeck.launcher.net.NetTransfers
@@ -227,7 +230,7 @@ private fun SignIn(share: NetShare, modifier: Modifier, onDone: () -> Unit) {
 }
 
 @Composable
-private fun ShareChip(label: String, on: Boolean, onClick: () -> Unit) {
+private fun ShareChip(label: String, on: Boolean, icon: ImageVector = Icons.Outlined.Dns, onClick: () -> Unit) {
     val pal = LocalPalette.current
     val colors = MaterialTheme.colorScheme
     val src = remember { MutableInteractionSource() }
@@ -242,7 +245,7 @@ private fun ShareChip(label: String, on: Boolean, onClick: () -> Unit) {
             .controllerConfirm(onClick = onClick)
             .padding(horizontal = 14.dp),
     ) {
-        Icon(Icons.Outlined.Dns, null, tint = if (on) pal.signal else colors.onSurfaceVariant, modifier = Modifier.size(16.dp))
+        Icon(icon, null, tint = if (on) pal.signal else colors.onSurfaceVariant, modifier = Modifier.size(16.dp))
         Text(label, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = colors.onBackground, maxLines = 1)
     }
 }
@@ -642,15 +645,72 @@ private fun ShareDialog(share: NetShare, isNew: Boolean, onSaved: (NetShare) -> 
     var testing by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     var confirmRemove by remember { mutableStateOf(false) }
+    // servers found on the network (new shares only), and the shares the server at [host] offers once listed
+    var servers by remember { mutableStateOf<List<NetServer>>(emptyList()) }
+    var scanning by remember { mutableStateOf(false) }
+    var scanTick by remember { mutableIntStateOf(0) }
+    var offered by remember { mutableStateOf<List<String>?>(null) }
+    var listing by remember { mutableStateOf(false) }
+    if (isNew) LaunchedEffect(scanTick) {
+        scanning = true
+        withContext(kotlinx.coroutines.Dispatchers.IO) { NetDiscovery.scan(ctx) { servers = it } }
+        scanning = false
+    }
+    LaunchedEffect(host) { offered = null }
     val colors = MaterialTheme.colorScheme
     AppDialog(shown, close, "netShare", wide = false, maxWidth = 640.dp) {
         DialogTitleRow(stringResource(if (isNew) R.string.net_add else R.string.net_edit), onClose = close)
+        // one row of picks: the servers found, then (after List shares) that server's shares
+        if (isNew || offered != null) Row(
+            verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+        ) {
+            val list = offered
+            if (list != null) {
+                Text(stringResource(R.string.net_shares_on), fontSize = 13.sp, color = colors.onSurfaceVariant)
+                if (list.isEmpty()) Text(stringResource(R.string.net_no_shares), fontSize = 13.sp, color = colors.onSurfaceVariant)
+                list.forEach { s -> ShareChip(s, s.equals(shareName, true), Icons.Outlined.Folder) { shareName = s } }
+            } else {
+                Text(stringResource(R.string.net_found), fontSize = 13.sp, color = colors.onSurfaceVariant)
+                servers.forEach { sv ->
+                    ShareChip(sv.label, sv.address == host.trim()) {
+                        host = sv.address
+                        if (name.isBlank()) sv.name?.let { name = it }
+                    }
+                }
+                if (scanning) {
+                    CircularProgressIndicator(strokeWidth = 2.dp, modifier = Modifier.size(16.dp))
+                    if (servers.isEmpty()) Text(stringResource(R.string.net_scanning), fontSize = 13.sp, color = colors.onSurfaceVariant)
+                } else {
+                    if (servers.isEmpty()) Text(stringResource(R.string.net_none_found), fontSize = 13.sp, color = colors.onSurfaceVariant)
+                    SmallIconButton(Icons.Outlined.Refresh, stringResource(R.string.net_scan_again), colors.onSurfaceVariant) { scanTick++ }
+                }
+            }
+        }
         // two to a row, so Connect and save stays on a 16:9 handheld's screen without scrolling
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
             OutlinedTextField(host, { host = it }, singleLine = true, label = { Text(stringResource(R.string.net_field_host)) },
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri), modifier = Modifier.weight(1f))
             OutlinedTextField(shareName, { shareName = it }, singleLine = true,
-                keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.None, autoCorrect = false), label = { Text(stringResource(R.string.net_field_share)) }, modifier = Modifier.weight(1f))
+                keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.None, autoCorrect = false), label = { Text(stringResource(R.string.net_field_share)) },
+                // signs in with the user and password below and asks the server what it shares
+                trailingIcon = {
+                    if (listing) CircularProgressIndicator(strokeWidth = 2.dp, modifier = Modifier.size(16.dp))
+                    else SmallIconButton(Icons.Outlined.FolderOpen, stringResource(R.string.net_list_shares), colors.onSurfaceVariant) {
+                        if (host.isBlank()) return@SmallIconButton
+                        val probe = NetShare(share.id, "", host.trim(), "", user.trim(), share.domain, encrypt, savePassword)
+                        val pw = if (password.isEmpty() && !isNew) NetShares.password(ctx, share.id) else password
+                        listing = true
+                        error = null
+                        scope.launch {
+                            val r = withContext(kotlinx.coroutines.Dispatchers.IO) { runCatching { SmbLink.shares(probe, pw) } }
+                            listing = false
+                            r.onSuccess { offered = it; if (it.size == 1 && shareName.isBlank()) shareName = it[0] }
+                                .onFailure { error = describeNetError(it) }
+                        }
+                    }
+                },
+                modifier = Modifier.weight(1f))
         }
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
             // no autocorrect or capitals: a keyboard "fixing" a user name is a sign-in failure that looks like a wrong password

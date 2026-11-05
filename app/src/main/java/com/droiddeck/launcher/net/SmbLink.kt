@@ -113,6 +113,29 @@ class SmbLink private constructor(
 
         /** Connects and signs in; an empty user signs in as a guest. Throws with the server's reason on failure. */
         fun open(share: NetShare, password: String): SmbLink {
+            val (client, connection, session) = signIn(share, password)
+            try {
+                val disk = session.connectShare(share.share.trim().trim('\\', '/')) as? DiskShare
+                    ?: throw IllegalStateException("\\\\${share.host}\\${share.share} is not a folder share")
+                return SmbLink(client, connection, session, disk)
+            } catch (e: Throwable) {
+                runCatching { client.close() }
+                throw e
+            }
+        }
+
+        /** The server's folder shares (no hidden $ ones), sorted: what it would show in a PC's network folder. [share]'s share name isn't used. */
+        fun shares(share: NetShare, password: String): List<String> {
+            val (client, _, session) = signIn(share, password)
+            try {
+                return ShareEnum.list(session, share.host.trim().substringBeforeLast(':'))
+            } finally {
+                runCatching { session.close() }
+                runCatching { client.close() }
+            }
+        }
+
+        private fun signIn(share: NetShare, password: String): Triple<SMBClient, Connection, Session> {
             val config = SmbConfig.builder()
                 .withSecurityProvider(BCSecurityProvider())
                 .withTimeout(30, TimeUnit.SECONDS)
@@ -133,9 +156,7 @@ class SmbLink private constructor(
                 else AuthenticationContext(share.user.trim(), password.toCharArray(), share.domain.trim().ifEmpty { null })
                 val session = connection.authenticate(auth)
                 if (share.encrypt && !session.shouldEncryptData()) throw IllegalStateException(NO_ENCRYPTION)
-                val disk = session.connectShare(share.share.trim().trim('\\', '/')) as? DiskShare
-                    ?: throw IllegalStateException("\\\\$host\\${share.share} is not a folder share")
-                return SmbLink(client, connection, session, disk)
+                return Triple(client, connection, session)
             } catch (e: Throwable) {
                 runCatching { client.close() }
                 throw e

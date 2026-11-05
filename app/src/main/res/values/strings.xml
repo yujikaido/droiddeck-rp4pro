@@ -2471,6 +2471,13 @@
     <string name="net_status_retrying">Connection lost, retrying…</string>
     <string name="net_status_done">Done: %1$s, %2$s</string>
     <string name="net_show_password">Show password</string>
+    <string name="net_found">On your network:</string>
+    <string name="net_scanning">Looking for servers…</string>
+    <string name="net_none_found">None found. Type the server\'s address below.</string>
+    <string name="net_scan_again">Look again</string>
+    <string name="net_list_shares">List this server\'s shares</string>
+    <string name="net_shares_on">Shares:</string>
+    <string name="net_no_shares">None you can open with this sign-in.</string>
     <string name="net_sd_card">SD card</string>
     <plurals name="net_files">
         <item quantity="one">%1$d file</item>
