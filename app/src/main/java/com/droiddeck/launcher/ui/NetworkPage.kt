@@ -103,7 +103,7 @@ private data class Row2(val key: String, val name: String, val dir: Boolean, val
  * up a folder. Copies run in [NetTransfers], so they carry on when the page is left.
  */
 @Composable
-internal fun NetworkPage(modifier: Modifier) {
+internal fun NetworkPage(s: FrontEndState, a: FrontEndActions, modifier: Modifier) {
     val ctx = LocalContext.current
     val prefs = remember { ctx.getSharedPreferences("net_shares", Context.MODE_PRIVATE) }
     var shares by remember { mutableStateOf(NetShares.list(ctx)) }
@@ -111,9 +111,20 @@ internal fun NetworkPage(modifier: Modifier) {
     val share = shares.firstOrNull { it.id == currentId } ?: shares.firstOrNull()
     var editing by remember { mutableStateOf<NetShare?>(null) }
     val narrow = LocalNarrowPane.current
+    // 0 Steam games, 1 Files; L1/R1 flip them as they do Retro's tabs
+    var tab by rememberSaveable { mutableIntStateOf(prefs.getInt("tab", 0)) }
+    val pickTab: (Int) -> Unit = { t -> tab = t; prefs.edit().putInt("tab", t).apply() }
 
-    Column(modifier.padding(horizontal = if (narrow) 16.dp else 22.dp, vertical = if (narrow) 12.dp else 18.dp)) {
-        PageHeader(stringResource(R.string.net_title))
+    Column(
+        modifier.padding(horizontal = if (narrow) 16.dp else 22.dp, vertical = if (narrow) 12.dp else 18.dp)
+            .bumpers(onPrevious = { if (share != null) pickTab((tab + 1) % 2) }, onNext = { if (share != null) pickTab((tab + 1) % 2) }),
+    ) {
+        PageHeader(stringResource(R.string.net_title)) {
+            if (share != null) {
+                Spacer(Modifier.weight(1f))
+                TabStrip(listOf(stringResource(R.string.net_tab_steam), stringResource(R.string.net_tab_files)), tab, pickTab)
+            }
+        }
         if (share == null) {
             Note(stringResource(R.string.net_intro))
             Spacer(Modifier.height(14.dp))
@@ -132,7 +143,8 @@ internal fun NetworkPage(modifier: Modifier) {
                 SecondaryButton(stringResource(R.string.net_edit), compact = true, icon = Icons.Outlined.Edit) { editing = share }
                 SecondaryButton(stringResource(R.string.net_add_short), compact = true, icon = Icons.Outlined.Add) { editing = blankShare() }
             }
-            Browser(share, Modifier.weight(1f).fillMaxWidth())
+            if (tab == 0) SteamShelfView(share, s, a, Modifier.weight(1f).fillMaxWidth())
+            else Browser(share, Modifier.weight(1f).fillMaxWidth()) { pickTab(0) }
             Transfers()
         }
     }
@@ -181,7 +193,7 @@ private fun ShareChip(label: String, on: Boolean, onClick: () -> Unit) {
 
 /** The two sides. Each keeps its own folder, list and picks; Y on either side copies to the folder open on the other. */
 @Composable
-private fun Browser(share: NetShare, modifier: Modifier) {
+private fun Browser(share: NetShare, modifier: Modifier, onSteamFolder: () -> Unit) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     // one thread per page for the share: SmbLink isn't thread-safe, and the copy worker opens its own
@@ -260,7 +272,17 @@ private fun Browser(share: NetShare, modifier: Modifier) {
         localPicked = emptySet()
     }
 
-    Row(modifier, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+    Column(modifier) {
+    // in a steamapps folder: offer it to the Steam games tab (for shares where it isn't at the top or one folder down)
+    if (remotePath.substringAfterLast('\\').equals("steamapps", ignoreCase = true)) Row(
+        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.padding(bottom = 8.dp),
+    ) {
+        PrimaryButton(stringResource(R.string.net_use_for_steam), compact = true) {
+            com.droiddeck.launcher.net.NetSteam.savePath(ctx, share, remotePath)
+            onSteamFolder()
+        }
+    }
+    Row(Modifier.weight(1f).fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
         val remoteRows = remoteEntries.map { Row2(it.path, it.name, it.dir, it.size) }
         Side(
             title = share.title,
@@ -305,6 +327,7 @@ private fun Browser(share: NetShare, modifier: Modifier) {
             onCopy = { row -> if (dir != null) copyUp(row?.let { File(it.key) }) },
             modifier = Modifier.weight(1f).fillMaxSize(),
         )
+    }
     }
 }
 

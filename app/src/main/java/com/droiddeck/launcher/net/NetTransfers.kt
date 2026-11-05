@@ -34,14 +34,15 @@ object NetTransfers {
         val id: Long,
         val share: NetShare,
         val direction: Direction,
-        /** DOWN: share paths to fetch. UP: device files to send. */
-        internal val remoteSources: List<NetEntry>,
-        internal val localSources: List<File>,
-        /** DOWN: the device folder they go into. UP: the share folder they go into. */
-        internal val localTarget: File?,
-        internal val remoteTarget: String,
+        /** DOWN: each share path and the device folder it goes into. Copied in this order, so a Steam game's
+         * .acf goes last and the game never looks installed while its files are still arriving. */
+        internal val downs: List<Pair<NetEntry, File>>,
+        /** UP: each device file or folder and the share folder it goes into. */
+        internal val ups: List<Pair<File, String>>,
         val label: String,
         val destination: String,
+        /** Set for a Steam game install or backup, so its cover can show the progress. */
+        val appId: Int? = null,
     ) {
         var status by mutableStateOf(Status.QUEUED)
             internal set
@@ -74,13 +75,29 @@ object NetTransfers {
     fun download(context: Context, share: NetShare, entries: List<NetEntry>, intoDir: File) {
         if (entries.isEmpty()) return
         val label = if (entries.size == 1) entries[0].name else "${entries.size} items"
-        add(context, Job(ids.getAndIncrement(), share, Direction.DOWN, entries, emptyList(), intoDir, "", label, intoDir.path))
+        add(context, Job(ids.getAndIncrement(), share, Direction.DOWN, entries.map { it to intoDir }, emptyList(), label, intoDir.path))
     }
 
     fun upload(context: Context, share: NetShare, files: List<File>, intoPath: String) {
         if (files.isEmpty()) return
         val label = if (files.size == 1) files[0].name else "${files.size} items"
-        add(context, Job(ids.getAndIncrement(), share, Direction.UP, emptyList(), files, null, intoPath, label, share.address + (if (intoPath.isEmpty()) "" else "\\$intoPath")))
+        add(context, Job(ids.getAndIncrement(), share, Direction.UP, emptyList(), files.map { it to intoPath }, label, share.address + (if (intoPath.isEmpty()) "" else "\\$intoPath")))
+    }
+
+    /** A Steam game from the share into a device library: its common/ folder, then its .acf. */
+    fun installSteamGame(context: Context, share: NetShare, game: NetSteamGame, library: File, libraryLabel: String) {
+        val steamapps = File(library, "steamapps")
+        val downs = listOfNotNull(
+            game.dir?.let { it to File(steamapps, "common") },
+            game.acf to steamapps,
+        )
+        add(context, Job(ids.getAndIncrement(), share, Direction.DOWN, downs, emptyList(), game.name, libraryLabel, game.appId))
+    }
+
+    /** A Steam game on this device to the share's steamapps folder: its common/ folder, then its .acf. */
+    fun backUpSteamGame(context: Context, share: NetShare, appId: Int, name: String, gameDir: File, acf: File, steamapps: String) {
+        val ups = listOf(gameDir to SmbLink.join(steamapps, "common"), acf to steamapps)
+        add(context, Job(ids.getAndIncrement(), share, Direction.UP, emptyList(), ups, name, share.address + "\\" + steamapps, appId))
     }
 
     fun cancel(job: Job) {
@@ -90,7 +107,7 @@ object NetTransfers {
 
     fun retry(context: Context, job: Job) {
         if (job.active) return
-        val again = Job(ids.getAndIncrement(), job.share, job.direction, job.remoteSources, job.localSources, job.localTarget, job.remoteTarget, job.label, job.destination)
+        val again = Job(ids.getAndIncrement(), job.share, job.direction, job.downs, job.ups, job.label, job.destination, job.appId)
         main.post { jobs.remove(job) }
         add(context, again)
     }
@@ -165,7 +182,6 @@ object NetTransfers {
     private fun plan(job: Job, link: SmbLink): List<Step> {
         val out = ArrayList<Step>()
         if (job.direction == Direction.DOWN) {
-            val into = job.localTarget!!
             fun walk(e: NetEntry, local: File) {
                 if (job.cancelled) return
                 if (e.dir) {
@@ -173,7 +189,7 @@ object NetTransfers {
                     link.list(e.path).forEach { walk(it, File(local, it.name)) }
                 } else out += Step(e.path, local, e.size, e.modified, false)
             }
-            job.remoteSources.forEach { walk(it, File(into, it.name)) }
+            job.downs.forEach { (e, into) -> walk(e, File(into, e.name)) }
         } else {
             fun walk(f: File, remote: String) {
                 if (job.cancelled) return
@@ -182,7 +198,7 @@ object NetTransfers {
                     f.listFiles().orEmpty().sortedBy { it.name.lowercase() }.forEach { walk(it, SmbLink.join(remote, it.name)) }
                 } else out += Step(remote, f, f.length(), f.lastModified(), false)
             }
-            job.localSources.forEach { walk(it, SmbLink.join(job.remoteTarget, it.name)) }
+            job.ups.forEach { (f, into) -> walk(f, SmbLink.join(into, f.name)) }
         }
         return out
     }

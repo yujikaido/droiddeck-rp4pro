@@ -305,7 +305,7 @@ internal fun Content(
         return
     }
     if (selected == "network") {
-        NetworkPage(modifier)
+        NetworkPage(s, a, modifier)
         return
     }
     if (selected.startsWith("rsys:")) {

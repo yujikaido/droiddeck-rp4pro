@@ -146,7 +146,7 @@ private fun GameTile(t: Tile, wide: Boolean, square: Boolean, src: MutableIntera
 }
 
 @Composable
-private fun CoverImage(art: File, modifier: Modifier) {
+internal fun CoverImage(art: File, modifier: Modifier) {
     var wideArt by remember(art) { mutableStateOf(false) }
     Box(modifier) {
         if (wideArt) {

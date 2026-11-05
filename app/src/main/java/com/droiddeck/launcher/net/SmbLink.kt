@@ -41,6 +41,19 @@ class SmbLink private constructor(
     fun sizeOf(path: String): Long =
         if (!disk.fileExists(path)) -1L else disk.getFileInformation(path).standardInformation.endOfFile
 
+    /** A small text file (an .acf), whole. */
+    fun readText(path: String, max: Int = 1 shl 20): String = openRead(path).use { f ->
+        val size = f.fileInformation.standardInformation.endOfFile.coerceAtMost(max.toLong()).toInt()
+        val buf = ByteArray(size)
+        var at = 0
+        while (at < size) {
+            val n = f.read(buf, at.toLong(), at, size - at)
+            if (n <= 0) break
+            at += n
+        }
+        String(buf, 0, at, Charsets.UTF_8)
+    }
+
     fun mkdirs(path: String) {
         var at = ""
         path.split('\\').filter { it.isNotEmpty() }.forEach { part ->

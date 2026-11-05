@@ -33,7 +33,8 @@ object Library {
         }
     }
 
-    private val NOT_GAMES = setOf(
+    /** Proton, the Steam Linux runtimes, redistributables: they come with Steam and aren't listed as games. */
+    internal val NOT_GAMES = setOf(
         858280,
         961940,
         993090,
