@@ -140,6 +140,11 @@
             android:exported="false"
             android:foregroundServiceType="dataSync" />
         <service
+            android:name=".net.NetTransferService"
+            android:exported="false"
+            android:stopWithTask="false"
+            android:foregroundServiceType="dataSync" />
+        <service
             android:name=".session.LogUploadService"
             android:exported="false"
             android:stopWithTask="false"

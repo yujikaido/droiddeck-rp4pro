@@ -304,6 +304,10 @@ internal fun Content(
         RetroStart(s, a, modifier)
         return
     }
+    if (selected == "network") {
+        NetworkPage(modifier)
+        return
+    }
     if (selected.startsWith("rsys:")) {
         RetroGallery(s, a, selected, onSelect, modifier)
         return
