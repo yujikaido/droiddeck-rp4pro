@@ -2459,7 +2459,6 @@
     <string name="net_empty_folder">This folder is empty</string>
     <string name="net_copy_to_device">Copy to device</string>
     <string name="net_copy_to_share">Copy to share</string>
-    <string name="net_items">%1$d items</string>
     <string name="net_selected">%1$d picked</string>
     <string name="net_pick_device_folder">Open a folder on this device to copy into</string>
     <string name="net_hints">A open · X pick · Y copy to the other side · B up a folder</string>
@@ -2469,7 +2468,13 @@
     <string name="net_status_scanning">Counting files…</string>
     <string name="net_progress">%1$s · %2$d of %3$d files</string>
     <string name="net_status_retrying">Connection lost, retrying…</string>
-    <string name="net_status_done">Done: %1$d files, %2$s</string>
+    <string name="net_status_done">Done: %1$s, %2$s</string>
+    <string name="net_show_password">Show password</string>
+    <string name="net_sd_card">SD card</string>
+    <plurals name="net_files">
+        <item quantity="one">%1$d file</item>
+        <item quantity="other">%1$d files</item>
+    </plurals>
     <string name="net_status_failed">Failed: %1$s</string>
     <string name="net_status_cancelled">Cancelled</string>
     <string name="net_channel">Network copies</string>

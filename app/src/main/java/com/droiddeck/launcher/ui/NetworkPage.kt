@@ -41,6 +41,8 @@ import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.Folder
 import androidx.compose.material.icons.outlined.SdCard
 import androidx.compose.material.icons.outlined.Smartphone
+import androidx.compose.material.icons.outlined.Visibility
+import androidx.compose.material.icons.outlined.VisibilityOff
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
@@ -60,6 +62,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
@@ -70,7 +73,10 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -192,7 +198,8 @@ private fun Browser(share: NetShare, modifier: Modifier) {
     var localEntries by remember { mutableStateOf<List<File>>(emptyList()) }
     var localPicked by remember { mutableStateOf<Set<String>>(emptySet()) }
     var localTick by remember { mutableIntStateOf(0) }
-    val roots = remember { StorageRoots.list(ctx).filter { it.readable } }
+    // some ROMs add /storage/sdcard0 as a link back to internal storage; show each place once
+    val roots = remember { StorageRoots.list(ctx).filter { it.readable }.distinctBy { runCatching { it.dir.canonicalPath }.getOrDefault(it.dir.path) } }
 
     DisposableEffect(share.id) {
         onDispose {
@@ -258,6 +265,7 @@ private fun Browser(share: NetShare, modifier: Modifier) {
         Side(
             title = share.title,
             path = share.address + if (remotePath.isEmpty()) "" else "\\$remotePath",
+            here = remotePath,
             icon = Icons.Outlined.Dns,
             rows = remoteRows,
             picked = remotePicked,
@@ -275,11 +283,14 @@ private fun Browser(share: NetShare, modifier: Modifier) {
         val dir = localDir?.let(::File)
         val root = roots.firstOrNull { it.dir.path == localDir }
         val localRows = if (dir == null) roots.map { r ->
-            Row2(r.dir.path, r.label, true, 0L, if (r.removable) Icons.Outlined.SdCard else Icons.Outlined.Smartphone, freeSpace(ctx, r.dir))
+            // Android names a card after its volume ID (3132-3731); with just one card, "SD card" says enough
+            val label = if (r.removable && roots.count { it.removable } == 1) stringResource(R.string.net_sd_card) else r.label
+            Row2(r.dir.path, label, true, 0L, if (r.removable) Icons.Outlined.SdCard else Icons.Outlined.Smartphone, freeSpace(ctx, r.dir))
         } else localEntries.map { Row2(it.path, it.name, it.isDirectory, if (it.isDirectory) 0L else it.length()) }
         Side(
             title = stringResource(R.string.net_device),
             path = dir?.path ?: "",
+            here = dir?.path ?: "",
             icon = Icons.Outlined.Smartphone,
             rows = localRows,
             picked = localPicked,
@@ -302,7 +313,7 @@ private fun freeSpace(ctx: Context, dir: File): String? =
 
 @Composable
 private fun Side(
-    title: String, path: String, icon: ImageVector, rows: List<Row2>, picked: Set<String>,
+    title: String, path: String, here: String, icon: ImageVector, rows: List<Row2>, picked: Set<String>,
     busy: Boolean, error: String?, canGoUp: Boolean, copyLabel: String,
     onRetry: () -> Unit, onUp: () -> Unit, onOpen: (Row2) -> Unit, onPick: (Row2) -> Unit, onCopy: (Row2?) -> Unit,
     modifier: Modifier,
@@ -311,12 +322,22 @@ private fun Side(
     val pal = LocalPalette.current
     val shape = RoundedCornerShape(14.dp)
     var focusedHere by remember { mutableStateOf(false) }
-    val first = remember { FocusRequester() }
+    val rowFocus = remember { HashMap<String, FocusRequester>() }
+    val upFocus = remember { FocusRequester() }
     val listState = rememberLazyListState()
-    // a new folder opens at its top, and keeps the controller's focus if it had it
-    LaunchedEffect(path, rows.size) {
-        listState.scrollToItem(0)
-        if (focusedHere && rows.isNotEmpty()) runCatching { first.requestFocus() }
+    // Opening or leaving a folder replaces every row, and the focused one with them; without this the controller's
+    // focus falls back to the rail. So it's put on the new list: on the folder just left when going up, else the top.
+    var refocus by remember { mutableStateOf<String?>(null) }
+    val open: (Row2) -> Unit = { row -> if (focusedHere) refocus = ""; onOpen(row) }
+    val up: () -> Unit = { if (focusedHere) refocus = here; onUp() }
+    LaunchedEffect(path, rows.size, busy) {
+        val target = refocus
+        val at = if (target.isNullOrEmpty()) -1 else rows.indexOfFirst { it.key == target }
+        listState.scrollToItem(at.coerceAtLeast(0))
+        if (target != null && !busy) {
+            refocus = null
+            focusSoon { rows.getOrNull(at.coerceAtLeast(0))?.let { rowFocus.getOrPut(it.key) { FocusRequester() } } ?: upFocus }
+        }
     }
     Column(
         modifier.clip(shape).background(colors.surface).border(1.dp, if (focusedHere) pal.signal.copy(alpha = 0.45f) else pal.line, shape)
@@ -324,7 +345,7 @@ private fun Side(
             .onPreviewKeyEvent { ev ->
                 val k = ev.nativeKeyEvent
                 if (k.keyCode != KeyEvent.KEYCODE_BUTTON_B || !canGoUp) false
-                else { if (k.action == KeyEvent.ACTION_DOWN && k.repeatCount == 0) onUp(); true }
+                else { if (k.action == KeyEvent.ACTION_DOWN && k.repeatCount == 0) up(); true }
             },
     ) {
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth().padding(start = 12.dp, end = 8.dp, top = 8.dp, bottom = 8.dp)) {
@@ -334,7 +355,7 @@ private fun Side(
                 // the end of a long path is the part that tells folders apart
                 if (path.isNotEmpty()) Text(if (path.length > 56) "…" + path.takeLast(55) else path, fontSize = 11.5.sp, color = colors.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
-            SecondaryButton("", compact = true, enabled = canGoUp, icon = Icons.Outlined.ArrowUpward, onClick = onUp)
+            SecondaryButton("", compact = true, enabled = canGoUp, icon = Icons.Outlined.ArrowUpward, modifier = Modifier.focusRequester(upFocus), onClick = up)
         }
         Box(Modifier.fillMaxWidth().height(1.dp).background(pal.line))
         Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
@@ -349,10 +370,10 @@ private fun Side(
                 }
                 rows.isEmpty() -> Text(stringResource(R.string.net_empty_folder), fontSize = 13.sp, color = colors.onSurfaceVariant)
                 else -> LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
-                    itemsIndexed(rows, key = { _, r -> r.key }) { i, row ->
+                    itemsIndexed(rows, key = { _, r -> r.key }) { _, row ->
                         EntryRow(
-                            row, row.key in picked, if (i == 0) Modifier.focusRequester(first) else Modifier,
-                            onA = { if (row.dir) onOpen(row) else onPick(row) },
+                            row, row.key in picked, Modifier.focusRequester(rowFocus.getOrPut(row.key) { FocusRequester() }),
+                            onA = { if (row.dir) open(row) else onPick(row) },
                             onX = { onPick(row) },
                             onY = { onCopy(row) },
                         )
@@ -363,7 +384,7 @@ private fun Side(
         Box(Modifier.fillMaxWidth().height(1.dp).background(pal.line))
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp)) {
             Text(
-                if (picked.isEmpty()) stringResource(R.string.net_items, rows.size) else stringResource(R.string.net_selected, picked.size),
+                if (picked.isEmpty()) pluralStringResource(R.plurals.fm_items, rows.size, rows.size) else stringResource(R.string.net_selected, picked.size),
                 fontSize = 12.sp, color = colors.onSurfaceVariant, modifier = Modifier.weight(1f),
             )
             SecondaryButton(copyLabel, compact = true, enabled = picked.isNotEmpty()) { onCopy(null) }
@@ -381,7 +402,8 @@ private fun EntryRow(row: Row2, picked: Boolean, extra: Modifier, onA: () -> Uni
     Row(
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp),
         modifier = Modifier.fillMaxWidth().then(extra).heightIn(min = 44.dp)
-            .background(when { hot -> pal.signal.copy(alpha = 0.16f); picked -> pal.signal.copy(alpha = 0.08f); else -> Color.Transparent })
+            .background(when { hot -> pal.signal.copy(alpha = 0.26f); picked -> pal.signal.copy(alpha = 0.10f); else -> Color.Transparent })
+            .drawBehind { if (hot) drawRect(pal.signal, size = androidx.compose.ui.geometry.Size(3.dp.toPx(), size.height)) }
             .onPreviewKeyEvent { ev ->
                 val k = ev.nativeKeyEvent
                 val act: (() -> Unit)? = when (k.keyCode) {
@@ -438,7 +460,7 @@ private fun Transfers() {
                             (if (job.rate > 0) " · ${Formatter.formatShortFileSize(ctx, job.rate)}/s" else "") +
                             (if (job.current.isNotEmpty()) " · ${job.current}" else "")
                         NetTransfers.Status.RETRYING -> stringResource(R.string.net_status_retrying) + (job.error?.let { " ($it)" } ?: "")
-                        NetTransfers.Status.DONE -> stringResource(R.string.net_status_done, job.filesTotal, Formatter.formatShortFileSize(ctx, job.bytesTotal))
+                        NetTransfers.Status.DONE -> stringResource(R.string.net_status_done, pluralStringResource(R.plurals.net_files, job.filesTotal, job.filesTotal), Formatter.formatShortFileSize(ctx, job.bytesTotal))
                         NetTransfers.Status.FAILED -> stringResource(R.string.net_status_failed, job.error ?: "")
                         NetTransfers.Status.CANCELLED -> stringResource(R.string.net_status_cancelled)
                     }
@@ -474,6 +496,7 @@ private fun ShareDialog(share: NetShare, isNew: Boolean, onSaved: (NetShare) -> 
     var shareName by remember { mutableStateOf(share.share) }
     var user by remember { mutableStateOf(share.user) }
     var password by remember { mutableStateOf("") }
+    var showPassword by remember { mutableStateOf(false) }
     var testing by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     val colors = MaterialTheme.colorScheme
@@ -483,13 +506,21 @@ private fun ShareDialog(share: NetShare, isNew: Boolean, onSaved: (NetShare) -> 
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
             OutlinedTextField(host, { host = it }, singleLine = true, label = { Text(stringResource(R.string.net_field_host)) },
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri), modifier = Modifier.weight(1f))
-            OutlinedTextField(shareName, { shareName = it }, singleLine = true, label = { Text(stringResource(R.string.net_field_share)) }, modifier = Modifier.weight(1f))
+            OutlinedTextField(shareName, { shareName = it }, singleLine = true,
+                keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.None, autoCorrect = false), label = { Text(stringResource(R.string.net_field_share)) }, modifier = Modifier.weight(1f))
         }
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
-            OutlinedTextField(user, { user = it }, singleLine = true, label = { Text(stringResource(R.string.net_field_user)) }, modifier = Modifier.weight(1f))
+            // no autocorrect or capitals: a keyboard "fixing" a user name is a sign-in failure that looks like a wrong password
+            OutlinedTextField(user, { user = it }, singleLine = true, label = { Text(stringResource(R.string.net_field_user)) },
+                keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.None, autoCorrect = false, keyboardType = KeyboardType.Ascii),
+                modifier = Modifier.weight(1f))
             OutlinedTextField(password, { password = it }, singleLine = true, label = { Text(stringResource(R.string.net_field_password)) },
                 placeholder = if (isNew) null else ({ Text(stringResource(R.string.net_password_kept)) }),
-                visualTransformation = PasswordVisualTransformation(),
+                visualTransformation = if (showPassword) VisualTransformation.None else PasswordVisualTransformation(),
+                trailingIcon = {
+                    SmallIconButton(if (showPassword) Icons.Outlined.VisibilityOff else Icons.Outlined.Visibility,
+                        stringResource(R.string.net_show_password), MaterialTheme.colorScheme.onSurfaceVariant) { showPassword = !showPassword }
+                },
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password), modifier = Modifier.weight(1f))
         }
         OutlinedTextField(name, { name = it }, singleLine = true, label = { Text(stringResource(R.string.net_field_name)) }, modifier = Modifier.fillMaxWidth())
