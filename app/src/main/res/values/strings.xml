@@ -2485,7 +2485,7 @@
     <string name="net_notify_title">Copying %1$s</string>
     <string name="net_tab_steam">Steam games</string>
     <string name="net_tab_files">Files</string>
-    <string name="net_internal">Internal storage</string>
+    <string name="net_builtin">Built-in storage</string>
     <string name="net_rescan">Rescan</string>
     <string name="net_use_for_steam">Use for Steam games</string>
     <string name="net_steam_looking">Looking for Steam games…</string>
@@ -2508,4 +2508,13 @@
     <string name="net_steam_update_backup">Update the backup on %1$s</string>
     <string name="net_steam_copying">Copying: the progress shows on the cover and at the bottom of the page.</string>
     <string name="net_steam_restart_note">Steam is running: it lists a new game the next time it starts.</string>
+    <string name="net_no_space_device">Not enough space on this device: it needs %1$s and has %2$s free</string>
+    <string name="net_no_space_share">Not enough space on the share: it needs %1$s and has %2$s free</string>
+    <string name="net_unreachable">Can\'t reach %1$s</string>
+    <string name="net_steam_update_available">Update available</string>
+    <string name="net_steam_backup_old">Backup out of date</string>
+    <string name="net_steam_update_note">%1$s has a newer version (build %2$d; this device has %3$d). Only the changed files are copied.</string>
+    <string name="net_steam_backup_old_note">This device has a newer version (build %2$d; %1$s has %3$d). Update the backup to copy the changed files.</string>
+    <string name="net_steam_install_update">Install update from %1$s</string>
+    <string name="net_steam_close_first">Close Steam first: a game\'s files can\'t be updated while it\'s running.</string>
 </resources>

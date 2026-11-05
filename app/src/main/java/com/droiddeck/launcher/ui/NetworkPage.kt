@@ -36,6 +36,8 @@ import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.ArrowUpward
 import androidx.compose.material.icons.outlined.CheckCircle
 import androidx.compose.material.icons.outlined.Circle
+import androidx.compose.material.icons.outlined.CloudOff
+import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Description
 import androidx.compose.material.icons.outlined.Dns
 import androidx.compose.material.icons.outlined.Edit
@@ -78,6 +80,7 @@ import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.res.pluralStringResource
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -142,8 +145,8 @@ internal fun NetworkPage(s: FrontEndState, a: FrontEndActions, modifier: Modifie
                 SecondaryButton(stringResource(R.string.net_edit), compact = true, icon = Icons.Outlined.Edit) { editing = share }
                 SecondaryButton(stringResource(R.string.net_add_short), compact = true, icon = Icons.Outlined.Add) { editing = blankShare() }
             }
-            if (tab == 0) SteamShelfView(share, s, a, Modifier.weight(1f).fillMaxWidth())
-            else Browser(share, Modifier.weight(1f).fillMaxWidth()) { pickTab(0) }
+            if (tab == 0) SteamShelfView(share, s, a, onEdit = { editing = share }, modifier = Modifier.weight(1f).fillMaxWidth())
+            else Browser(share, Modifier.weight(1f).fillMaxWidth(), onEdit = { editing = share }) { pickTab(0) }
             Transfers(hint = tab == 1)
         }
     }
@@ -192,7 +195,7 @@ private fun ShareChip(label: String, on: Boolean, onClick: () -> Unit) {
 
 /** The two sides. Each keeps its own folder, list and picks; Y on either side copies to the folder open on the other. */
 @Composable
-private fun Browser(share: NetShare, modifier: Modifier, onSteamFolder: () -> Unit) {
+private fun Browser(share: NetShare, modifier: Modifier, onEdit: () -> Unit, onSteamFolder: () -> Unit) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     // one thread per page for the share: SmbLink isn't thread-safe, and the copy worker opens its own
@@ -211,6 +214,7 @@ private fun Browser(share: NetShare, modifier: Modifier, onSteamFolder: () -> Un
     var localTick by remember { mutableIntStateOf(0) }
     // some ROMs add /storage/sdcard0 as a link back to internal storage; show each place once
     val roots = remember { StorageRoots.list(ctx).filter { it.readable }.distinctBy { runCatching { it.dir.canonicalPath }.getOrDefault(it.dir.path) } }
+    val adopted = remember { adoptedCardName(ctx) }
 
     DisposableEffect(share.id) {
         onDispose {
@@ -295,6 +299,7 @@ private fun Browser(share: NetShare, modifier: Modifier, onSteamFolder: () -> Un
             canGoUp = remotePath.isNotEmpty(),
             copyLabel = stringResource(R.string.net_copy_to_device),
             onRetry = { connectTick++ },
+            onEdit = onEdit,
             onUp = { listRemote(SmbLink.parent(remotePath)) },
             onOpen = { row -> listRemote(row.key) },
             onPick = { row -> remotePicked = if (row.key in remotePicked) remotePicked - row.key else remotePicked + row.key },
@@ -304,9 +309,14 @@ private fun Browser(share: NetShare, modifier: Modifier, onSteamFolder: () -> Un
         val dir = localDir?.let(::File)
         val root = roots.firstOrNull { it.dir.path == localDir }
         val localRows = if (dir == null) roots.map { r ->
-            // Android names a card after its volume ID (3132-3731); with just one card, "SD card" says enough
-            val label = if (r.removable && roots.count { it.removable } == 1) stringResource(R.string.net_sd_card) else r.label
-            Row2(r.dir.path, label, true, 0L, if (r.removable) Icons.Outlined.SdCard else Icons.Outlined.Smartphone, freeSpace(ctx, r.dir))
+            // Android names a card after its volume ID (3132-3731); with just one card, "SD card" says enough. Shared
+            // storage is "Internal" to Android even when it lives on an adopted card, so it's named for where it is.
+            val label = when {
+                !r.removable -> adopted ?: stringResource(R.string.net_builtin)
+                roots.count { it.removable } == 1 -> stringResource(R.string.net_sd_card)
+                else -> r.label
+            }
+            Row2(r.dir.path, label, true, 0L, if (r.removable || adopted != null) Icons.Outlined.SdCard else Icons.Outlined.Smartphone, freeSpace(ctx, r.dir))
         } else localEntries.map { Row2(it.path, it.name, it.isDirectory, if (it.isDirectory) 0L else it.length()) }
         Side(
             title = stringResource(R.string.net_device),
@@ -320,6 +330,7 @@ private fun Browser(share: NetShare, modifier: Modifier, onSteamFolder: () -> Un
             canGoUp = dir != null,
             copyLabel = stringResource(R.string.net_copy_to_share),
             onRetry = {},
+            onEdit = null,
             onUp = { localDir = if (root != null || dir == null) null else dir.parentFile?.path; localPicked = emptySet() },
             onOpen = { row -> localDir = row.key; localPicked = emptySet() },
             onPick = { row -> if (dir != null) localPicked = if (row.key in localPicked) localPicked - row.key else localPicked + row.key },
@@ -330,6 +341,40 @@ private fun Browser(share: NetShare, modifier: Modifier, onSteamFolder: () -> Un
     }
 }
 
+/**
+ * The adopted card's name when Android's shared storage lives on one (an SD card formatted as internal storage), else
+ * null. Android still calls that storage "Internal", which reads wrong beside the device's real built-in storage.
+ */
+internal fun adoptedCardName(ctx: Context): String? {
+    val sm = ctx.getSystemService(android.os.storage.StorageManager::class.java) ?: return null
+    val shared = android.os.Environment.getExternalStorageDirectory()
+    // the system's volume lookups still answer "default" for adopted shared storage; a different filesystem says it
+    val size = { f: File -> runCatching { android.os.StatFs(f.path).totalBytes }.getOrDefault(0L) }
+    val sharedSize = size(shared)
+    if (sharedSize <= 0L || sharedSize == size(android.os.Environment.getDataDirectory())) return null
+    val name = runCatching { sm.getStorageVolume(shared)?.getDescription(ctx) }.getOrNull()?.trim()
+    return name?.takeIf { it.isNotEmpty() && !it.contains("internal", ignoreCase = true) && !it.equals("android", ignoreCase = true) }
+        ?: ctx.getString(R.string.net_sd_card)
+}
+
+/** The share didn't answer: what went wrong, then Retry and (when there's a share to fix) Edit share. */
+@Composable
+internal fun Unreachable(title: String, error: String, onRetry: () -> Unit, onEdit: (() -> Unit)?, modifier: Modifier = Modifier) {
+    val colors = MaterialTheme.colorScheme
+    Column(
+        modifier.padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterVertically),
+    ) {
+        Icon(Icons.Outlined.CloudOff, null, tint = colors.onSurfaceVariant, modifier = Modifier.size(34.dp))
+        Text(stringResource(R.string.net_unreachable, title), fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = colors.onBackground, textAlign = TextAlign.Center)
+        Text(error, fontSize = 13.sp, color = colors.onSurfaceVariant, textAlign = TextAlign.Center)
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.padding(top = 6.dp)) {
+            SecondaryButton(stringResource(R.string.net_retry), compact = true, icon = Icons.Outlined.Refresh, onClick = onRetry)
+            if (onEdit != null) SecondaryButton(stringResource(R.string.net_edit), compact = true, icon = Icons.Outlined.Edit, onClick = onEdit)
+        }
+    }
+}
+
 private fun freeSpace(ctx: Context, dir: File): String? =
     runCatching { ctx.getString(R.string.net_free, Formatter.formatShortFileSize(ctx, dir.usableSpace)) }.getOrNull()
 
@@ -337,7 +382,7 @@ private fun freeSpace(ctx: Context, dir: File): String? =
 private fun Side(
     title: String, path: String, here: String, icon: ImageVector, rows: List<Row2>, picked: Set<String>,
     busy: Boolean, error: String?, canGoUp: Boolean, copyLabel: String,
-    onRetry: () -> Unit, onUp: () -> Unit, onOpen: (Row2) -> Unit, onPick: (Row2) -> Unit, onCopy: (Row2?) -> Unit,
+    onRetry: () -> Unit, onEdit: (() -> Unit)?, onUp: () -> Unit, onOpen: (Row2) -> Unit, onPick: (Row2) -> Unit, onCopy: (Row2?) -> Unit,
     modifier: Modifier,
 ) {
     val colors = MaterialTheme.colorScheme
@@ -386,10 +431,7 @@ private fun Side(
                     CircularProgressIndicator(strokeWidth = 2.dp, color = pal.signal, modifier = Modifier.size(18.dp))
                     Text(stringResource(R.string.net_connecting), fontSize = 13.sp, color = colors.onSurfaceVariant)
                 }
-                error != null -> Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(16.dp)) {
-                    Text(error, fontSize = 13.sp, color = colors.error, modifier = Modifier.padding(bottom = 10.dp))
-                    SecondaryButton(stringResource(R.string.net_retry), compact = true, onClick = onRetry)
-                }
+                error != null -> Unreachable(title, error, onRetry, onEdit)
                 rows.isEmpty() -> Text(stringResource(R.string.net_empty_folder), fontSize = 13.sp, color = colors.onSurfaceVariant)
                 else -> LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
                     itemsIndexed(rows, key = { _, r -> r.key }) { _, row ->

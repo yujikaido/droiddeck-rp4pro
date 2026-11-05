@@ -28,6 +28,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.CheckCircle
 import androidx.compose.material.icons.outlined.CloudDone
+import androidx.compose.material.icons.outlined.CloudUpload
+import androidx.compose.material.icons.outlined.Downloading
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
@@ -72,9 +74,17 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.concurrent.Executors
 
-/** One cover on the Steam games tab: a game on the share, on this device, or both. */
-private class SteamCard(val appId: Int, val name: String, val net: NetSteamGame?, val local: Library.SteamGame?) {
+/** One cover on the Steam games tab: a game on the share, on this device, or both. [localBuild]: the device .acf's buildid. */
+private class SteamCard(val appId: Int, val name: String, val net: NetSteamGame?, val local: Library.SteamGame?, val localBuild: Long = 0L) {
     val size: Long get() = net?.size ?: 0L
+    private val both: Boolean get() = net != null && local != null && net.build > 0L && localBuild > 0L
+    /** The share has a newer build than the device (updated on the PC). */
+    val updateHere: Boolean get() = both && net!!.build > localBuild
+    /** The device has a newer build than the share (updated here). */
+    val backupOld: Boolean get() = both && localBuild > net!!.build
+    /** The device library the game is in (the folder holding steamapps). */
+    val localRoot: File? get() = local?.gameFiles?.parentFile?.parentFile?.parentFile
+    val localAcf: File? get() = local?.gameFiles?.parentFile?.parentFile?.let { File(it, "appmanifest_$appId.acf") }
 }
 
 /** A device library a game can go into: Steam's own on internal storage, or the card's. */
@@ -88,7 +98,7 @@ private class SteamTarget(val root: File, val label: String) {
  * card) or back it up to the share. Both copy the game's common\ folder first and its .acf last.
  */
 @Composable
-internal fun SteamShelfView(share: NetShare, s: FrontEndState, a: FrontEndActions, modifier: Modifier) {
+internal fun SteamShelfView(share: NetShare, s: FrontEndState, a: FrontEndActions, onEdit: () -> Unit, modifier: Modifier) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     val colors = MaterialTheme.colorScheme
@@ -100,6 +110,7 @@ internal fun SteamShelfView(share: NetShare, s: FrontEndState, a: FrontEndAction
     var missing by remember(share.id) { mutableStateOf(false) }
     var tick by remember(share.id) { mutableIntStateOf(0) }
     var local by remember { mutableStateOf<List<Library.SteamGame>>(emptyList()) }
+    var localBuilds by remember { mutableStateOf<Map<Int, Long>>(emptyMap()) }
     var localTick by remember { mutableIntStateOf(0) }
     var open by remember { mutableStateOf<SteamCard?>(null) }
 
@@ -128,7 +139,14 @@ internal fun SteamShelfView(share: NetShare, s: FrontEndState, a: FrontEndAction
     }
 
     LaunchedEffect(localTick) {
-        local = withContext(Dispatchers.IO) { runCatching { Library.steamGames(ctx) }.getOrDefault(emptyList()) }
+        val games = withContext(Dispatchers.IO) { runCatching { Library.steamGames(ctx) }.getOrDefault(emptyList()) }
+        localBuilds = withContext(Dispatchers.IO) {
+            games.mapNotNull { g ->
+                val acf = g.gameFiles?.parentFile?.parentFile?.let { File(it, "appmanifest_${g.appId}.acf") } ?: return@mapNotNull null
+                runCatching { g.appId to NetSteam.buildOf(acf.readText()) }.getOrNull()
+            }.toMap()
+        }
+        local = games
     }
 
     // a finished install adds a game to the device (and to the Games page); a finished backup adds one to the share
@@ -142,13 +160,13 @@ internal fun SteamShelfView(share: NetShare, s: FrontEndState, a: FrontEndAction
     }
 
     val localById = local.filter { it.library != Library.ADDED }.associateBy { it.appId }
-    val onShare = shelf?.games.orEmpty().map { SteamCard(it.appId, it.name, it, localById[it.appId]) }
+    val onShare = shelf?.games.orEmpty().map { SteamCard(it.appId, it.name, it, localById[it.appId], localBuilds[it.appId] ?: 0L) }
     val shareIds = onShare.map { it.appId }.toSet()
     val onlyHere = localById.values.filter { it.appId !in shareIds }.sortedBy { it.name.lowercase() }
-        .map { SteamCard(it.appId, it.name, null, it) }
+        .map { SteamCard(it.appId, it.name, null, it, localBuilds[it.appId] ?: 0L) }
     val targets = remember(localTick) {
         Library.steamLibraries(ctx).filter { (root, _) -> root.isDirectory }
-            .map { (root, label) -> SteamTarget(root, if (label == "internal") ctx.getString(R.string.net_internal) else label) }
+            .map { (root, label) -> SteamTarget(root, if (label == "internal") ctx.getString(R.string.net_builtin) else label) }
     }
 
     Column(modifier) {
@@ -164,11 +182,7 @@ internal fun SteamShelfView(share: NetShare, s: FrontEndState, a: FrontEndAction
                 CircularProgressIndicator(strokeWidth = 2.dp, color = LocalPalette.current.signal, modifier = Modifier.size(18.dp))
                 Text(stringResource(R.string.net_steam_looking), fontSize = 13.sp, color = colors.onSurfaceVariant)
             }
-            error != null -> Column(Modifier.padding(top = 12.dp)) {
-                Note(error!!)
-                Spacer(Modifier.heightIn(min = 10.dp))
-                SecondaryButton(stringResource(R.string.net_retry), compact = true) { tick++ }
-            }
+            error != null -> Unreachable(share.title, error!!, onRetry = { tick++ }, onEdit = onEdit, modifier = Modifier.weight(1f).fillMaxWidth())
             else -> LazyVerticalGrid(
                 columns = GridCells.Adaptive(118.dp),
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -220,9 +234,14 @@ private fun Cover(card: SteamCard, onClick: () -> Unit) {
                         fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.White, modifier = Modifier.padding(top = 6.dp))
                 }
             }
-            // on both sides: installed here and backed up there
+            // on both sides: installed here and backed up there (an arrow when one side has a newer build)
             if (job == null && card.net != null && card.local != null) Icon(
-                Icons.Outlined.CheckCircle, stringResource(R.string.net_steam_installed), tint = pal.good,
+                when {
+                    card.updateHere -> Icons.Outlined.Downloading
+                    card.backupOld -> Icons.Outlined.CloudUpload
+                    else -> Icons.Outlined.CheckCircle
+                },
+                stringResource(R.string.net_steam_installed), tint = if (card.updateHere || card.backupOld) pal.signal else pal.good,
                 modifier = Modifier.align(Alignment.TopEnd).padding(6.dp).size(22.dp).clip(RoundedCornerShape(99.dp)).background(Color.Black.copy(alpha = 0.55f)).padding(2.dp),
             )
         }
@@ -230,11 +249,18 @@ private fun Cover(card: SteamCard, onClick: () -> Unit) {
             Text(card.name, fontSize = 12.5.sp, fontWeight = FontWeight.SemiBold, color = colors.onBackground, maxLines = 1, overflow = TextOverflow.Ellipsis)
             Text(
                 when {
+                    card.updateHere -> stringResource(R.string.net_steam_update_available)
+                    card.backupOld -> stringResource(R.string.net_steam_backup_old)
                     card.net != null && card.local != null -> stringResource(R.string.net_steam_installed)
                     card.net != null -> if (card.size > 0) Formatter.formatShortFileSize(ctx, card.size) else stringResource(R.string.net_steam_on_share_short)
                     else -> stringResource(R.string.net_steam_not_backed_up)
                 },
-                fontSize = 11.sp, color = if (card.net != null && card.local != null) pal.good else colors.onSurfaceVariant, maxLines = 1,
+                fontSize = 11.sp, maxLines = 1,
+                color = when {
+                    card.updateHere || card.backupOld -> pal.signal
+                    card.net != null && card.local != null -> pal.good
+                    else -> colors.onSurfaceVariant
+                },
             )
         }
     }
@@ -271,7 +297,7 @@ private fun SteamGameDialog(card: SteamCard, share: NetShare, shelf: NetSteamShe
     val pal = LocalPalette.current
     val shown = rememberShown(onClose)
     val close = { shown.targetState = false }
-    var target by remember { mutableIntStateOf(targets.indexOfLast { it.label != ctx.getString(R.string.net_internal) }.coerceAtLeast(0)) }
+    var target by remember { mutableIntStateOf(targets.indexOfLast { it.label != ctx.getString(R.string.net_builtin) }.coerceAtLeast(0)) }
     val job = NetTransfers.jobs.lastOrNull { it.appId == card.appId && it.active }
     AppDialog(shown, close, "netSteamGame", wide = true, maxWidth = 760.dp) {
         DialogTitleRow(card.name, onClose = close)
@@ -284,7 +310,7 @@ private fun SteamGameDialog(card: SteamCard, share: NetShare, shelf: NetSteamShe
                 )
                 Actions {
                     if (card.net != null) ActionChip(stringResource(R.string.net_steam_on_share_named, share.title), ok = true)
-                    if (card.local != null) ActionChip(stringResource(R.string.net_steam_on_device_named, card.local.library.let { if (it == "internal") stringResource(R.string.net_internal) else it }), ok = true)
+                    if (card.local != null) ActionChip(stringResource(R.string.net_steam_on_device_named, card.local.library.let { if (it == "internal") stringResource(R.string.net_builtin) else it }), ok = true)
                 }
                 if (card.net != null && card.local == null) {
                     if (card.net.dir == null) Note(stringResource(R.string.net_steam_no_folder, card.net.installDir))
@@ -305,9 +331,21 @@ private fun SteamGameDialog(card: SteamCard, share: NetShare, shelf: NetSteamShe
                         }
                     }
                 }
-                if (card.local != null) {
+                // a newer build on the share: copy it over the installed one, into the same library
+                if (card.updateHere && card.net != null && card.net.dir != null && card.local != null) {
+                    Text(stringResource(R.string.net_steam_update_note, share.title, card.net.build, card.localBuild), fontSize = 13.sp, color = colors.onSurfaceVariant)
+                    if (steamRunning) Text(stringResource(R.string.net_steam_close_first), fontSize = 13.sp, color = colors.error)
+                    val root = card.localRoot
+                    PrimaryButton(stringResource(R.string.net_steam_install_update, share.title), enabled = job == null && !steamRunning && root != null, main = false) {
+                        NetTransfers.installSteamGame(ctx, share, card.net, root!!, card.local.library.let { if (it == "internal") ctx.getString(R.string.net_builtin) else it })
+                        close()
+                    }
+                }
+                if (card.backupOld) Text(stringResource(R.string.net_steam_backup_old_note, share.title, card.localBuild, card.net!!.build), fontSize = 13.sp, color = colors.onSurfaceVariant)
+                // not offered when the share's copy is newer: backing up would put the older build over it
+                if (card.local != null && !card.updateHere) {
                     val files = card.local.gameFiles
-                    val acf = files?.parentFile?.parentFile?.let { File(it, "appmanifest_${card.appId}.acf") }
+                    val acf = card.localAcf
                     if (shelf == null) Note(stringResource(R.string.net_steam_missing, share.address))
                     else if (files == null || acf?.isFile != true) Note(stringResource(R.string.net_steam_cant_back_up))
                     else SecondaryButton(

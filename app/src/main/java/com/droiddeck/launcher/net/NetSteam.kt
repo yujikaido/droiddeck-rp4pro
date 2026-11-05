@@ -11,6 +11,8 @@ data class NetSteamGame(
     val size: Long,
     val acf: NetEntry,
     val dir: NetEntry?,
+    /** Steam's buildid from the .acf: it goes up with each update (0 when it doesn't say). */
+    val build: Long = 0L,
 )
 
 /** What a share's steamapps folder holds. [loose] are common/ folders no .acf names: Steam can't take those as installed. */
@@ -24,6 +26,7 @@ object NetSteam {
     private val APPID = Regex("^\\s*\"appid\"\\s*\"(\\d+)\"", setOf(RegexOption.MULTILINE, RegexOption.IGNORE_CASE))
     private val NAME = Regex("^\\s*\"name\"\\s*\"([^\"]*)\"", RegexOption.MULTILINE)
     private val INSTALL_DIR = Regex("^\\s*\"installdir\"\\s*\"([^\"]*)\"", setOf(RegexOption.MULTILINE, RegexOption.IGNORE_CASE))
+    private val BUILD = Regex("^\\s*\"buildid\"\\s*\"(\\d+)\"", setOf(RegexOption.MULTILINE, RegexOption.IGNORE_CASE))
     private val SIZE = Regex("^\\s*\"SizeOnDisk\"\\s*\"(\\d+)\"", setOf(RegexOption.MULTILINE, RegexOption.IGNORE_CASE))
 
     private const val PREFS = "net_shares"
@@ -64,7 +67,7 @@ object NetSteam {
                 val dir = INSTALL_DIR.find(text)?.groupValues?.get(1)?.trim().orEmpty()
                 NetSteamGame(
                     appId, NAME.find(text)?.groupValues?.get(1)?.trim().orEmpty().ifEmpty { dir.ifEmpty { "App $appId" } }, dir,
-                    SIZE.find(text)?.groupValues?.get(1)?.toLongOrNull() ?: 0L, acf, byName[dir.lowercase()],
+                    SIZE.find(text)?.groupValues?.get(1)?.toLongOrNull() ?: 0L, acf, byName[dir.lowercase()], buildOf(text),
                 )
             }
             .sortedBy { it.name.lowercase() }
@@ -74,6 +77,9 @@ object NetSteam {
             .map { it.name }
         return NetSteamShelf(steamapps, games, loose)
     }
+
+    /** The buildid in an .acf's text, or 0. */
+    fun buildOf(acf: String): Long = BUILD.find(acf)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
 
     /** A game's poster from Steam's CDN, for games that aren't on this device yet (so Steam hasn't cached any art). */
     fun posterUrl(appId: Int) = "https://cdn.cloudflare.steamstatic.com/steam/apps/$appId/library_600x900.jpg"

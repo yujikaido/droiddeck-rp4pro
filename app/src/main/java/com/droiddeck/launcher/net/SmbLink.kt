@@ -1,7 +1,9 @@
 package com.droiddeck.launcher.net
 
 import com.hierynomus.msdtyp.AccessMask
+import com.hierynomus.msdtyp.FileTime
 import com.hierynomus.msfscc.FileAttributes
+import com.hierynomus.msfscc.fileinformation.FileBasicInformation
 import com.hierynomus.mssmb2.SMB2CreateDisposition
 import com.hierynomus.mssmb2.SMB2ShareAccess
 import com.hierynomus.protocol.commons.EnumWithValue
@@ -37,9 +39,23 @@ class SmbLink private constructor(
             .sortedWith(compareBy<NetEntry>({ !it.dir }, { it.name.lowercase() }))
             .toList()
 
-    /** Size of a file, or -1 if it isn't there. */
-    fun sizeOf(path: String): Long =
-        if (!disk.fileExists(path)) -1L else disk.getFileInformation(path).standardInformation.endOfFile
+    /** A file's size and last-write time, or null if it isn't there. */
+    fun stat(path: String): NetEntry? {
+        if (!disk.fileExists(path)) return null
+        val info = disk.getFileInformation(path)
+        return NetEntry(path.substringAfterLast('\\'), path, false, info.standardInformation.endOfFile, info.basicInformation.lastWriteTime.toEpochMillis())
+    }
+
+    /** Free space on the share, or null when the server doesn't say. */
+    fun freeSpace(): Long? = runCatching { disk.shareInformation.freeSpace }.getOrNull()?.takeIf { it > 0L }
+
+    /** Gives a finished upload the device file's date, then moves it from its .ddpart name onto [path]. */
+    fun finish(file: com.hierynomus.smbj.share.File, path: String, modified: Long) {
+        if (modified > 0L) file.setFileInformation(
+            FileBasicInformation(FileBasicInformation.DONT_SET, FileBasicInformation.DONT_SET, FileTime.ofEpochMillis(modified), FileBasicInformation.DONT_SET, 0L),
+        )
+        file.rename(path, true)
+    }
 
     /** A small text file (an .acf), whole. */
     fun readText(path: String, max: Int = 1 shl 20): String = openRead(path).use { f ->
@@ -66,9 +82,9 @@ class SmbLink private constructor(
         path, EnumSet.of(AccessMask.GENERIC_READ), null, SMB2ShareAccess.ALL, SMB2CreateDisposition.FILE_OPEN, null,
     )
 
-    /** Opens [path] for writing, keeping what's there (so an interrupted upload can carry on from its end). */
+    /** Opens [path] for writing, keeping what's there (so an interrupted upload can carry on from its end); DELETE lets [finish] rename it. */
     fun openWrite(path: String): com.hierynomus.smbj.share.File = disk.openFile(
-        path, EnumSet.of(AccessMask.GENERIC_WRITE, AccessMask.GENERIC_READ), null, SMB2ShareAccess.ALL, SMB2CreateDisposition.FILE_OPEN_IF, null,
+        path, EnumSet.of(AccessMask.GENERIC_WRITE, AccessMask.GENERIC_READ, AccessMask.DELETE), null, SMB2ShareAccess.ALL, SMB2CreateDisposition.FILE_OPEN_IF, null,
     )
 
     /** The largest read/write the server agreed to (SMB2.1+ servers allow up to 8 MB). */

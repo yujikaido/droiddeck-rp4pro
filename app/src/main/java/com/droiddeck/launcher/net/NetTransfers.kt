@@ -23,14 +23,21 @@ import java.util.concurrent.atomic.AtomicReference
  * job, files go [LANES] at a time, each lane on its own connection: most of a small file's time is waiting on the
  * network and the server's disks, so several in flight keep the link busy.
  *
- * Resuming is by size: a file already there at the same size is skipped, a shorter one is carried on from its end.
- * So a dropped connection retries from the file it was on, and pressing Retry on a failed job (or copying the same
- * folder again) only fetches what's missing.
+ * A file already there with the same size and date is skipped; anything else is copied again. Each file is written
+ * under a .ddpart name and only takes its real name once whole, so a half-copied file never passes for a finished
+ * one, and a dropped connection carries on from the end of the .ddpart. So Retry (or copying a folder or a game
+ * again, as installing an update does) only moves what's missing or changed.
  */
 object NetTransfers {
     private const val TAG = "NetTransfers"
     private val RETRY_WAITS_S = intArrayOf(2, 4, 8, 15, 30, 30, 30, 30)
     private const val LANES = 4
+    private const val PART = ".ddpart"
+    /** Room left over after a copy, so the device isn't filled to the last byte. */
+    private const val SPARE = 256L shl 20
+
+    /** Not enough room on the other side: retrying won't help, so the job stops at once. */
+    private class NoSpace(message: String) : java.io.IOException(message)
 
     enum class Direction { DOWN, UP }
     enum class Status { QUEUED, SCANNING, COPYING, RETRYING, DONE, FAILED, CANCELLED }
@@ -150,6 +157,7 @@ object NetTransfers {
                     steps = SmbLink.open(job.share, password).use { plan(job, it) }
                     job.filesTotal = steps.count { !it.dir }
                     job.bytesTotal = steps.sumOf { it.size }
+                    SmbLink.open(job.share, password).use { checkSpace(context, job, it, steps) }
                 }
                 job.status = Status.COPYING
                 job.error = null
@@ -166,6 +174,7 @@ object NetTransfers {
             } catch (e: Throwable) {
                 Log.w(TAG, "job ${job.id} (${job.label}): ${e.message}", e)
                 if (job.cancelled) { job.status = Status.CANCELLED; break }
+                if (e is NoSpace) { job.error = e.message; job.status = Status.FAILED; break }
                 job.error = describeNetError(e)
                 if (job.moved.get() > movedBefore) attempt = 0
                 if (attempt >= RETRY_WAITS_S.size) { job.status = Status.FAILED; break }
@@ -234,25 +243,29 @@ object NetTransfers {
         return out
     }
 
+    /** Same file: same size, and the same date give or take 2 s (FAT keeps dates to 2 s; a date of 0 means unknown). */
+    private fun same(size: Long, modified: Long, step: Step): Boolean =
+        size == step.size && (step.modified <= 0L || modified <= 0L || kotlin.math.abs(modified - step.modified) <= 2_000L)
+
     private fun fetch(job: Job, link: SmbLink, step: Step, window: ArrayDeque<Pair<Long, Long>>) {
         if (step.dir) {
             if (!step.local.isDirectory && !step.local.mkdirs()) throw java.io.IOException("can't create ${step.local.path}")
             return
         }
-        val have = if (step.local.isFile) step.local.length() else 0L
-        if (have == step.size && step.local.isFile) {
+        if (step.local.isFile && same(step.local.length(), step.local.lastModified(), step)) {
             advance(job, step.size, 1)
             return
         }
         step.local.parentFile?.mkdirs()
-        val from = if (have < step.size) have else 0L
+        val part = File(step.local.path + PART)
+        val from = if (part.isFile && part.length() <= step.size) part.length() else 0L
         advance(job, from, 0)
+        var pos = from
         link.openRead(step.remote).use { src ->
-            RandomAccessFile(step.local, "rw").use { out ->
-                if (from == 0L) out.setLength(0L)
+            RandomAccessFile(part, "rw").use { out ->
+                out.setLength(from)
                 out.seek(from)
                 val buf = ByteArray(link.chunk)
-                var pos = from
                 while (pos < step.size) {
                     if (job.cancelled) return
                     val n = src.read(buf, pos, 0, minOf(buf.size.toLong(), step.size - pos).toInt())
@@ -265,6 +278,9 @@ object NetTransfers {
                 }
             }
         }
+        if (pos < step.size) throw java.io.IOException("${step.remote} ended early")
+        if (step.local.exists() && !step.local.delete()) throw java.io.IOException("can't replace ${step.local.path}")
+        if (!part.renameTo(step.local)) throw java.io.IOException("can't rename ${part.path}")
         if (step.modified > 0) step.local.setLastModified(step.modified)
         advance(job, 0L, 1)
     }
@@ -274,16 +290,18 @@ object NetTransfers {
             link.mkdirs(step.remote)
             return
         }
-        val have = link.sizeOf(step.remote)
-        if (have == step.size) {
+        val there = link.stat(step.remote)
+        if (there != null && same(there.size, there.modified, step)) {
             advance(job, step.size, 1)
             return
         }
         SmbLink.parent(step.remote).takeIf { it.isNotEmpty() }?.let { link.mkdirs(it) }
-        val from = if (have in 0 until step.size) have else 0L
+        val partPath = step.remote + PART
+        val have = link.stat(partPath)?.size ?: -1L
+        val from = if (have in 0..step.size) have else 0L
         advance(job, from, 0)
-        link.openWrite(step.remote).use { dst ->
-            if (from == 0L && have > 0L) dst.setLength(0L)
+        link.openWrite(partPath).use { dst ->
+            if (have != from) dst.setLength(0L)
             RandomAccessFile(step.local, "r").use { input ->
                 input.seek(from)
                 val buf = ByteArray(link.chunk)
@@ -298,9 +316,36 @@ object NetTransfers {
                     job.moved.addAndGet(n.toLong())
                     measure(job, window)
                 }
+                if (pos < step.size) throw java.io.IOException("${step.local.path} ended early")
             }
+            link.finish(dst, step.remote, step.modified)
         }
         advance(job, 0L, 1)
+    }
+
+    /**
+     * Stops a copy that can't fit before it starts: what still has to move (files not already there) against the free
+     * space where it's going, less a little to spare on the device.
+     */
+    private fun checkSpace(context: Context, job: Job, link: SmbLink, steps: List<Step>) {
+        val files = steps.filter { !it.dir }
+        fun size(n: Long) = android.text.format.Formatter.formatShortFileSize(context, n)
+        if (job.direction == Direction.DOWN) {
+            val need = files.sumOf { st ->
+                if (st.local.isFile && st.local.length() == st.size) 0L
+                else st.size - File(st.local.path + PART).let { if (it.isFile && it.length() <= st.size) it.length() else 0L }
+            }
+            var dir: File? = job.downs.firstOrNull()?.second
+            while (dir != null && !dir.exists()) dir = dir.parentFile
+            val free = dir?.usableSpace ?: return
+            if (need > 0L && need + SPARE > free) throw NoSpace(context.getString(com.droiddeck.launcher.R.string.net_no_space_device, size(need), size(free)))
+        } else {
+            val free = link.freeSpace() ?: return
+            if (job.bytesTotal <= free) return
+            // only worth asking file by file when the whole lot wouldn't fit
+            val need = files.sumOf { st -> if (link.stat(st.remote)?.size == st.size) 0L else st.size }
+            if (need > free) throw NoSpace(context.getString(com.droiddeck.launcher.R.string.net_no_space_share, size(need), size(free)))
+        }
     }
 
     /** The lanes add to the same counters. */
