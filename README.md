@@ -38,7 +38,7 @@ More before/after pictures are in the [Changelog](CHANGELOG.md) and [Fixes](FIXE
 
 ## Latest: fix54
 
-**A Network page.** I can now copy Steam games, ROMs and anything else between the RP4 Pro and my NAS (or a shared
+**A Network page.** I can now copy Steam games and other files between the RP4 Pro and my NAS (or a shared
 folder on a PC) right from DroidDeck. Steam games install straight into Steam's library, with no download, and back
 up the other way. It also brings Retro tab fixes, a keyboard that no longer covers the whole screen, and faster SD
 card installs. Get it from the [Releases](../../releases) page, or from the app's **Updates** page on fix43 or

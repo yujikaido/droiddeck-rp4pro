@@ -42,11 +42,11 @@ How it behaves:
 - The server's address only shows when you add or edit a share. Everywhere else a share goes by the name you gave it.
 
 On mine (TrueNAS, over Wi-Fi) games with many files copy at about 35-50 MB/s; a single big file goes at about
-20 MB/s for now. My whole ROMs folder (34 GB, 784 files) came over in 18 minutes.
+20 MB/s for now.
 
 **Also in fix54:**
-- **Retro tab:** ROMs copied in while the app is open show up right away. DraStic (DS) starts the game instead of
-  its menu. BIOS folders aren't listed as games. PS1 games packed as `EBOOT.PBP` are named after their folder. The
+- **Retro tab:** newly added games show up right away. DraStic (DS) starts the game instead of its menu. Files that
+  aren't games are no longer listed as games. PS1 games packed as `EBOOT.PBP` are named after their folder. The
   emulator picker says that a RetroArch core has to be downloaded in RetroArch first (without it the game opens to
   a black screen).
 - **Typing:** text boxes keep the keyboard docked at the bottom instead of Gboard covering the whole screen, and
