@@ -462,7 +462,7 @@ Guide+A chord fallback bug.
   checked out. PR #35 was updated to the new base.
 - The D3D8 idea for Ys Origin was dropped: it's a D3D9 game under DXVK 1.10.3.
 - **The app now builds from source** (fix20). Up to then I could only swap libraries inside the stock APK.
-- **A Retro tab** (fix24 to fix42): a Steam-style start screen for emulators and ROMs, with box art and game info,
+- **A Retro tab** (fix24 to fix42): a Steam-style start screen for your emulators and games, with box art and game info,
   using the platform files from Daijishou (MIT). It starts each game fresh in its emulator. One gotcha: the Home key
   only works with Retroid's controller style set to Retro.
 - **fix43**: the app's Updates page now follows this repository's releases.
@@ -514,11 +514,8 @@ Guide+A chord fallback bug.
   - Dropped the Wi-Fi in the middle of each: they waited and carried on.
   - Cancelled an install halfway: it resumed without re-copying the finished files, and Steam's "Verify
     integrity" found nothing wrong.
-- **Retro tab with my NAS ROMs**: copied my ROMs folder (34 GB, 784 files) in 18 minutes, and the Retro tab found
-  680 games across 18 systems.
-  - Fixed along the way: new ROMs only showed after leaving the app, DraStic opened its menu instead of the game,
-    BIOS files were listed as games, and a PS1 game showed as "EBOOT".
-  - Not DroidDeck bugs: missing RetroArch cores give a black screen, and ePSXe needs a PS1 BIOS.
+- **Retro tab**: a few fixes. Newly added games only showed after leaving the app, DraStic opened its menu instead
+  of the game, some files that aren't games were listed as games, and one PS1 game showed as "EBOOT".
 - **Server discovery**: Add share finds servers on the network (Bonjour, plus a quick check of the SMB port) and
   can list a server's shares once you sign in. I asked for this in the first version, because every file app has it.
 - **Keyboard**: in landscape, Gboard covered the whole screen with its own tiny text box. Text fields now keep the
