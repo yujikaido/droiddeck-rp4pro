@@ -1643,16 +1643,25 @@ static int on_frame_timer(void *data) {
 }
 
 static int layer_candidate(const struct draw_list *dl, int scene_w, int scene_h) {
-    for (int i = dl->n - 1; i >= 0 && i >= dl->n - 2; i--) {
+    /* The game's window does not have to fill the scene: a game in a smaller window still gets
+     * its own display layer, mapped to where the window actually is. Pick the largest window,
+     * as long as it covers a good part of the scene. */
+    int best = -1, best_area = 0;
+    for (int i = 0; i < dl->n; i++) {
         const struct vkp_draw *d = &dl->d[i];
         if (d->blend) continue;
         if (!vkp_image_is_dmabuf(d->img)) continue;
-        if (d->dx != 0 || d->dy != 0 || d->dw != scene_w || d->dh != scene_h) continue;
-        if (d->sx != 0 || d->sy != 0 || (int)d->sw != vkp_image_width(d->img) ||
-            (int)d->sh != vkp_image_height(d->img)) continue;
-        return i;
+        if (d->sx < 0 || d->sy < 0) continue;
+        /* 1152x648 buffers reach the compositor with a 1151x647 source rectangle (one pixel
+         * trimmed); a source within two pixels of the whole image still counts as the window. */
+        if (abs((int)d->sw - vkp_image_width(d->img)) > 2 ||
+            abs((int)d->sh - vkp_image_height(d->img)) > 2) continue;
+        if (d->dw <= 0 || d->dh <= 0) continue;
+        int area = d->dw * d->dh;
+        if (area > best_area) { best = i; best_area = area; }
     }
-    return -1;
+    if (best < 0 || (long long)best_area * 2 < (long long)scene_w * scene_h) return -1;
+    return best;
 }
 
 static struct surface *surface_for_image(const struct vkp_image *img) {
@@ -1875,7 +1884,17 @@ static void render_scene(void) {
     if (hdr_route == 0 || hdr_route == 3) {
     const int pass_on = fx_on || framegen;
     int li = (g_zero_copy && !framegen && !cardboard) ? layer_candidate(&dl, w, h) : -1;
-    int over = li >= 0 ? dl.n - 1 - li : 0;
+    /* Small windows above the game (the touch cursor, a 24x24 dot) must not cost the game its
+     * display layer: the pointer is an Android view, and pausing zero-copy on every touch made
+     * the scene flip between the layer and the copy path (visible as flicker). */
+    int over = 0, over_at = -1;
+    if (li >= 0) {
+        for (int j = li + 1; j < dl.n; j++) {
+            if (vkp_image_width(dl.d[j].img) <= 64 && vkp_image_height(dl.d[j].img) <= 64) continue;
+            over++;
+            over_at = j;
+        }
+    }
     const int fx_blocks = (li >= 0 && fx_on && over > 0);
     if (fx_blocks) { li = -1; over = 0; }
     const int ov_blocks = (li >= 0 && over > 0 && !fx_blocks && !sc_layer_overlay_affordable());
@@ -1910,12 +1929,13 @@ static void render_scene(void) {
             r = ahb_swapchain_present(ls->dmabuf_buf, ls, w, h);
         if (r != 0 && li >= 0)
             r = fx_on ? sc_layer_present_pass(&dl.d[li], 1, w, h)
-                      : sc_layer_present(dl.d[li].img, w, h, ls ? droiddeck_surface_color(ls) : NULL);
+                      : sc_layer_present(dl.d[li].img, dl.d[li].dx, dl.d[li].dy, dl.d[li].dw, dl.d[li].dh, w, h,
+                                         ls ? droiddeck_surface_color(ls) : NULL);
         if (r == 0) {
             if (ls) ls->drawn = 1;
             int go[8], ov = 0;
-            if (over == 1 && li >= 0 && vkp_map_draw(&dl.d[li + 1], go))
-                ov = sc_layer_present_overlay(dl.d[li + 1].img, go, dl.d[li + 1].blend) == 0 ? 1 : -1;
+            if (over == 1 && li >= 0 && over_at > li && vkp_map_draw(&dl.d[over_at], go))
+                ov = sc_layer_present_overlay(dl.d[over_at].img, go, dl.d[over_at].blend) == 0 ? 1 : -1;
             if (ov <= 0) sc_layer_hide_overlay();
             if (ov < 0) {
                 sc_layer_hide();

@@ -18,7 +18,7 @@ int sc_layer_can_tag_hdr(void);
 void sc_layer_hdr_symbols(char *out, size_t size);
 
 
-int sc_layer_present(struct vkp_image *src, int scene_w, int scene_h, const struct droiddeck_color *color);
+int sc_layer_present(struct vkp_image *src, int dx, int dy, int dw, int dh, int scene_w, int scene_h, const struct droiddeck_color *color);
 
 int sc_layer_present_pass(const struct vkp_draw *draws, int n, int scene_w, int scene_h);
 

@@ -826,14 +826,18 @@ unavailable:
     return -1;
 }
 
-int sc_layer_present(struct vkp_image *src, int scene_w, int scene_h, const struct droiddeck_color *color) {
+int sc_layer_present(struct vkp_image *src, int dx, int dy, int dw, int dh, int scene_w, int scene_h,
+                     const struct droiddeck_color *color) {
     struct layer *l = layer_of(SC_LAYER_GAME);
     if (!src || ensure_sc(l) != 0) return -1;
     int sw = vkp_image_width(src), sh = vkp_image_height(src);
+    if (vkp_update_map(scene_w, scene_h) != 0) return -1;
+    struct vkp_draw d = {.img = src, .sx = 0, .sy = 0, .sw = (float)sw, .sh = (float)sh,
+                         .dx = dx, .dy = dy, .dw = dw, .dh = dh};
     int r[8];
-    int g = layer_geometry(sw, sh, scene_w, scene_h, r);
-    if (g < 0) return -1;
-    if (g == 0) { sc_layer_hide(); return 0; }
+    /* The window is where the game put it, not necessarily the whole scene: map its buffer onto
+     * that rectangle instead of stretching it over the scene. */
+    if (!vkp_map_draw(&d, r)) { sc_layer_hide(); return 0; }
 
     int wait_fd;
     int idx = take_free_slot(l, sw, sh, AHB_RGBA8, &wait_fd);
@@ -843,8 +847,8 @@ int sc_layer_present(struct vkp_image *src, int scene_w, int scene_h, const stru
     if (color && color->dataspace) droiddeck_color_frame_shown(color, DROIDDECK_HDR_LAYER_COPY, AHB_RGBA8);
     if (!l->first_logged) {
         l->first_logged = 1;
-        droiddeck_log("layer", "presenting %dx%d game frames on their own SurfaceControl layer (%s pool, %d buffers); "
-                   "HUD and pointer stay Android views above it", sw, sh,
+        droiddeck_log("layer", "presenting %dx%d game frames at %d,%d-%d,%d on their own SurfaceControl layer (%s pool, %d buffers); "
+                   "HUD and pointer stay Android views above it", sw, sh, dx, dy, dx + dw, dy + dh,
                    pool_kind(l->pool_modifier), l->pool_n);
     }
     vkp_signal_first_frame();
