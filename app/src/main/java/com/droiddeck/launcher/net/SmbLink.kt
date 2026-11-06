@@ -116,7 +116,7 @@ class SmbLink private constructor(
             val (client, connection, session) = signIn(share, password)
             try {
                 val disk = session.connectShare(share.share.trim().trim('\\', '/')) as? DiskShare
-                    ?: throw IllegalStateException("\\\\${share.host}\\${share.share} is not a folder share")
+                    ?: throw IllegalStateException("${share.share} is not a folder share")
                 return SmbLink(client, connection, session, disk)
             } catch (e: Throwable) {
                 runCatching { client.close() }

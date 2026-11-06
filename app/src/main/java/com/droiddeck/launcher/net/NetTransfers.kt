@@ -100,7 +100,7 @@ object NetTransfers {
     fun upload(context: Context, share: NetShare, files: List<File>, intoPath: String) {
         if (files.isEmpty()) return
         val label = if (files.size == 1) files[0].name else "${files.size} items"
-        add(context, Job(ids.getAndIncrement(), share, Direction.UP, emptyList(), files.map { it to intoPath }, label, share.address + (if (intoPath.isEmpty()) "" else "\\$intoPath")))
+        add(context, Job(ids.getAndIncrement(), share, Direction.UP, emptyList(), files.map { it to intoPath }, label, share.place(intoPath)))
     }
 
     /** A Steam game from the share into a device library: its common/ folder, then its .acf. */
@@ -116,7 +116,7 @@ object NetTransfers {
     /** A Steam game on this device to the share's steamapps folder: its common/ folder, then its .acf. */
     fun backUpSteamGame(context: Context, share: NetShare, appId: Int, name: String, gameDir: File, acf: File, steamapps: String) {
         val ups = listOf(gameDir to SmbLink.join(steamapps, "common"), acf to steamapps)
-        add(context, Job(ids.getAndIncrement(), share, Direction.UP, emptyList(), ups, name, share.address + "\\" + steamapps, appId))
+        add(context, Job(ids.getAndIncrement(), share, Direction.UP, emptyList(), ups, name, share.place(steamapps), appId))
     }
 
     fun cancel(job: Job) {

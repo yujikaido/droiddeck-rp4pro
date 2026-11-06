@@ -352,7 +352,7 @@ private fun Browser(share: NetShare, modifier: Modifier, onEdit: () -> Unit, onS
         val remoteRows = remoteEntries.map { Row2(it.path, it.name, it.dir, it.size) }
         Side(
             title = share.title,
-            path = share.address + if (remotePath.isEmpty()) "" else "\\$remotePath",
+            path = share.place(remotePath),
             here = remotePath,
             icon = Icons.Outlined.Dns,
             rows = remoteRows,

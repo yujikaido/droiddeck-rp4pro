@@ -26,8 +26,12 @@ data class NetShare(
     /** Off: the password is asked for once each time DroidDeck starts and kept in memory only. */
     val savePassword: Boolean = true,
 ) {
-    val title: String get() = name.ifBlank { "$host\\$share" }
+    // the server's address shows only in the share dialog; everywhere else the share goes by its name
+    val title: String get() = name.ifBlank { share }
     val address: String get() = "\\\\$host\\$share"
+
+    /** A folder on this share as the Network page shows it: the share's name, then the path inside it (no address). */
+    fun place(path: String): String = if (path.isEmpty()) title else "$title\\$path"
 }
 
 /** Saved shares. The password is sealed with an Android Keystore key that never leaves the device, so a copy of

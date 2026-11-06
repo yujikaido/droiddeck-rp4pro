@@ -191,7 +191,7 @@ internal fun SteamShelfView(share: NetShare, s: FrontEndState, a: FrontEndAction
     Column(modifier) {
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp)) {
             Text(
-                shelf?.let { share.address + "\\" + it.steamapps } ?: share.address,
+                shelf?.let { share.place(it.steamapps) } ?: share.title,
                 fontSize = 12.sp, color = colors.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f),
             )
             SecondaryButton(stringResource(R.string.net_rescan), compact = true, icon = Icons.Outlined.Refresh) { tick++; localTick++ }
@@ -208,7 +208,7 @@ internal fun SteamShelfView(share: NetShare, s: FrontEndState, a: FrontEndAction
                 verticalArrangement = Arrangement.spacedBy(12.dp),
                 modifier = Modifier.weight(1f).fillMaxWidth(),
             ) {
-                if (missing) item(span = { GridItemSpan(maxLineSpan) }) { Note(stringResource(R.string.net_steam_missing, share.address)) }
+                if (missing) item(span = { GridItemSpan(maxLineSpan) }) { Note(stringResource(R.string.net_steam_missing, share.title)) }
                 if (shelf != null) {
                     item(span = { GridItemSpan(maxLineSpan) }) { SectionTitle(stringResource(R.string.net_steam_on_share, share.title), onShare.size.toString()) }
                     if (onShare.isEmpty()) item(span = { GridItemSpan(maxLineSpan) }) { Note(stringResource(R.string.net_steam_share_empty)) }
@@ -369,7 +369,7 @@ private fun SteamGameDialog(card: SteamCard, share: NetShare, shelf: NetSteamShe
                 if (card.local != null && !card.updateHere) {
                     val files = card.local.gameFiles
                     val acf = card.localAcf
-                    if (shelf == null) Note(stringResource(R.string.net_steam_missing, share.address))
+                    if (shelf == null) Note(stringResource(R.string.net_steam_missing, share.title))
                     else if (files == null || acf?.isFile != true) Note(stringResource(R.string.net_steam_cant_back_up))
                     else SecondaryButton(
                         stringResource(if (card.net != null) R.string.net_steam_update_backup else R.string.net_steam_back_up, share.title),

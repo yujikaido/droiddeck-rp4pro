@@ -59,7 +59,7 @@ internal fun NetworkSettings(
                     stringResource(R.string.net_set_encrypted).takeIf { sh.encrypt },
                     stringResource(R.string.net_set_ask).takeIf { !sh.savePassword && sh.user.isNotBlank() },
                 )
-                SettingsRow(sh.title, sh.address + "  ·  " + notes.joinToString("  ·  ")) {
+                SettingsRow(sh.title, notes.joinToString("  ·  ")) {
                     SecondaryButton(stringResource(R.string.net_edit), compact = true, icon = Icons.Outlined.Edit) { onEdit(sh) }
                 }
             }
@@ -78,7 +78,7 @@ internal fun NetworkSettings(
             ) { path -> target = path; prefs.edit().putString("steam_target", path).apply() }
         }
         SettingsGroup(stringResource(R.string.net_set_steam, current.title), compact = true) {
-            SettingsRow(steamPath?.let { current.address + "\\" + it } ?: stringResource(R.string.net_set_steam_none), null, stacked = true) {
+            SettingsRow(steamPath?.let { current.place(it) } ?: stringResource(R.string.net_set_steam_none), null, stacked = true) {
                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                     SecondaryButton(stringResource(R.string.net_set_find_again), compact = true, enabled = steamPath != null) {
                         NetSteam.forgetPath(ctx, current)
