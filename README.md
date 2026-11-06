@@ -28,9 +28,9 @@ This isn't the general DroidDeck Mali build; it's made and tested for the RP4 Pr
 - **A Network page** to copy Steam games and files to and from a NAS or a PC's shared folder.
 - **Updates from this repository**, in the app's Updates page.
 
-| A Retro tab for your emulators | Ys Origin: white rooms fixed (69 fps) |
+| A Retro tab for your emulators | A Network page: Steam games on my NAS |
 |---|---|
-| ![Retro start screen](screenshots/13-retro-start-screen.jpg) | ![Ys Origin room](screenshots/02-ys-origin-room-after-fix.jpg) |
+| ![Retro start screen](screenshots/13-retro-start-screen.jpg) | ![Network page, Steam games tab](screenshots/16-network-steam-games.jpg) |
 | **Ys: The Oath in Felghana draws its world (69 fps)** | **LSFG frame generation on the Vulkan 1.1 driver** |
 | ![Oath Icebound Cave](screenshots/15-ys-oath-icebound-cave-after-fix45-69fps.jpg) | ![LSFG in Ys Origin](screenshots/11-lsfg-ys-origin-title-50-to-60fps.jpg) |
 
