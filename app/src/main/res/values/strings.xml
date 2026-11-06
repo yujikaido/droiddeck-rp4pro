@@ -2471,7 +2471,8 @@
     <string name="net_status_retrying">Connection lost, retrying…</string>
     <string name="net_status_done">Done: %1$s, %2$s</string>
     <string name="net_show_password">Show password</string>
-    <string name="net_transfer">Transfer</string>
+    <string name="net_transfer_right">Transfer →</string>
+    <string name="net_transfer_left">← Transfer</string>
     <string name="net_found">On your network:</string>
     <string name="net_scanning">Looking for servers…</string>
     <string name="net_none_found">None found. Type the server\'s address below.</string>
