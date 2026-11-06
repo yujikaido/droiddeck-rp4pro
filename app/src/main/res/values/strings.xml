@@ -2462,7 +2462,7 @@
     <string name="net_copy_to_share">Copy to share</string>
     <string name="net_selected">%1$d picked</string>
     <string name="net_pick_device_folder">Open a folder on this device to copy into</string>
-    <string name="net_hints">A open · X pick · Y copy to the other side · B up a folder</string>
+    <string name="net_hints">A open · X pick · Y transfer · B up a folder</string>
     <string name="net_cancel">Cancel</string>
     <string name="net_clear_finished">Clear finished</string>
     <string name="net_status_queued">Waiting</string>
@@ -2471,8 +2471,7 @@
     <string name="net_status_retrying">Connection lost, retrying…</string>
     <string name="net_status_done">Done: %1$s, %2$s</string>
     <string name="net_show_password">Show password</string>
-    <string name="net_copy_folder_to_share">Copy this folder to share</string>
-    <string name="net_copy_folder_to_device">Copy this folder to device</string>
+    <string name="net_transfer">Transfer</string>
     <string name="net_found">On your network:</string>
     <string name="net_scanning">Looking for servers…</string>
     <string name="net_none_found">None found. Type the server\'s address below.</string>

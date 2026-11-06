@@ -33,7 +33,10 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Add
+import androidx.compose.material.icons.outlined.ArrowBack
+import androidx.compose.material.icons.outlined.ArrowForward
 import androidx.compose.material.icons.outlined.ArrowUpward
+import androidx.compose.material.icons.outlined.SwapHoriz
 import androidx.compose.material.icons.outlined.CheckCircle
 import androidx.compose.material.icons.outlined.Circle
 import androidx.compose.material.icons.outlined.CloudOff
@@ -106,8 +109,7 @@ private data class Row2(val key: String, val name: String, val dir: Boolean, val
 /**
  * The rail's Network page: a saved SMB share on the left, this device on the right, and the copy queue under them.
  * A opens a folder (or picks a file), X picks, Y copies what's picked (or the row it's on) to the other side, and the
- * button under a side copies the picks, or the open folder when nothing is picked. B goes
- * up a folder. Copies run in [NetTransfers], so they carry on when the page is left.
+ * Transfer button between the sides copies the picks, its arrow pointing the way they'll go. B goes up a folder. Copies run in [NetTransfers], so they carry on when the page is left.
  */
 @Composable
 internal fun NetworkPage(s: FrontEndState, a: FrontEndActions, modifier: Modifier) {
@@ -360,17 +362,23 @@ private fun Browser(share: NetShare, modifier: Modifier, onEdit: () -> Unit, onS
             busy = connecting,
             error = remoteError,
             canGoUp = remotePath.isNotEmpty(),
-            copyLabel = stringResource(R.string.net_copy_to_device),
-            folderLabel = if (remotePath.isNotEmpty()) stringResource(R.string.net_copy_folder_to_device) else null,
-            onCopyFolder = { copyDown(NetEntry(remotePath.substringAfterLast('\\'), remotePath, true, 0L, 0L)) },
             onRetry = { connectTick++ },
             onEdit = onEdit,
             onUp = { listRemote(SmbLink.parent(remotePath)) },
             onOpen = { row -> listRemote(row.key) },
-            onPick = { row -> remotePicked = if (row.key in remotePicked) remotePicked - row.key else remotePicked + row.key },
+            // picks live on one side at a time, so the Transfer arrow only ever has one way to point
+            onPick = { row ->
+                remotePicked = if (row.key in remotePicked) remotePicked - row.key else remotePicked + row.key
+                if (remotePicked.isNotEmpty()) localPicked = emptySet()
+            },
             onCopy = { row -> copyDown(row?.let { r -> remoteEntries.firstOrNull { it.path == r.key } }) },
             modifier = Modifier.weight(1f).fillMaxSize(),
         )
+        // one button between the sides; its arrow points where the picked files will go
+        TransferButton(
+            direction = when { remotePicked.isNotEmpty() -> 1; localPicked.isNotEmpty() -> -1; else -> 0 },
+            modifier = Modifier.align(Alignment.CenterVertically),
+        ) { if (remotePicked.isNotEmpty()) copyDown(null) else if (localPicked.isNotEmpty()) copyUp(null) }
         val dir = localDir?.let(::File)
         val root = roots.firstOrNull { it.dir.path == localDir }
         val localRows = if (dir == null) roots.map { r ->
@@ -393,15 +401,14 @@ private fun Browser(share: NetShare, modifier: Modifier, onEdit: () -> Unit, onS
             busy = false,
             error = null,
             canGoUp = dir != null,
-            copyLabel = stringResource(R.string.net_copy_to_share),
-            // a whole storage root (all of internal storage, the whole card) is too much to send by accident
-            folderLabel = if (dir != null && root == null) stringResource(R.string.net_copy_folder_to_share) else null,
-            onCopyFolder = { if (dir != null) copyUp(dir) },
             onRetry = {},
             onEdit = null,
             onUp = { localDir = if (root != null || dir == null) null else dir.parentFile?.path; localPicked = emptySet() },
             onOpen = { row -> localDir = row.key; localPicked = emptySet() },
-            onPick = { row -> if (dir != null) localPicked = if (row.key in localPicked) localPicked - row.key else localPicked + row.key },
+            onPick = { row ->
+                if (dir != null) localPicked = if (row.key in localPicked) localPicked - row.key else localPicked + row.key
+                if (localPicked.isNotEmpty()) remotePicked = emptySet()
+            },
             onCopy = { row -> if (dir != null) copyUp(row?.let { File(it.key) }) },
             modifier = Modifier.weight(1f).fillMaxSize(),
         )
@@ -450,7 +457,7 @@ private fun freeSpace(ctx: Context, dir: File): String? =
 @Composable
 private fun Side(
     title: String, path: String, here: String, icon: ImageVector, rows: List<Row2>, picked: Set<String>,
-    busy: Boolean, error: String?, canGoUp: Boolean, copyLabel: String, folderLabel: String?, onCopyFolder: () -> Unit,
+    busy: Boolean, error: String?, canGoUp: Boolean,
     onRetry: () -> Unit, onEdit: (() -> Unit)?, onUp: () -> Unit, onOpen: (Row2) -> Unit, onPick: (Row2) -> Unit, onCopy: (Row2?) -> Unit,
     modifier: Modifier,
 ) {
@@ -515,15 +522,38 @@ private fun Side(
             }
         }
         Box(Modifier.fillMaxWidth().height(1.dp).background(pal.line))
-        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp)) {
-            Text(
-                if (picked.isEmpty()) pluralStringResource(R.plurals.fm_items, rows.size, rows.size) else stringResource(R.string.net_selected, picked.size),
-                fontSize = 12.sp, color = colors.onSurfaceVariant, modifier = Modifier.weight(1f),
-            )
-            // with nothing picked, the button copies the folder that's open, so a whole folder needs no picking
-            if (picked.isEmpty() && folderLabel != null) SecondaryButton(folderLabel, compact = true) { onCopyFolder() }
-            else SecondaryButton(copyLabel, compact = true, enabled = picked.isNotEmpty()) { onCopy(null) }
-        }
+        Text(
+            if (picked.isEmpty()) pluralStringResource(R.plurals.fm_items, rows.size, rows.size) else stringResource(R.string.net_selected, picked.size),
+            fontSize = 12.sp, color = colors.onSurfaceVariant, modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
+        )
+    }
+}
+
+/** Between the two sides: Transfer, with an arrow toward where the picks go ([direction] 1 = right, -1 = left, 0 = nothing picked). */
+@Composable
+private fun TransferButton(direction: Int, modifier: Modifier, onClick: () -> Unit) {
+    val pal = LocalPalette.current
+    val colors = MaterialTheme.colorScheme
+    val src = remember { MutableInteractionSource() }
+    val hot = rememberHot(src)
+    val on = direction != 0
+    val shape = RoundedCornerShape(14.dp)
+    val tint = if (on) Color.White else colors.onSurfaceVariant.copy(alpha = 0.45f)
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(4.dp, Alignment.CenterVertically),
+        modifier = modifier.width(92.dp).heightIn(min = 96.dp).clip(shape)
+            .background(if (on) pal.signal else Color.White.copy(alpha = 0.03f))
+            .glideBorder(hot, shape, if (on) Color.White else pal.signal, if (on) pal.signal else pal.line2)
+            .hoverable(src).clickable(enabled = on, interactionSource = src, indication = LocalIndication.current, onClick = onClick)
+            .controllerConfirm(onClick = { if (on) onClick() })
+            .padding(8.dp),
+    ) {
+        @Suppress("DEPRECATION")
+        Icon(
+            when (direction) { 1 -> Icons.Outlined.ArrowForward; -1 -> Icons.Outlined.ArrowBack; else -> Icons.Outlined.SwapHoriz },
+            null, tint = tint, modifier = Modifier.size(32.dp),
+        )
+        Text(stringResource(R.string.net_transfer), fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold, color = tint)
     }
 }
 
