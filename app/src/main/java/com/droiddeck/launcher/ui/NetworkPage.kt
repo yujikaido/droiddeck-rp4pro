@@ -105,7 +105,8 @@ private data class Row2(val key: String, val name: String, val dir: Boolean, val
 
 /**
  * The rail's Network page: a saved SMB share on the left, this device on the right, and the copy queue under them.
- * A opens a folder (or picks a file), X picks, Y copies what's picked (or the row it's on) to the other side, B goes
+ * A opens a folder (or picks a file), X picks, Y copies what's picked (or the row it's on) to the other side, and the
+ * button under a side copies the picks, or the open folder when nothing is picked. B goes
  * up a folder. Copies run in [NetTransfers], so they carry on when the page is left.
  */
 @Composable
@@ -360,6 +361,8 @@ private fun Browser(share: NetShare, modifier: Modifier, onEdit: () -> Unit, onS
             error = remoteError,
             canGoUp = remotePath.isNotEmpty(),
             copyLabel = stringResource(R.string.net_copy_to_device),
+            folderLabel = if (remotePath.isNotEmpty()) stringResource(R.string.net_copy_folder_to_device) else null,
+            onCopyFolder = { copyDown(NetEntry(remotePath.substringAfterLast('\\'), remotePath, true, 0L, 0L)) },
             onRetry = { connectTick++ },
             onEdit = onEdit,
             onUp = { listRemote(SmbLink.parent(remotePath)) },
@@ -391,6 +394,9 @@ private fun Browser(share: NetShare, modifier: Modifier, onEdit: () -> Unit, onS
             error = null,
             canGoUp = dir != null,
             copyLabel = stringResource(R.string.net_copy_to_share),
+            // a whole storage root (all of internal storage, the whole card) is too much to send by accident
+            folderLabel = if (dir != null && root == null) stringResource(R.string.net_copy_folder_to_share) else null,
+            onCopyFolder = { if (dir != null) copyUp(dir) },
             onRetry = {},
             onEdit = null,
             onUp = { localDir = if (root != null || dir == null) null else dir.parentFile?.path; localPicked = emptySet() },
@@ -444,7 +450,7 @@ private fun freeSpace(ctx: Context, dir: File): String? =
 @Composable
 private fun Side(
     title: String, path: String, here: String, icon: ImageVector, rows: List<Row2>, picked: Set<String>,
-    busy: Boolean, error: String?, canGoUp: Boolean, copyLabel: String,
+    busy: Boolean, error: String?, canGoUp: Boolean, copyLabel: String, folderLabel: String?, onCopyFolder: () -> Unit,
     onRetry: () -> Unit, onEdit: (() -> Unit)?, onUp: () -> Unit, onOpen: (Row2) -> Unit, onPick: (Row2) -> Unit, onCopy: (Row2?) -> Unit,
     modifier: Modifier,
 ) {
@@ -514,7 +520,9 @@ private fun Side(
                 if (picked.isEmpty()) pluralStringResource(R.plurals.fm_items, rows.size, rows.size) else stringResource(R.string.net_selected, picked.size),
                 fontSize = 12.sp, color = colors.onSurfaceVariant, modifier = Modifier.weight(1f),
             )
-            SecondaryButton(copyLabel, compact = true, enabled = picked.isNotEmpty()) { onCopy(null) }
+            // with nothing picked, the button copies the folder that's open, so a whole folder needs no picking
+            if (picked.isEmpty() && folderLabel != null) SecondaryButton(folderLabel, compact = true) { onCopyFolder() }
+            else SecondaryButton(copyLabel, compact = true, enabled = picked.isNotEmpty()) { onCopy(null) }
         }
     }
 }
@@ -542,13 +550,16 @@ private fun EntryRow(row: Row2, picked: Boolean, extra: Modifier, onA: () -> Uni
                 if (act == null) false else { if (k.action == KeyEvent.ACTION_DOWN && k.repeatCount == 0) act(); true }
             }
             .hoverable(src).clickable(interactionSource = src, indication = LocalIndication.current, onClick = onA)
-            .padding(horizontal = 12.dp),
+            .padding(start = 2.dp, end = 12.dp),
     ) {
-        Icon(
-            if (picked) Icons.Outlined.CheckCircle else Icons.Outlined.Circle, null,
-            tint = if (picked) pal.signal else colors.onSurfaceVariant.copy(alpha = 0.35f),
-            modifier = Modifier.size(18.dp).clip(RoundedCornerShape(99.dp)).clickable(onClick = onX),
-        )
+        // a finger-sized target around the small circle: tapping the row opens a folder, tapping here picks it
+        Box(contentAlignment = Alignment.Center, modifier = Modifier.size(40.dp).clip(RoundedCornerShape(99.dp)).clickable(onClick = onX)) {
+            Icon(
+                if (picked) Icons.Outlined.CheckCircle else Icons.Outlined.Circle, null,
+                tint = if (picked) pal.signal else colors.onSurfaceVariant.copy(alpha = 0.35f),
+                modifier = Modifier.size(20.dp),
+            )
+        }
         Icon(row.icon ?: if (row.dir) Icons.Outlined.Folder else Icons.Outlined.Description, null,
             tint = if (row.dir) pal.signal else colors.onSurfaceVariant, modifier = Modifier.size(18.dp))
         Text(row.name, fontSize = 13.5.sp, color = colors.onBackground, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
