@@ -451,3 +451,85 @@ other Ys games); 2 test fix15 (rebased bridge on v0.5.4.1: Steam start, Ys Origi
 3 nan_position startup probe; 4 full v0.5.4.1-based build (source tarball, compositor rebuild); 5 32-bit DXVK D3D8
 for Ys Origin; 6 library pass, sleep/resume + device-loss test, 1080p, battery Win-FG vs LSFG, update prompt,
 Guide+A chord fallback bug.
+
+## 2026-10-28: cached memory, building the app myself, and a Retro tab (fix15 to fix43)
+
+- **Cache test.** Ys I's dialog crawl came from FEX writing one byte at a time into the bridge's uncached memory.
+  I measured a cached version: the stall went from 163 ms to 0.74 ms, but the cache then has to be flushed before
+  every submit (about 0.03-0.05 ms per MB). So it became an opt-in switch per game (`VKBRIDGE_CACHED_UPLOAD`, fix17)
+  rather than the default. Ys I stays on TSO off, which is simpler and just as fast.
+- **fix18** moved everything onto ASEbrahim's v0.5.4.1. Steam, Ys I, sleep/resume and Ys Origin's rooms all
+  checked out. PR #35 was updated to the new base.
+- The D3D8 idea for Ys Origin was dropped: it's a D3D9 game under DXVK 1.10.3.
+- **The app now builds from source** (fix20). Up to then I could only swap libraries inside the stock APK.
+- **A Retro tab** (fix24 to fix42): a Steam-style start screen for emulators and ROMs, with box art and game info,
+  using the platform files from Daijishou (MIT). It starts each game fresh in its emulator. One gotcha: the Home key
+  only works with Retroid's controller style set to Retro.
+- **fix43**: the app's Updates page now follows this repository's releases.
+
+## 2026-10-29: four games fixed, and the README split up (fix44 to fix51)
+
+- **Tales of Symphonia closed at start.** It asks for 2x multisampling, which this Mali driver doesn't have.
+  Bridge fix `msaa2_as_4`: it reports 2x and quietly makes the image with 4 samples (fix44).
+- **Oath in Felghana's world was black.** Microsoft's own `d3dx9_41/43` DLLs return NaN matrices when run through
+  FEX. Using Wine's built-in d3dx9 fixes it (fix45, about 69 fps). The same cause turned out to be behind Ys
+  Origin's white rooms (fix48), not the dead particles I first blamed.
+- **fix46** took ASEbrahim's v0.5.4.2. Lesson learned: Windows line endings in the guest scripts stop Steam from
+  starting, so the source repo keeps `autocrlf` off.
+- **Symphonia's battles ran at 15 fps.** The game pins its main thread to Windows CPU 0, which on this chip is a
+  slow little core. Mapping CPU 0 to a big core gave a steady 30 (fix49), and fix50 does it for every game
+  ("fast cores first").
+- **fix51**: when you come back from a Retro game, its emulator closes.
+- The README got too long, so it's now split into README, Games, Changelog and Fixes.
+
+## 2026-10-31 to 2026-11-02: ScummVM and the new bridge (fix52, fix53)
+
+- **fix52**: ScummVM games on the Retro tab (King's Quest, Space Quest and friends), played with the touch screen.
+- **November 1**: ASEbrahim released MaliBridge v0.5.5.1. fix53 takes his new bridge and moves my RP4 Pro fixes onto
+  it. Tales of Vesperia's towns went from about 42 to 46 fps; everything tested before still works.
+- Cleanup: a leftover shader dump folder from the October 27 hunt had grown to 44,000 files (610 MB). Deleted.
+
+## 2026-11-03 to 2026-11-04: SD card installs
+
+- **Tales of Eternia "Reserving space" at 5 files a second.** It has 33,552 of its files in a single folder, and
+  the card is exFAT, where every new file name means scanning the whole folder. DroidDeck's folder-listing cache now
+  works on native exFAT/FAT/NTFS cards too, and I ported upstream's fast path (#1331). Result: 22-30 files a second.
+  The card itself sets the floor: about 10 ms to create a file, and 11.6 ms to look up a new name in a 26,000-file
+  folder. So there's maybe 2x left at most.
+- **Steam's "Move install folder" to the card failed** with "Disk write failure". Steam copies a file, then sets its
+  date, and the card refuses that. A small preload now treats that refusal as success on exFAT/FAT/NTFS only.
+  Tales of Vesperia (24 GB) moved to the card fine after that.
+- **Turning the screen off paused Steam** in the middle of reserving, committing or moving, because those steps
+  don't write to Steam's log for minutes. They now count as busy from start to end (capped at 3 hours).
+- **November 4 evening**: started the Network page.
+
+## 2026-11-05: the Network page (fix54)
+
+- **The Network page**: connect to a shared folder (SMB) on a NAS or PC. A Steam games tab installs games
+  straight into Steam's library and backs them up the other way; a Files tab copies anything in both directions;
+  a Settings tab handles shares, copy speed and where games go.
+- **Tested from the PC while I was away:**
+  - Installed Ys: The Oath in Felghana (1.8 GB, 2,096 files) and backed up King's Quest Collection (2.3 GB,
+    953 files) at about 35-50 MB/s.
+  - Dropped the Wi-Fi in the middle of each: they waited and carried on.
+  - Cancelled an install halfway: it resumed without re-copying the finished files, and Steam's "Verify
+    integrity" found nothing wrong.
+- **Retro tab with my NAS ROMs**: copied my ROMs folder (34 GB, 784 files) in 18 minutes, and the Retro tab found
+  680 games across 18 systems.
+  - Fixed along the way: new ROMs only showed after leaving the app, DraStic opened its menu instead of the game,
+    BIOS files were listed as games, and a PS1 game showed as "EBOOT".
+  - Not DroidDeck bugs: missing RetroArch cores give a black screen, and ePSXe needs a PS1 BIOS.
+- **Server discovery**: Add share finds servers on the network (Bonjour, plus a quick check of the SMB port) and
+  can list a server's shares once you sign in. I asked for this in the first version, because every file app has it.
+- **Keyboard**: in landscape, Gboard covered the whole screen with its own tiny text box. Text fields now keep the
+  keyboard docked, and dialogs move above it, in every DroidDeck dialog.
+- **Files tab buttons**: the first version put a copy button under each side, and the one under where I wanted the
+  file to go actually sent things the other way. Now it's **Transfer →** under the left side and **← Transfer**
+  under the right, shown only when something is picked.
+- **Privacy**: the server's address now shows only when adding or editing a share. Everywhere else the share goes
+  by its name.
+- **On the NAS**: moving about 640 GB of old Steam backups into the handheld's folder took seconds with `mv` on the
+  NAS itself, since both folders are in the same dataset. Copying them through a PC would have taken hours. A
+  separate NAS user for the handheld also needs permission to the files already in its folder, or Steam games
+  shows "access refused".
+- **fix54 published.**
