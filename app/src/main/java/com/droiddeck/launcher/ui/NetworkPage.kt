@@ -31,7 +31,6 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.ArrowUpward
@@ -53,7 +52,6 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -76,12 +74,11 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.input.KeyboardCapitalization
-import androidx.compose.ui.text.input.PasswordVisualTransformation
-import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -203,6 +200,7 @@ private fun SignIn(share: NetShare, modifier: Modifier, onDone: () -> Unit) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     val colors = MaterialTheme.colorScheme
+    val view = LocalView.current
     var password by remember(share.id) { mutableStateOf("") }
     var testing by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
@@ -210,10 +208,9 @@ private fun SignIn(share: NetShare, modifier: Modifier, onDone: () -> Unit) {
         Icon(Icons.Outlined.Lock, null, tint = colors.onSurfaceVariant, modifier = Modifier.size(34.dp))
         Text(stringResource(R.string.net_sign_in, share.title), fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = colors.onBackground)
         Text(stringResource(R.string.net_sign_in_note, share.user), fontSize = 13.sp, color = colors.onSurfaceVariant, textAlign = TextAlign.Center)
-        OutlinedTextField(
-            password, { password = it }, singleLine = true, label = { Text(stringResource(R.string.net_field_password)) },
-            visualTransformation = PasswordVisualTransformation(), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
-            modifier = Modifier.widthIn(max = 360.dp).fillMaxWidth(),
+        AdbTextField(
+            password, { password = it }, stringResource(R.string.net_field_password), KeyboardType.Password, ImeAction.Done,
+            password = true, onDone = { hideKeyboard(view) }, modifier = Modifier.widthIn(max = 360.dp),
         )
         if (error != null) Text(error!!, fontSize = 13.sp, color = colors.error)
         PrimaryButton(stringResource(if (testing) R.string.net_connecting else R.string.net_connect), enabled = !testing && password.isNotEmpty(), compact = true) {
@@ -645,6 +642,8 @@ private fun ShareDialog(share: NetShare, isNew: Boolean, onSaved: (NetShare) -> 
     var testing by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     var confirmRemove by remember { mutableStateOf(false) }
+    val view = LocalView.current
+    val done = { hideKeyboard(view) }
     // servers found on the network (new shares only), and the shares the server at [host] offers once listed
     var servers by remember { mutableStateOf<List<NetServer>>(emptyList()) }
     var scanning by remember { mutableStateOf(false) }
@@ -689,12 +688,12 @@ private fun ShareDialog(share: NetShare, isNew: Boolean, onSaved: (NetShare) -> 
         }
         // two to a row, so Connect and save stays on a 16:9 handheld's screen without scrolling
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
-            OutlinedTextField(host, { host = it }, singleLine = true, label = { Text(stringResource(R.string.net_field_host)) },
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri), modifier = Modifier.weight(1f))
-            OutlinedTextField(shareName, { shareName = it }, singleLine = true,
-                keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.None, autoCorrect = false), label = { Text(stringResource(R.string.net_field_share)) },
+            AdbTextField(host, { host = it }, stringResource(R.string.net_field_host), KeyboardType.Uri, ImeAction.Done,
+                compact = true, onDone = done, modifier = Modifier.weight(1f))
+            AdbTextField(shareName, { shareName = it }, stringResource(R.string.net_field_share), KeyboardType.Uri, ImeAction.Done,
+                compact = true, onDone = done,
                 // signs in with the user and password below and asks the server what it shares
-                trailingIcon = {
+                trailing = {
                     if (listing) CircularProgressIndicator(strokeWidth = 2.dp, modifier = Modifier.size(16.dp))
                     else SmallIconButton(Icons.Outlined.FolderOpen, stringResource(R.string.net_list_shares), colors.onSurfaceVariant) {
                         if (host.isBlank()) return@SmallIconButton
@@ -713,27 +712,33 @@ private fun ShareDialog(share: NetShare, isNew: Boolean, onSaved: (NetShare) -> 
                 modifier = Modifier.weight(1f))
         }
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
-            // no autocorrect or capitals: a keyboard "fixing" a user name is a sign-in failure that looks like a wrong password
-            OutlinedTextField(user, { user = it }, singleLine = true, label = { Text(stringResource(R.string.net_field_user)) },
-                keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.None, autoCorrect = false, keyboardType = KeyboardType.Ascii),
-                modifier = Modifier.weight(1f))
-            OutlinedTextField(password, { password = it }, singleLine = true, label = { Text(stringResource(R.string.net_field_password)) },
-                placeholder = if (isNew) null else ({ Text(stringResource(R.string.net_password_kept)) }),
-                visualTransformation = if (showPassword) VisualTransformation.None else PasswordVisualTransformation(),
-                trailingIcon = {
+            // no autocorrect or capitals (the field asks for none): a keyboard "fixing" a user name is a sign-in failure that looks like a wrong password
+            AdbTextField(user, { user = it }, stringResource(R.string.net_field_user), KeyboardType.Ascii, ImeAction.Done,
+                compact = true, onDone = done, modifier = Modifier.weight(1f))
+            AdbTextField(password, { password = it }, stringResource(R.string.net_field_password), KeyboardType.Password, ImeAction.Done,
+                placeholder = if (isNew) null else stringResource(R.string.net_password_kept),
+                compact = true, onDone = done, password = true, revealed = showPassword,
+                trailing = {
                     SmallIconButton(if (showPassword) Icons.Outlined.VisibilityOff else Icons.Outlined.Visibility,
                         stringResource(R.string.net_show_password), MaterialTheme.colorScheme.onSurfaceVariant) { showPassword = !showPassword }
                 },
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password), modifier = Modifier.weight(1f))
+                modifier = Modifier.weight(1f))
         }
-        OutlinedTextField(name, { name = it }, singleLine = true, label = { Text(stringResource(R.string.net_field_name)) }, modifier = Modifier.fillMaxWidth())
-        // what each means (and the USB debugging caveat) is spelled out in Settings, under Keeping the NAS safe
-        Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
-            Switched(stringResource(R.string.net_save_password), savePassword, Modifier.weight(1f)) { savePassword = it }
-            Switched(stringResource(R.string.net_encrypt), encrypt, Modifier.weight(1f)) { encrypt = it }
+        AdbTextField(name, { name = it }, stringResource(R.string.net_field_name), KeyboardType.Text, ImeAction.Done,
+            compact = true, onDone = done)
+        // what each means (and the USB debugging caveat) is spelled out in Settings, under Keeping the NAS safe.
+        // Adding has the servers row too, so there the switches share the buttons' row to keep Connect and save on screen;
+        // editing has room, and Remove's "Press again to remove" needs it
+        val switches: @Composable (Modifier) -> Unit = { m ->
+            Switched(stringResource(R.string.net_save_password), savePassword, m) { savePassword = it }
+            Switched(stringResource(R.string.net_encrypt), encrypt, m) { encrypt = it }
+        }
+        if (!isNew) Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+            switches(Modifier.weight(1f))
         }
         if (error != null) Text(error!!, fontSize = 13.sp, color = colors.error)
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+            if (isNew) switches(Modifier)
             // a second press removes it: the first only asks, so a stray A on the button can't drop a share
             if (!isNew) SecondaryButton(stringResource(if (confirmRemove) R.string.net_remove_confirm else R.string.net_remove), compact = true) {
                 if (confirmRemove) { onRemoved(); close() } else confirmRemove = true

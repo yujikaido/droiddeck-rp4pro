@@ -83,7 +83,7 @@ object NetShares {
         val arr = JSONArray()
         list(context).filter { it.id != id }.forEach { arr.put(toJson(it)) }
         remembered.remove(id)
-        prefs(context).edit().putString("shares", arr.toString()).remove("pw:$id").apply()
+        prefs(context).edit().putString("shares", arr.toString()).remove("pw:$id").remove("steam:$id").apply()
     }
 
     fun password(context: Context, id: String): String =

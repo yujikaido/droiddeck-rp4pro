@@ -310,9 +310,30 @@ internal fun AppDialog(
     val pal = LocalPalette.current
     VeilRing()
     Dialog(onDismissRequest = back ?: close, properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)) {
+      // resize, not pan: panning slides the whole dialog up by a guess and can leave the focused field under the
+      // keyboard; with resize, imePadding below shrinks the dialog to the space above it and the field scrolls into view
+      val dialogView = LocalView.current
+      val dialogWindow = (dialogView.parent as? androidx.compose.ui.window.DialogWindowProvider)?.window
+      androidx.compose.runtime.SideEffect { dialogWindow?.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE) }
+      // the window shrinks to the space above the keyboard, but this app's insets (target SDK 28) don't reach Compose,
+      // so the dialog reads the visible area itself: with a keyboard up it moves to the top and fits (and scrolls) there
+      val density = androidx.compose.ui.platform.LocalDensity.current
+      val screenPx = with(density) { LocalConfiguration.current.screenHeightDp.dp.roundToPx() }
+      var visiblePx by remember { androidx.compose.runtime.mutableIntStateOf(0) }
+      androidx.compose.runtime.DisposableEffect(dialogView) {
+          val frame = android.graphics.Rect()
+          val listener = android.view.ViewTreeObserver.OnGlobalLayoutListener {
+              dialogView.getWindowVisibleDisplayFrame(frame)
+              visiblePx = frame.height()
+          }
+          dialogView.viewTreeObserver.addOnGlobalLayoutListener(listener)
+          onDispose { dialogView.viewTreeObserver.removeOnGlobalLayoutListener(listener) }
+      }
+      val keyboardUp = visiblePx in 1 until screenPx * 3 / 4
+      val roomDp = with(density) { (if (keyboardUp) visiblePx else screenPx).toDp() }
       CompositionLocalProvider(LocalFrontFocus provides null) {
         Box(
-            contentAlignment = Alignment.Center,
+            contentAlignment = if (keyboardUp) Alignment.TopCenter else Alignment.Center,
             modifier = Modifier.fillMaxSize().imePadding()
                 .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null, onClick = close),
         ) {
@@ -334,7 +355,7 @@ internal fun AppDialog(
                                 else -> Modifier.fillMaxWidth()
                             },
                         )
-                        .heightIn(max = (LocalConfiguration.current.screenHeightDp - 24).dp)
+                        .heightIn(max = roomDp - 24.dp)
                         .shadow(24.dp, Shape16, ambientColor = Color.Black, spotColor = Color.Black)
                         .clip(Shape16)
                         .background(pal.surfaceVariant.copy(alpha = 0.97f))
@@ -421,7 +442,7 @@ internal fun DialogFooter(note: String?, confirm: String, enabled: Boolean, onCa
 internal fun Small(text: String, error: Boolean = false) =
     Text(text, fontSize = 12.sp, lineHeight = 16.sp, color = if (error) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
 
-private fun hideKeyboard(view: View) {
+internal fun hideKeyboard(view: View) {
     (view.context.getSystemService(android.content.Context.INPUT_METHOD_SERVICE) as? InputMethodManager)
         ?.hideSoftInputFromWindow(view.windowToken, 0)
 }
