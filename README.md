@@ -25,6 +25,7 @@ This isn't the general DroidDeck Mali build; it's made and tested for the RP4 Pr
   white rooms, Tales of Symphonia closing at start, Oath in Felghana's black world.
 - **Frame generation works**: LSFG on the Vulkan 1.1 driver, and Win-FG no longer crashes on a second launch.
 - **A Retro tab**, so your emulators and ROMs live next to your Steam games.
+- **A Network page** to copy Steam games and files to and from a NAS or a PC's shared folder.
 - **Updates from this repository**, in the app's Updates page.
 
 | A Retro tab for your emulators | Ys Origin: white rooms fixed (69 fps) |
@@ -35,14 +36,13 @@ This isn't the general DroidDeck Mali build; it's made and tested for the RP4 Pr
 
 More before/after pictures are in the [Changelog](CHANGELOG.md) and [Fixes](FIXES.md).
 
-## Latest: fix53
+## Latest: fix54
 
-**The newer MaliBridge v0.5.5.1 bridge, with this build's RP4 Pro fixes moved onto it.** It brings ASEbrahim's
-rendering speedups and black-screen and flicker fixes; Tales of Vesperia's towns went from about 42 to about 46 fps,
-and every game tested before still runs as it did. The app around it is unchanged. fix52 before it added
-**ScummVM games on the Retro tab** (King's Quest, Space Quest, Police Quest and other point-and-click games, played
-with the touch screen). Get it from the [Releases](../../releases) page, or from the app's **Updates** page on fix43
-or later. Every build's notes are in the [CHANGELOG](CHANGELOG.md).
+**A Network page.** I can now copy Steam games, ROMs and anything else between the RP4 Pro and my NAS (or a shared
+folder on a PC) right from DroidDeck. Steam games install straight into Steam's library, with no download, and back
+up the other way. It also brings Retro tab fixes, a keyboard that no longer covers the whole screen, and faster SD
+card installs. Get it from the [Releases](../../releases) page, or from the app's **Updates** page on fix43 or
+later. Every build's notes are in the [CHANGELOG](CHANGELOG.md).
 
 ## More pages
 
@@ -55,8 +55,8 @@ or later. Every build's notes are in the [CHANGELOG](CHANGELOG.md).
 
 ## Installing
 
-`DroidDeck-MaliBridge-v0.5.4.2-rp4pro-fix53.apk` (on the [Releases](../../releases) page) is DroidDeck Mali
-v0.5.4.2 built from source with the MaliBridge v0.5.5.1 bridge, these fixes and the Retro tab. fix14, the earlier build on v0.5.4, is still
+`DroidDeck-MaliBridge-v0.5.4.2-rp4pro-fix54.apk` (on the [Releases](../../releases) page) is DroidDeck Mali
+v0.5.4.2 built from source with the MaliBridge v0.5.5.1 bridge, these fixes, the Retro tab and the Network page. fix14, the earlier build on v0.5.4, is still
 there too. Both are signed with a **personal debug key**, not the author's. Because of that:
 
 - If you have the official DroidDeck Mali installed, **uninstall it first**. Android refuses to install over
@@ -138,7 +138,7 @@ Steam's **Quick Access** menu, the same as on a Steam Deck.
 | `patches/` | the compositor and frame-generation patches against the `mali-test-build` fork |
 | `tools/` | the Vulkan probes run inside the DroidDeck rootfs during the investigation (`vk*.py`), the apitrace frame replay (`ys_replay.py`), and the preload build / APK repack scripts |
 | `docs/` | the pull-request write-ups sent upstream, and [`PROGRESS-LOG.md`](docs/PROGRESS-LOG.md), the day-by-day investigation log |
-| branch [`source`](../../tree/source) | the whole app fix53 is built from (DroidDeck Mali v0.5.4.2 with the MaliBridge v0.5.5.1 bridge, the fixes and the Retro tab) |
+| branch [`source`](../../tree/source) | the whole app fix54 is built from (DroidDeck Mali v0.5.4.2 with the MaliBridge v0.5.5.1 bridge, the fixes, the Retro tab and the Network page) |
 
 ## Credits
 

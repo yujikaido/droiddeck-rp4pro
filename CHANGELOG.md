@@ -5,6 +5,58 @@
 Newest first. Each build is on the [Releases](../../releases) page; from fix43 on, the app's **Updates** page
 offers new ones by itself.
 
+## fix54: the Network page
+
+This is the big one for me. I keep my games on my NAS, and getting them onto the RP4 Pro's SD card meant pulling
+the card and copying through my PC. fix54 adds a **Network** page on the left rail that connects to a shared
+folder (SMB) on a NAS, or on a Windows or Mac PC, so I can do it all from the handheld.
+
+| Steam games on my NAS | Files: copy both ways |
+|---|---|
+| ![Network page, Steam games tab](screenshots/16-network-steam-games.jpg) | ![Network page, Files tab](screenshots/17-network-files.jpg) |
+| **Settings: shares, copy speed, where games go** | |
+| ![Network page, Settings tab](screenshots/18-network-settings.jpg) | |
+
+**Steam games tab.** It finds the `steamapps` folder on the share (at the top or one folder down, or pick it in
+Files) and lists every game in it with its cover and size. **Install** copies the game straight into Steam's
+library on the device, so Steam sees it as installed: no download. It works the other way too: **Back up** copies a
+game from the device to the share, and when the copy on the share is older, it updates only the files that changed.
+
+**Files tab.** The share is on the left, the device on the right. Tap the circle next to a file or folder to pick
+it. A **Transfer →** button shows under the left side when something there is picked, and **← Transfer** under the
+right side, and it copies the picks into the folder open on the other side. With a controller: A opens, X picks,
+Y transfers, B goes up a folder, LB/RB switch tabs.
+
+**Settings tab.** **Add share** looks for servers on your network and lists them, so you can pick yours instead of
+typing an address. After you type your user name and password, the folder button lists that server's shares. You
+can also choose how many files copy at a time (1, 2, 4 or 8) and where Steam installs go.
+
+How it behaves:
+- Copies keep going in the background. A Wi-Fi drop makes them wait and carry on, and a cancelled copy picks up
+  where it stopped.
+- Each file lands under a temporary name first, and Steam's `.acf` is copied last, so a half-copied game never
+  looks installed.
+- It checks there's enough space before it starts.
+- The password is either saved (locked with the device's own keystore) or not saved at all and asked once each
+  time DroidDeck starts. Encrypted SMB 3 is a switch per share.
+- The server's address only shows when you add or edit a share. Everywhere else a share goes by the name you gave it.
+
+On mine (TrueNAS, over Wi-Fi) games with many files copy at about 35-50 MB/s; a single big file goes at about
+20 MB/s for now. My whole ROMs folder (34 GB, 784 files) came over in 18 minutes.
+
+**Also in fix54:**
+- **Retro tab:** ROMs copied in while the app is open show up right away. DraStic (DS) starts the game instead of
+  its menu. BIOS folders aren't listed as games. PS1 games packed as `EBOOT.PBP` are named after their folder. The
+  emulator picker says that a RetroArch core has to be downloaded in RetroArch first (without it the game opens to
+  a black screen).
+- **Typing:** text boxes keep the keyboard docked at the bottom instead of Gboard covering the whole screen, and
+  dialogs move up above the keyboard so you can see the box you're typing in.
+- **SD card:** Steam's "Move install folder" to an exFAT card works now (it used to stop with "Disk write
+  failure"). Games with tens of thousands of files reserve space on the card about 4-5 times faster. And turning
+  the screen off no longer pauses Steam while it's still writing a download to disk.
+
+Not tested yet: a full run through the Network page using only the controller.
+
 ## fix53: the MaliBridge v0.5.5.1 bridge
 
 ASEbrahim released MaliBridge v0.5.5 and v0.5.5.1 on November 1. fix53 takes the new **bridge** (the part that
