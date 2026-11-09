@@ -20,8 +20,8 @@
     X(DeviceWaitIdle) X(CreateImage) X(GetImageMemoryRequirements) X(AllocateMemory) \
     X(BindImageMemory) X(DestroyImage) X(FreeMemory) X(AcquireNextImageKHR) \
     X(ResetCommandBuffer) X(BeginCommandBuffer) X(CmdPipelineBarrier) X(CmdBlitImage) \
-    X(EndCommandBuffer) X(ResetFences) X(QueueSubmit) X(QueuePresentKHR) X(WaitForFences) \
-    X(QueueWaitIdle) X(GetMemoryFdPropertiesKHR) \
+    X(EndCommandBuffer) X(ResetFences) X(QueueSubmit) X(QueuePresentKHR) X(WaitForFences) X(GetFenceStatus) \
+    X(QueueWaitIdle) X(GetMemoryFdPropertiesKHR) X(GetAndroidHardwareBufferPropertiesANDROID) \
     X(GetImageSubresourceLayout) X(MapMemory) X(UnmapMemory) X(CmdClearColorImage) \
       \
     X(CreateShaderModule) X(DestroyShaderModule) X(CreatePipelineLayout) X(DestroyPipelineLayout) \

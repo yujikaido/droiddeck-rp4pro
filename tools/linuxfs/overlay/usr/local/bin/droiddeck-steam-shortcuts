@@ -15,28 +15,52 @@ import sys
 TAG = "droiddeck-app"
 
 
-def account_dir(steam_root):
-    """The most recent account's userdata folder, else the only one that is not 0."""
-    users = os.path.join(steam_root, "config", "loginusers.vdf")
-    recent = None
+STEAM64_BASE = 76561197960265728
+
+
+def login_users(steam_root):
+    """loginusers.vdf's accounts: (SteamID64, {key in lower case: value})."""
     try:
-        with open(users, encoding="utf-8", errors="replace") as f:
+        with open(os.path.join(steam_root, "config", "loginusers.vdf"), encoding="utf-8", errors="replace") as f:
             text = f.read()
-        for block in re.finditer(r'"(\d{5,})"\s*\{([^}]*)\}', text):
-            if re.search(r'"MostRecent"\s*"1"', block.group(2)):
-                recent = int(block.group(1))
     except OSError:
-        pass
+        return []
+    users = []
+    for block in re.finditer(r'"(\d{5,})"\s*\{([^}]*)\}', text):
+        keys = {k.lower(): v for k, v in re.findall(r'"([^"]+)"\s*"([^"]*)"', block.group(2))}
+        users.append((int(block.group(1)), keys))
+    return users
+
+
+def account_dir(steam_root):
+    """The signed-in account's userdata folder.
+
+    loginusers.vdf's account marked MostRecent, else AllowAutoLogin, else the one with the newest
+    Timestamp; without any of those, the userdata folder whose localconfig.vdf was written last,
+    else the only one that is not 0.
+    """
+    best, rank = None, None
+    for steamid, keys in login_users(steam_root):
+        stamp = keys.get("timestamp", "")
+        r = (keys.get("mostrecent") == "1", "1" in (keys.get("allowautologin"), keys.get("autologin")), int(stamp) if stamp.isdigit() else 0)
+        if any(r) and steamid > STEAM64_BASE and (rank is None or r > rank):
+            best, rank = steamid, r
     userdata = os.path.join(steam_root, "userdata")
-    if recent is not None:
-        acct = recent - 76561197960265728
-        return os.path.join(userdata, str(acct))
+    if best is not None:
+        return os.path.join(userdata, str(best - STEAM64_BASE))
     try:
         dirs = [d for d in os.listdir(userdata) if d.isdigit() and d != "0"]
     except OSError:
         dirs = []
+    written = []
+    for d in dirs:
+        try:
+            written.append((os.path.getmtime(os.path.join(userdata, d, "config", "localconfig.vdf")), d))
+        except OSError:
+            pass
+    if written:
+        return os.path.join(userdata, max(written)[1])
     return os.path.join(userdata, dirs[0]) if len(dirs) == 1 else None
-
 
 
 def parse(data):
@@ -180,12 +204,14 @@ def merge(fresh, current, state, seen):
 def reconcile(existing, wanted, seen, record):
     games, away = record["games"], dict(record["away"])
     kept, ours, placed = [], [], {}
+    claimed = {(unquoted(fresh["Exe"]), fresh["AppName"]) for fresh in wanted.values()}
     for value in existing.values():
         if not isinstance(value, dict):
             continue
         tags = value.get("tags")
         if not isinstance(tags, dict) or TAG not in tags.values():
-            kept.append(value)
+            if (unquoted(value.get("Exe")), value.get("AppName")) not in claimed:
+                kept.append(value)
             continue
         appid = value.get("appid")
         if not isinstance(appid, int) or appid in placed:
@@ -342,9 +368,21 @@ def main():
         spec.loader.exec_module(compat)
         cfg = os.path.join(steam_root, "config", "config.vdf")
         if os.path.isfile(cfg) and (ours or routes):
-            compat.register_default(cfg, apps=[str(int(g["appid"]) & 0xFFFFFFFF) for g in games if g.get("exe")] + [str(appid) for appid in set(routes.values())],
-                                    protect=compat.adopt_extras(os.path.join(steam_root, "compatibilitytools.d")))
-            print("droiddeck-steam-shortcuts: mapped them to %s" % compat.TOOL)
+            tools = os.path.join(steam_root, "compatibilitytools.d")
+            x64_tool = os.environ.get("BL_COMPAT_TOOL")
+            own = {}
+            if x64_tool:
+                protect = {compat.first_key(os.path.join(tools, e, "compatibilitytool.vdf"), ["compatibilitytools", "compat_tools"]) or e: e
+                           for e in (os.listdir(tools) if os.path.isdir(tools) else [])}
+                # Its own state: the arm64 client's state.json lists which of that client's titles follow its default.
+                own = {"default": x64_tool,
+                       "directory": os.path.join(os.path.dirname(os.path.abspath(steam_root)), "droiddeck-compat"),
+                       "linux_tool": "droiddeck-direct"}
+            else:
+                protect = compat.adopt_extras(tools)
+            used = compat.register_default(cfg, apps=[str(int(g["appid"]) & 0xFFFFFFFF) for g in games if g.get("exe") and not g.get("native")] + [str(appid) for appid in set(routes.values())],
+                                           protect=protect, **own)
+            print("droiddeck-steam-shortcuts: mapped them to %s" % used)
     except Exception as e:
         print("droiddeck-steam-shortcuts: compat mapping skipped (%s)" % e)
     return 0

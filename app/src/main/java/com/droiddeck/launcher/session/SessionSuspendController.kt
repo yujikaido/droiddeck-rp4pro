@@ -2,14 +2,30 @@ package com.droiddeck.launcher.session
 
 import android.os.Process
 import java.io.File
+import java.io.IOException
+import java.io.RandomAccessFile
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 
 internal class SessionSuspendController(
     private val sessionRoot: () -> Int,
     private val helperRoots: () -> List<Int>,
     private val suspendAudio: () -> Unit,
     private val resumeAudio: () -> Unit,
+    private val procRoot: File = File("/proc"),
+    private val signal: (Int, Int) -> Unit = Process::sendSignal,
+    private val threadSignal: (Int, Int, Int) -> Unit = { pid, tid, signal -> ThreadSignals.tgkill(pid, tid, signal) },
+    private val sleep: (Long) -> Unit = Thread::sleep,
+    private val nowMillis: () -> Long = { System.nanoTime() / 1_000_000 },
+    private val executor: ExecutorService = Executors.newSingleThreadExecutor(),
+    private val zramControl: File? = null,
+    private val clockControl: File? = null,
+    private val nowNanos: () -> Long = System::nanoTime,
+    private val pagedOut: (processes: Int, unacknowledged: Int, residentKb: Long, swapKb: Long, swapBeforeKb: Long, millis: Long) -> Unit =
+        { _, _, _, _, _, _ -> },
 ) {
     private enum class Role { SESSION_ROOT, SESSION_CHILD, HELPER_ROOT, HELPER_CHILD }
 
@@ -17,6 +33,9 @@ internal class SessionSuspendController(
         val pid: Int,
         val started: Long,
         val role: Role,
+        /** A helper that is not the session's descendant (the Mali bridge's server): stopped after the
+         *  guest's threads and continued before the guest, so its clients find it running again. */
+        val outside: Boolean = false,
     )
 
     private data class ProcessInfo(
@@ -24,96 +43,124 @@ internal class SessionSuspendController(
         val parent: Int,
         val started: Long,
         val state: Char,
+        val tracer: Int,
     )
 
-    private val executor: ExecutorService = Executors.newSingleThreadExecutor()
-    @Volatile private var closing = false
-    private var frozen = emptyList<ProcessRecord>()
+    private data class TaskIdentity(val process: ProcessRecord, val tid: Int, val started: Long)
 
-    fun freeze(completion: (Boolean) -> Unit) {
-        submit {
-            if (closing) {
-                completion(false)
-                return@submit
-            }
-            if (frozen.isNotEmpty()) {
-                val fullyFrozen = frozen.any { it.role == Role.SESSION_ROOT } && frozen.all(::isStoppedOrGone)
-                if (!fullyFrozen && restore(frozen)) frozen = emptyList()
-                completion(fullyFrozen)
-                return@submit
-            }
-            val records = LinkedHashMap<Pair<Int, Long>, ProcessRecord>()
-            val root = sessionRoot()
-            if (root <= 1) {
-                completion(false)
-                return@submit
-            }
-            runAudio(suspendAudio)
-            val helpers = helperRoots().filter { it > 1 && it != root }.distinct()
-            var stablePasses = 0
+    @Volatile private var closing = false
+    @Volatile private var cancelled = false
+    private var frozen = emptyList<ProcessRecord>()
+    private var frozenSince: Long? = null
+
+    fun freeze(pageOut: Boolean = false, completion: (Boolean) -> Unit) {
+        cancelled = false
+        submit({
+            val records = frozen.associateByTo(LinkedHashMap()) { it.pid to it.started }
             var complete = false
-            repeat(10) { pass ->
-                if (closing) {
-                    restore(records.values.toList())
-                    runAudio(resumeAudio)
-                    completion(false)
-                    return@submit
+            var interrupted = false
+            try {
+                val root = records.values.firstOrNull { it.role == Role.SESSION_ROOT }
+                    ?: readProcess(sessionRoot())?.takeIf { it.pid > 1 }?.let {
+                        ProcessRecord(it.pid, it.started, Role.SESSION_ROOT)
+                    } ?: throw IOException("Session root is unavailable")
+                records[root.pid to root.started] = root
+                runAudio(suspendAudio)
+                val helpers = helperRoots().filter { it > 1 && it != root.pid }.distinct()
+                for (helper in helpers) {
+                    if (records.values.any { it.pid == helper && it.role == Role.HELPER_ROOT }) continue
+                    readProcess(helper)?.let {
+                        records[it.pid to it.started] = ProcessRecord(it.pid, it.started, Role.HELPER_ROOT, outside = !descendsFrom(it, root.pid))
+                    }
                 }
-                val includeRoots = pass >= 2
-                addSnapshot(records, root, helpers, includeRoots)
-                stop(records.values.toList(), includeRoots)
-                Thread.sleep(if (pass == 0) 70L else 35L)
-                val rootCaptured = records.values.any { it.role == Role.SESSION_ROOT }
-                if (rootCaptured && records.isNotEmpty() && records.values.all(::isStoppedOrGone)) {
-                    stablePasses++
-                    if (stablePasses >= 2) complete = true
-                } else {
-                    stablePasses = 0
+                if (pageOut) pageOut(records, root.pid, helpers)
+                val deadline = nowMillis() + FREEZE_TIMEOUT_MS
+                var previous: Map<TaskIdentity, Long>? = null
+                for (pass in 0 until FREEZE_MAX_PASSES) {
+                    if (closing || cancelled || nowMillis() >= deadline) break
+                    try {
+                        if (readProcess(root.pid)?.started != root.started) break
+                        addSnapshot(records, root.pid, helpers)
+                        if (readProcess(root.pid)?.started != root.started) break
+                        stop(records.values.toList())
+                        sleep(if (pass == 0) 70L else 35L)
+                        if (closing || cancelled || nowMillis() >= deadline) break
+                        val current = stoppedSnapshot(records.values.toList(), root)
+                        if (current != null && current == previous) {
+                            complete = true
+                            break
+                        }
+                        previous = current
+                    } catch (_: IOException) {
+                        previous = null
+                        sleep(35L)
+                    }
                 }
-            }
-            if (complete) {
+            } catch (_: InterruptedException) {
+                interrupted = true
+                Thread.interrupted()
+            } catch (_: Exception) {
+            } finally {
                 frozen = records.values.toList()
-                completion(true)
-            } else {
-                val restored = restore(records.values.toList())
-                runAudio(resumeAudio)
-                if (!restored) frozen = records.values.toList()
-                completion(false)
+                if (complete && frozenSince == null) frozenSince = nowNanos()
+                if (!complete) {
+                    if (restoreSafely(frozen)) frozen = emptyList()
+                    runAudio(resumeAudio)
+                }
+                if (interrupted) Thread.currentThread().interrupt()
             }
-        }
+            completion(complete)
+        }, { completion(false) })
+    }
+
+    // A freeze still queued or paging out stops before its next SIGSTOP pass and rolls back.
+    fun cancelFreeze() {
+        cancelled = true
     }
 
     fun resume(completion: (Boolean) -> Unit) {
-        submit {
+        submit({
             val records = frozen
+            advanceClock()
             runAudio(resumeAudio)
-            val resumed = restore(records)
+            val resumed = restoreSafely(records)
             if (resumed) frozen = emptyList()
             completion(resumed)
-        }
+        }, { completion(false) })
     }
 
     fun closeAndResume(completion: () -> Unit) {
         closing = true
-        submit {
-            restore(frozen)
-            frozen = emptyList()
+        submit({
+            advanceClock()
+            if (restoreSafely(frozen)) frozen = emptyList()
             completion()
             executor.shutdown()
+        }, completion)
+    }
+
+    private fun submit(task: () -> Unit, rejected: () -> Unit) {
+        try {
+            executor.execute(task)
+        } catch (_: RejectedExecutionException) {
+            rejected()
         }
     }
 
-    private fun submit(task: () -> Unit) {
+    private fun advanceClock() {
+        val since = frozenSince ?: return
+        frozenSince = null
+        val control = clockControl?.takeIf { it.isFile && it.length() >= Long.SIZE_BYTES } ?: return
         try {
-            executor.execute {
-                try {
-                    task()
-                } catch (_: InterruptedException) {
-                    Thread.currentThread().interrupt()
-                }
+            RandomAccessFile(control, "rw").use { file ->
+                val bytes = ByteArray(Long.SIZE_BYTES)
+                file.readFully(bytes)
+                val shift = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).long.coerceAtLeast(0L) +
+                    (nowNanos() - since).coerceAtLeast(0L)
+                file.seek(0L)
+                file.write(ByteBuffer.allocate(Long.SIZE_BYTES).order(ByteOrder.LITTLE_ENDIAN).putLong(shift).array())
             }
-        } catch (_: RuntimeException) {
-            task()
+        } catch (_: IOException) {
         }
     }
 
@@ -128,22 +175,27 @@ internal class SessionSuspendController(
         records: MutableMap<Pair<Int, Long>, ProcessRecord>,
         root: Int,
         helpers: List<Int>,
-        includeRoots: Boolean,
     ) {
         val processes = readProcesses()
         val byPid = processes.associateBy { it.pid }
-        for (process in descendants(root, processes, byPid)) {
-            records[process.pid to process.started] = ProcessRecord(process.pid, process.started, Role.SESSION_CHILD)
+        val rootRecord = records.values.first { it.role == Role.SESSION_ROOT }
+        if (byPid[root]?.started != rootRecord.started) throw IOException("Session root exited or changed")
+        val liveHelpers = helpers.filter { pid ->
+            records.values.any { it.pid == pid && it.role == Role.HELPER_ROOT && it.started == byPid[pid]?.started }
         }
-        for (helper in helpers) {
+        for (process in descendants(root, processes, byPid) + processes.filter { it.tracer == root }) {
+            records.putIfAbsent(process.pid to process.started, ProcessRecord(process.pid, process.started, Role.SESSION_CHILD))
+        }
+        for (helper in liveHelpers) {
             for (process in descendants(helper, processes, byPid)) {
-                records[process.pid to process.started] = ProcessRecord(process.pid, process.started, Role.HELPER_CHILD)
+                records.putIfAbsent(process.pid to process.started, ProcessRecord(process.pid, process.started, Role.HELPER_CHILD))
             }
         }
-        if (includeRoots) {
-            byPid[root]?.let { records[it.pid to it.started] = ProcessRecord(it.pid, it.started, Role.SESSION_ROOT) }
-            for (helper in helpers) {
-                byPid[helper]?.let { records[it.pid to it.started] = ProcessRecord(it.pid, it.started, Role.HELPER_ROOT) }
+        byPid[root]?.let { records[it.pid to it.started] = ProcessRecord(it.pid, it.started, Role.SESSION_ROOT) }
+        for (helper in liveHelpers) {
+            byPid[helper]?.let {
+                val outside = records[it.pid to it.started]?.outside ?: false
+                records[it.pid to it.started] = ProcessRecord(it.pid, it.started, Role.HELPER_ROOT, outside)
             }
         }
     }
@@ -168,42 +220,160 @@ internal class SessionSuspendController(
     }
 
     private fun readProcesses(): List<ProcessInfo> =
-        File("/proc").listFiles().orEmpty().mapNotNull { entry ->
+        (procRoot.listFiles() ?: throw IOException("Cannot enumerate processes")).mapNotNull { entry ->
             val pid = entry.name.toIntOrNull() ?: return@mapNotNull null
-            readProcess(pid)
+            try { readProcess(pid) } catch (_: IOException) { null }
         }
 
     private fun readProcess(pid: Int): ProcessInfo? {
-        val stat = try {
-            File("/proc/$pid/stat").readText()
-        } catch (_: Exception) {
-            return null
-        }
-        val close = stat.lastIndexOf(')')
-        if (close < 0 || close + 2 >= stat.length) return null
-        val fields = stat.substring(close + 2).trim().split(Regex("\\s+"))
-        if (fields.size < 20) return null
-        return try {
-            ProcessInfo(pid, fields[1].toInt(), fields[19].toLong(), fields[0].first())
-        } catch (_: NumberFormatException) {
-            null
+        val base = File(procRoot, pid.toString())
+        try {
+            val fields = readStat(File(base, "stat"))
+            val tracer = File(base, "status").useLines { lines ->
+                lines.firstOrNull { it.startsWith("TracerPid:") }?.substringAfter(':')?.trim()?.toIntOrNull() ?: 0
+            }
+            return ProcessInfo(pid, fields[1].toInt(), fields[19].toLong(), fields[0].first(), tracer)
+        } catch (error: IOException) {
+            if (procRoot.list()?.contains(pid.toString()) == false) return null
+            throw error
         }
     }
 
-    private fun stop(records: List<ProcessRecord>, includeRoots: Boolean) {
-        val descendants = records.filter { it.role == Role.SESSION_CHILD || it.role == Role.HELPER_CHILD }
-        val session = records.filter { it.role == Role.SESSION_ROOT }
-        val helpers = records.filter { it.role == Role.HELPER_ROOT }
-        for (record in descendants) send(record, SIGSTOP)
-        if (includeRoots) {
-            for (record in session) send(record, SIGSTOP)
-            for (record in helpers) send(record, SIGSTOP)
+    private fun readStat(file: File): List<String> {
+        val stat = file.readText()
+        val close = stat.lastIndexOf(')')
+        if (close < 0 || close + 2 >= stat.length) throw IOException("Invalid process stat: $file")
+        val fields = stat.substring(close + 2).trim().split(Regex("\\s+"))
+        if (fields.size < 20) throw IOException("Incomplete process stat: $file")
+        return fields
+    }
+
+    private fun stoppedSnapshot(records: List<ProcessRecord>, root: ProcessRecord): Map<TaskIdentity, Long>? {
+        // PRoot can leave the leader stopped while native worker threads keep running.
+        val tasks = LinkedHashMap<TaskIdentity, Long>()
+        var stopped = true
+        for (record in records) {
+            val current = readProcess(record.pid)
+            if (current == null || current.started != record.started) {
+                if (record == root) throw IOException("Session root exited or changed")
+                continue
+            }
+            val entries = File(procRoot, "${record.pid}/task").listFiles()
+                ?: throw IOException("Cannot enumerate threads: ${record.pid}")
+            if (entries.none { it.name.toIntOrNull() != null }) throw IOException("Empty thread inventory: ${record.pid}")
+            var liveRoot = false
+            for (entry in entries) {
+                val tid = entry.name.toIntOrNull() ?: continue
+                val fields = readStat(File(entry, "stat"))
+                val state = fields[0].first()
+                if (state != 'Z' && state != 'X') liveRoot = true
+                if (state != 'T' && state != 't' && state != 'Z' && state != 'X') stopped = false
+                tasks[TaskIdentity(record, tid, fields[19].toLong())] = fields[11].toLong() + fields[12].toLong()
+            }
+            if (record == root && !liveRoot) throw IOException("Session root has no live threads")
+            if (readProcess(record.pid)?.started != record.started) throw IOException("Process changed during inspection")
+        }
+        return tasks.takeIf { stopped && it.isNotEmpty() }
+    }
+
+    // A stopped process cannot run libblsession's SIGURG handler, so the page-out has to finish
+    // before the stop. Android's low-memory killer otherwise finds the frozen game resident in RAM
+    // with most of zram still free.
+    private fun pageOut(records: MutableMap<Pair<Int, Long>, ProcessRecord>, root: Int, helpers: List<Int>) {
+        val control = zramControl?.takeIf { it.isFile } ?: return
+        try {
+            addSnapshot(records, root, helpers)
+            control.writeText("1")
+        } catch (_: IOException) {
+            return
+        }
+        val targets = records.values.filter { record ->
+            try {
+                File(procRoot, "${record.pid}/maps").useLines { lines -> lines.any { it.endsWith("/libblsession.so") } }
+            } catch (_: IOException) {
+                false
+            }
+        }
+        if (targets.isEmpty()) return
+        val acks = targets.associateWith { File(control.parentFile, "${control.name}.ack.${it.pid}") }
+        acks.values.forEach { it.delete() }
+        val start = nowMillis()
+        val before = memoryKb(targets)
+        for (record in targets) send(record, SIGURG)
+        // A program can replace libblsession's SIGURG handler (PyInstaller's bootloader, the Go runtime);
+        // such a process never creates its ack and is not waited for once the start window has passed.
+        val waiting = targets.toMutableList()
+        while (!closing && !cancelled && nowMillis() - start < PAGE_OUT_TIMEOUT_MS) {
+            val started = nowMillis() - start >= PAGE_OUT_START_MS
+            waiting.removeAll { val ack = acks.getValue(it); ack.length() > 0 || (started && !ack.exists()) || isGone(it) }
+            if (waiting.isEmpty()) break
+            sleep(PAGE_OUT_POLL_MS)
+        }
+        val unacknowledged = targets.count { acks.getValue(it).length() == 0L && !isGone(it) }
+        acks.values.forEach { it.delete() }
+        val after = memoryKb(targets)
+        pagedOut(targets.size, unacknowledged, after.first, after.second, before.second, nowMillis() - start)
+    }
+
+    private fun isGone(record: ProcessRecord): Boolean =
+        try { readProcess(record.pid)?.started != record.started } catch (_: Exception) { false }
+
+    private fun memoryKb(records: List<ProcessRecord>): Pair<Long, Long> {
+        var resident = 0L
+        var swap = 0L
+        for (record in records) {
+            try {
+                File(procRoot, "${record.pid}/status").useLines { lines ->
+                    for (line in lines) {
+                        val kb = line.substringAfter(':').trim().substringBefore(' ').toLongOrNull() ?: continue
+                        if (line.startsWith("VmRSS:")) resident += kb else if (line.startsWith("VmSwap:")) swap += kb
+                    }
+                }
+            } catch (_: IOException) {
+            }
+        }
+        return resident to swap
+    }
+
+    // PRoot traces every guest. A stop sent while it runs becomes a group stop that it restarts
+    // thread by thread; once it is stopped, each thread that takes a SIGSTOP stays parked in its
+    // signal-delivery stop. So the roots stop first and every guest thread gets its own SIGSTOP.
+    private fun stop(records: List<ProcessRecord>) {
+        for (record in records.filter { it.role == Role.SESSION_ROOT }) send(record, SIGSTOP)
+        for (record in records.filter { it.role == Role.HELPER_ROOT && !it.outside }) send(record, SIGSTOP)
+        for (record in records.filter { it.role == Role.SESSION_CHILD || it.role == Role.HELPER_CHILD }) {
+            stopThreads(record)
+        }
+        for (record in records.filter { it.role == Role.HELPER_ROOT && it.outside }) send(record, SIGSTOP)
+    }
+
+    private fun descendsFrom(process: ProcessInfo, root: Int): Boolean {
+        var parent = process.parent
+        repeat(64) {
+            if (parent == root) return true
+            if (parent <= 1) return false
+            parent = (try { readProcess(parent) } catch (_: Exception) { null })?.parent ?: return false
+        }
+        return false
+    }
+
+    private fun stopThreads(record: ProcessRecord) {
+        val current = try { readProcess(record.pid) } catch (_: Exception) { return }
+        if (current == null || current.started != record.started) return
+        for (entry in File(procRoot, "${record.pid}/task").listFiles().orEmpty()) {
+            val tid = entry.name.toIntOrNull() ?: continue
+            val state = try { readStat(File(entry, "stat"))[0].first() } catch (_: IOException) { continue }
+            if (state == 'T' || state == 't' || state == 'Z' || state == 'X') continue
+            try {
+                threadSignal(record.pid, tid, SIGSTOP)
+            } catch (_: Throwable) {
+            }
         }
     }
 
     private fun restore(records: List<ProcessRecord>): Boolean {
         val ordered = records.sortedBy {
-            when (it.role) {
+            if (it.role == Role.HELPER_ROOT && it.outside) -1 else when (it.role) {
                 Role.SESSION_ROOT -> 0
                 Role.HELPER_ROOT -> 1
                 Role.SESSION_CHILD -> 2
@@ -211,36 +381,54 @@ internal class SessionSuspendController(
             }
         }
         for (record in ordered) send(record, SIGCONT)
-        repeat(8) {
-            Thread.sleep(25L)
-            if (ordered.all(::isRunningOrGone)) return true
+        val waiting = ordered.toMutableList()
+        repeat(RESTORE_CHECKS) { check ->
+            sleep(25L)
+            waiting.removeAll { isRunningOrGone(it) }
+            if (waiting.isEmpty()) return true
+            if (check % 8 == 7) for (record in waiting) send(record, SIGCONT)
         }
-        return ordered.all(::isRunningOrGone)
+        return false
+    }
+
+    private fun restoreSafely(records: List<ProcessRecord>): Boolean = try {
+        restore(records)
+    } catch (_: InterruptedException) {
+        Thread.currentThread().interrupt()
+        false
+    } catch (_: Exception) {
+        false
     }
 
     private fun send(record: ProcessRecord, signal: Int) {
-        val current = readProcess(record.pid) ?: return
-        if (current.started != record.started) return
+        val current = try { readProcess(record.pid) } catch (_: Exception) { return }
+        if (current == null || current.started != record.started) return
         try {
-            Process.sendSignal(record.pid, signal)
+            this.signal(record.pid, signal)
         } catch (_: Throwable) {
         }
     }
 
-    private fun isStoppedOrGone(record: ProcessRecord): Boolean {
-        val current = readProcess(record.pid) ?: return true
-        if (current.started != record.started) return true
-        return current.state == 'T' || current.state == 't' || current.state == 'Z' || current.state == 'X'
-    }
-
     private fun isRunningOrGone(record: ProcessRecord): Boolean {
-        val current = readProcess(record.pid) ?: return true
-        if (current.started != record.started) return true
-        return current.state != 'T' && current.state != 't'
+        val current = try { readProcess(record.pid) } catch (_: Exception) { return false }
+        if (current == null || current.started != record.started) return true
+        if (current.state == 'T' || current.state == 't') return false
+        // A traced worker in 't' is usually PRoot handling a system call; 'T' is a job-control stop.
+        return File(procRoot, "${record.pid}/task").listFiles().orEmpty().none { entry ->
+            entry.name.toIntOrNull() != null &&
+                try { readStat(File(entry, "stat"))[0].first() == 'T' } catch (_: IOException) { false }
+        }
     }
 
     private companion object {
         const val SIGSTOP = 19
         const val SIGCONT = 18
+        const val SIGURG = 23
+        const val PAGE_OUT_POLL_MS = 100L
+        const val PAGE_OUT_START_MS = 2_000L
+        const val PAGE_OUT_TIMEOUT_MS = 12_000L
+        const val RESTORE_CHECKS = 80
+        const val FREEZE_TIMEOUT_MS = 8_000L
+        const val FREEZE_MAX_PASSES = 256
     }
 }

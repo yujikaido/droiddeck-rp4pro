@@ -11,6 +11,8 @@ struct droiddeck_color;
 enum sc_layer_id { SC_LAYER_GAME = 0, SC_LAYER_OVERLAY = 1, SC_LAYER_COUNT = 2 };
 
 int sc_layer_available(void);
+/* The fds in an AHardwareBuffer's native handle (up to max); 0 when there is no handle. */
+int sc_layer_ahb_fds(const AHardwareBuffer *ahb, int *fds, int max);
 
 void sc_layer_probe_dmabuf_fd(int fd);
 
@@ -36,6 +38,8 @@ int sc_layer_overlay_affordable(void);
 int sc_layer_present_overlay(struct vkp_image *src, const int geo[8], int translucent);
 
 void sc_layer_hide(void);
+int sc_layer_base_black(int width, int height);
+void sc_layer_hide_base(void);
 void sc_layer_hide_overlay(void);
 
 void sc_layer_window_gone(void);

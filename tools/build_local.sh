@@ -12,15 +12,21 @@ else
     export DROIDDECK_BUILD_TREE_STATE=unknown
 fi
 sdk_dir=${ANDROID_HOME:-${ANDROID_SDK_ROOT:-"${HOME}/Library/Android/sdk"}}
-java_dir=${JAVA_HOME:-"/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home"}
-image_name=${DROIDDECK_BUILD_IMAGE:-droiddeck-local-cross:24.04-v3}
+java_dir="${JAVA_HOME:-/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home}"
+[[ -x "$java_dir/bin/java" ]] || {
+  mise_java="$(mise -C "${repo_root}" which java 2>/dev/null)"
+  if [[ -n "$mise_java" ]]; then
+    mise_home="$(dirname "$mise_java")"
+    [[ "$mise_home" == */bin ]] && mise_home="$(dirname "$mise_home")"
+    [[ -x "$mise_home/bin/java" ]] && java_dir="$mise_home"
+  fi
+}
+[[ -x "$java_dir/bin/java" ]] || java_dir="${HOME}/.local/share/mise/installs/java/temurin-17"
+[[ "$java_dir" == */homebrew/* ]] && echo "using homebrew java path: $java_dir"
+[[ "$java_dir" == */mise/* ]] && echo "using mise java path: $java_dir"
+. "${repo_root}/tools/docker_platform.sh"
+image_name=${DROIDDECK_BUILD_IMAGE}
 build_variant=${DROIDDECK_BUILD_VARIANT:-release}
-# A side-by-side build (app/build.gradle reads these): DROIDDECK_APP_ID_SUFFIX=.mali makes
-# com.droiddeck.launcher.mali, "DroidDeck Mali"; DROIDDECK_APPLICATION_ID sets the whole id and
-# DROIDDECK_APP_LABEL the name. Unset, the standard com.droiddeck.launcher.
-application_id=${DROIDDECK_APPLICATION_ID:-com.droiddeck.launcher${DROIDDECK_APP_ID_SUFFIX:-}}
-export DROIDDECK_APP_ID_SUFFIX=${DROIDDECK_APP_ID_SUFFIX:-} DROIDDECK_APPLICATION_ID=${DROIDDECK_APPLICATION_ID:-}
-export DROIDDECK_APP_LABEL=${DROIDDECK_APP_LABEL:-}
 case "$build_variant" in
     debug) gradle_task=assembleDebug ;;
     release) gradle_task=assembleRelease ;;
@@ -82,11 +88,37 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+cache_dir=${DROIDDECK_BUILD_CACHE:-"${HOME}/.cache/droiddeck-build"}
+mkdir -p "${cache_dir}"
+# Steps whose output depends only on tracked sources are kept per input hash in the
+# shared cache, so a rerun or a fresh worktree copies them instead of rebuilding.
+inputs_hash() {
+    (cd "${repo_root}" && { printf '%s\n' "$1"; shift; find "$@" -type f ! -name '*.pyc' | LC_ALL=C sort | xargs shasum -a 256; }) \
+        | shasum -a 256 | cut -d' ' -f1
+}
+restore_step() {
+    local stored="${cache_dir}/steps/$1/$2"
+    [[ -f "${stored}/.complete" ]] || return 1
+    mkdir -p "$3"
+    (cd "${stored}" && tar -cf - --exclude .complete .) | tar -xf - -C "$3" || return 1
+    echo "$1: inputs unchanged, reused ${stored}"
+}
+save_step() {
+    local stored="${cache_dir}/steps/$1/$2" part
+    mkdir -p "${cache_dir}/steps/$1"
+    part=$(mktemp -d "${stored}.part.XXXXXX")
+    (cd "$3" && tar -cf - .) | tar -xf - -C "${part}"
+    touch "${part}/.complete"
+    # Another checkout may have published the same key meanwhile; its copy is equivalent.
+    if [[ -e "${stored}" ]]; then rm -rf "${part}"; else mv "${part}" "${stored}" || rm -rf "${part}"; fi
+}
+
 python3 "${repo_root}/tools/docker_preflight.py" "${image_name}"
+image_id=$(docker image inspect --format '{{.Id}}' "${image_name}")
 rm -rf -- "${linuxfs_dir}"
 mkdir -p "${linuxfs_dir}"
 
-docker run --rm --platform linux/amd64 \
+docker run --rm --platform "${docker_platform}" \
     --user "$(id -u):$(id -g)" \
     -v "${repo_root}:/src" -w /src "${image_name}" bash -lc '
         set -euo pipefail
@@ -129,17 +161,30 @@ docker run --rm --platform linux/amd64 \
         READELF=aarch64-linux-gnu-readelf bash tools/linuxfs/check-preloads.sh "$d"
     '
 
-docker run --rm --platform linux/amd64 \
-    -v "${repo_root}:/src" -w /src public.ecr.aws/docker/library/debian:bullseye bash -c '
-        set -euo pipefail
-        printf "deb http://archive.debian.org/debian bullseye main\ndeb http://archive.debian.org/debian-security bullseye-security main\n" > /etc/apt/sources.list
-        apt-get -o Acquire::Check-Valid-Until=false update -qq
-        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends gcc g++ gcc-multilib g++-multilib binutils >/dev/null
-        tools/linuxfs/build-x86-preloads.sh app/src/main/assets/linuxfs
-        chown -R '"$(id -u):$(id -g)"' app/src/main/assets/linuxfs
-    '
+x86_key=$(inputs_hash bullseye tools/linuxfs/build-x86-preloads.sh tools/linuxfs/preload tools/linuxfs/fex \
+    app/src/main/cpp/fakeinput_steam.cpp)
+x86_stage="${staging_dir}/x86-preloads"
+if restore_step x86-preloads "${x86_key}" "${linuxfs_dir}"; then :; else
+    docker run --rm --platform linux/amd64 \
+        -v "${repo_root}:/src" -w /src public.ecr.aws/docker/library/debian:bullseye bash -c '
+            set -euo pipefail
+            printf "deb http://archive.debian.org/debian bullseye main\ndeb http://archive.debian.org/debian-security bullseye-security main\n" > /etc/apt/sources.list
+            apt-get -o Acquire::Check-Valid-Until=false update -qq
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends gcc g++ gcc-multilib g++-multilib binutils >/dev/null
+            tools/linuxfs/build-x86-preloads.sh app/src/main/assets/linuxfs
+            chown -R '"$(id -u):$(id -g)"' app/src/main/assets/linuxfs
+        '
+    mkdir -p "${x86_stage}"
+    cp -R "${linuxfs_dir}/x86_64" "${linuxfs_dir}/i386" "${x86_stage}/"
+    save_step x86-preloads "${x86_key}" "${x86_stage}"
+fi
 
-DROIDDECK_BUILD_IMAGE="${image_name}" "${repo_root}/tools/vr/build.sh" "${linuxfs_dir}/usr/local/lib/droiddeck-vr"
+vr_out="${linuxfs_dir}/usr/local/lib/droiddeck-vr"
+vr_key=$(inputs_hash "${image_id} ${ndk_version} ${VK_INCLUDE:-}" tools/vr app/src/main/cpp/waylandcomp/generated/xdg-shell-protocol.c)
+if ! restore_step vr "${vr_key}" "${vr_out}"; then
+    DROIDDECK_BUILD_IMAGE="${image_name}" "${repo_root}/tools/vr/build.sh" "${vr_out}"
+    save_step vr "${vr_key}" "${vr_out}"
+fi
 
 github_repo=${DROIDDECK_GITHUB_REPOSITORY:-}
 if [[ -z "${github_repo}" ]]; then
@@ -157,8 +202,6 @@ if [[ -z "${github_repo}" ]]; then
     github_repo=${github_repo%.git}
 fi
 
-cache_dir=${DROIDDECK_BUILD_CACHE:-"${HOME}/.cache/droiddeck-build"}
-mkdir -p "${cache_dir}"
 cached() {
     local sha=$1 name=$2 out
     shift 2
@@ -184,7 +227,7 @@ fi
 
 . "${repo_root}/tools/linuxfs/uruntime.env"
 uruntime_binary=$(cached "${URUNTIME_SHA256}" "${URUNTIME_ASSET}" \
-    bash -c 'curl -fsSL --retry 3 -o "$out" "$0"' "https://github.com/VHSgunzo/uruntime/releases/download/${URUNTIME_VERSION}/${URUNTIME_ASSET}")
+    bash -c 'curl -fsSL --retry 5 --retry-all-errors --connect-timeout 20 -o "$out" "$0"' "https://github.com/VHSgunzo/uruntime/releases/download/${URUNTIME_VERSION}/${URUNTIME_ASSET}")
 mkdir -p "${linuxfs_dir}/usr/local/lib/droiddeck" "${linuxfs_dir}/usr/local/share/licenses/uruntime"
 install -m644 "${uruntime_binary}" "${linuxfs_dir}/usr/local/lib/droiddeck/uruntime"
 install -m644 "${repo_root}/tools/linuxfs/licenses/uruntime-LICENSE" "${linuxfs_dir}/usr/local/share/licenses/uruntime/LICENSE"
@@ -219,7 +262,7 @@ mkdir -p "${msi_pkgs}" "${msi_dir}"
 while read -r package_sha256 package_url; do
     [[ -n "${package_url}" ]] || continue
     package_archive=$(cached "${package_sha256}" "$(basename "${package_url}")" \
-        bash -c 'curl -fsSL --retry 3 -o "$out" "$0"' "${package_url}")
+        bash -c 'curl -fsSL --retry 5 --retry-all-errors --connect-timeout 20 -o "$out" "$0"' "${package_url}")
     tar -xJf "${package_archive}" -C "${msi_pkgs}"
 done < <(grep -v '^#' "${repo_root}/tools/msitools/packages.txt")
 for tool in msiinfo cabextract; do install -m644 "${msi_pkgs}/usr/bin/${tool}" "${msi_dir}/${tool}"; done
@@ -239,24 +282,34 @@ mkdir -p "${mango_dir}" "${mango_pkgs}"
 while read -r package_sha256 package_url; do
     [[ -n "${package_url}" ]] || continue
     package_archive=$(cached "${package_sha256}" "$(basename "${package_url}")" \
-        bash -c 'curl -fsSL --retry 3 -o "$out" "$0"' "${package_url}")
+        bash -c 'curl -fsSL --retry 5 --retry-all-errors --connect-timeout 20 -o "$out" "$0"' "${package_url}")
     zstd -dc "${package_archive}" | tar -xf - -C "${mango_pkgs}"
 done < <(grep -v '^#' "${repo_root}/tools/mangoapp/packages.txt")
 install -m644 "${mango_pkgs}/usr/bin/mangoapp" "${mango_dir}/mangoapp"
 for library in libfmt.so.10 libspdlog.so.1.13 libglfw.so.3 libtraceevent.so.1; do
     cp -L "${mango_pkgs}/usr/lib/${library}" "${mango_dir}/${library}"
 done
-docker run --rm --platform linux/amd64 --user "$(id -u):$(id -g)" -v "${repo_root}:/src" -w /src "${image_name}" \
+docker run --rm --platform "${docker_platform}" --user "$(id -u):$(id -g)" -v "${repo_root}:/src" -w /src "${image_name}" \
     aarch64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Wl,-soname,libtracefs.so.1 \
     -o app/src/main/assets/linuxfs/usr/local/lib/mangoapp/libtracefs.so.1 tools/mangoapp/libtracefs-shim.c
 mkdir -p "${linuxfs_dir}/usr/local/bin"
 install -m644 "${repo_root}/tools/mangoapp/mangoapp" "${linuxfs_dir}/usr/local/bin/mangoapp"
 
+pw_pkgs="${staging_dir}/pw-pkgs"
+mkdir -p "${pw_pkgs}"
+while read -r package_sha256 package_url; do
+    [[ -n "${package_url}" ]] || continue
+    package_archive=$(cached "${package_sha256}" "$(basename "${package_url}")" \
+        bash -c 'curl -fsSL --retry 5 --retry-all-errors --connect-timeout 20 -o "$out" "$0"' "${package_url}")
+    zstd -dc "${package_archive}" | tar -xf - -C "${pw_pkgs}"
+done < <(grep -v '^#' "${repo_root}/tools/pipewire/packages.txt")
+"${repo_root}/tools/pipewire/assemble.sh" "${pw_pkgs}" "${linuxfs_dir}/usr/local/lib/droiddeck-pipewire.tzst"
+
 pa_source=${DROIDDECK_PA13_SOURCE_DIR:-"${staging_dir}/pulseaudio-13.0"}
 if [[ -z "${DROIDDECK_PA13_SOURCE_DIR:-}" ]]; then
     pa_tarball="${cache_dir}/pulseaudio-13.0.tar.gz"
     if [[ ! -s "${pa_tarball}" ]] || ! tar -tzf "${pa_tarball}" >/dev/null 2>&1; then
-        curl -fsSL -o "${pa_tarball}.part" \
+        curl -fsSL --retry 5 --retry-all-errors --connect-timeout 20 -o "${pa_tarball}.part" \
             https://github.com/pulseaudio/pulseaudio/archive/refs/tags/v13.0.tar.gz
         mv "${pa_tarball}.part" "${pa_tarball}"
     fi
@@ -279,8 +332,32 @@ if [[ -f "${proot_out}/libproot.so" && -f "${proot_out}/libproot-loader.so" \
         && (cd "${proot_out}" && shasum -a 256 -c .proot-outputs >/dev/null 2>&1); then
     echo "proot: sources unchanged, keeping ${proot_out}/libproot.so"
 else
-    "${repo_root}/tools/proot/build.sh" "${proot_out}"
+    proot_stage="${staging_dir}/proot"
+    if ! restore_step proot "${proot_inputs}" "${proot_stage}"; then
+        "${repo_root}/tools/proot/build.sh" "${proot_stage}"
+        save_step proot "${proot_inputs}" "${proot_stage}"
+    fi
+    install -m755 "${proot_stage}/libproot.so" "${proot_stage}/libproot-loader.so" "${proot_out}/"
     echo "${proot_inputs}" > "${proot_out}/.proot-inputs"
+    (cd "${proot_out}" && shasum -a 256 libproot.so libproot-loader.so > .proot-outputs)
+fi
+# DROIDDECK_PUBLISHED_PACKS=1 (a release candidate): the proot and DirectAudio packs this APK pins are the ones published on
+# DroidDeck-Components (tools/packs/<name>/release.env), because a fresh install downloads exactly those bytes, and a pack built
+# here differs from CI's (another zstd, another proot toolchain), so no device could download it. The proot in the APK's
+# libraries is then the published one, so that the recorded runtime inputs and the pinned pack agree.
+published_pack() { # published_pack <name> <destination>
+    local name=$1 sha size
+    sha=$(sed -n "s/^${name^^}_PACK_SHA256=//p" "${repo_root}/tools/packs/${name}/release.env")
+    [[ -n "${sha}" ]] || { echo "tools/packs/${name}/release.env pins no ${name} pack" >&2; exit 1; }
+    bash "${repo_root}/tools/packs/fetch-verified.sh" \
+        "https://github.com/Droid-Deck/DroidDeck-Components/releases/download/pack-${name}-${sha:0:16}/${name}.tar.zst" "${sha}" "$2"
+}
+if [[ "${DROIDDECK_PUBLISHED_PACKS:-0}" == 1 ]]; then
+    published_pack proot "${staging_dir}/published-proot.tar.zst"
+    mkdir -p "${staging_dir}/published-proot"
+    zstd -dc "${staging_dir}/published-proot.tar.zst" | tar -xf - -C "${staging_dir}/published-proot"
+    install -m755 "${staging_dir}/published-proot/libproot.so" "${staging_dir}/published-proot/libproot-loader.so" "${proot_out}/"
+    echo "${proot_inputs}+published" > "${proot_out}/.proot-inputs"
     (cd "${proot_out}" && shasum -a 256 libproot.so libproot-loader.so > .proot-outputs)
 fi
 
@@ -296,7 +373,8 @@ install -m755 "${sink_output}/module-aaudio-sink.so" \
     "${bundle_dir}/modules/arm64/module-aaudio-sink.so"
 install -m755 "${sink_output}/module-directaudio-native-sink.so" \
     "${bundle_dir}/modules/arm64/module-directaudio-native-sink.so"
-tar -cf - -C "${bundle_dir}" . | zstd -19 -T0 -c > "${staging_dir}/pulseaudio.tzst"
+# --numeric-owner: the members keep their uid/gid but not the builder's user and group names
+tar --numeric-owner -cf - -C "${bundle_dir}" . | zstd -19 -T0 -c > "${staging_dir}/pulseaudio.tzst"
 mkdir -p "${repo_root}/app/build/prepared-assets"
 mv "${staging_dir}/pulseaudio.tzst" "${repo_root}/app/build/prepared-assets/pulseaudio.tzst"
 
@@ -312,6 +390,7 @@ else
         fi
     done
     rustup target add --toolchain stable aarch64-linux-android
+    export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${cache_dir}/stores-target}"
     if ! command -v cargo-ndk >/dev/null 2>&1; then
         cargo install cargo-ndk --locked
     fi
@@ -319,11 +398,35 @@ fi
 
 cd "${repo_root}"
 python3 tools/quest/build-driver.py "${NDK}"
-bash tools/comet/build-local.sh
+xbox_out="${linuxfs_dir}/usr/local/lib/droiddeck-xbox"
+xbox_key=$(inputs_hash "native-arm64-ubuntu24.04" tools/xbox)
+if [[ "${DROIDDECK_SKIP_PACKS:-0}" == 1 ]]; then
+    echo "DROIDDECK_SKIP_PACKS=1: the Xbox backend is left out of this build" >&2
+elif ! restore_step xbox "${xbox_key}" "${xbox_out}"; then
+    bash tools/xbox/build-local.sh
+    save_step xbox "${xbox_key}" "${xbox_out}"
+fi
+
+comet_out="${linuxfs_dir}/usr/local/lib/droiddeck-comet"
+comet_key=$(inputs_hash "${image_id}" tools/comet)
+if ! restore_step comet "${comet_key}" "${comet_out}"; then
+    DROIDDECK_BUILD_IMAGE="${image_name}" bash tools/comet/build-local.sh
+    save_step comet "${comet_key}" "${comet_out}"
+fi
+# DROIDDECK_SKIP_PACKS=1 (with the Xbox backend above): the downloadable packs are left out; the APK does not carry them
+[[ "${DROIDDECK_SKIP_PACKS:-0}" == 1 ]] || bash tools/packs/build.sh app/build/packs
+if [[ "${DROIDDECK_PUBLISHED_PACKS:-0}" == 1 && "${DROIDDECK_SKIP_PACKS:-0}" != 1 ]]; then
+    for pack_name in proot directaudio; do
+        published_pack "${pack_name}" "${staging_dir}/published-${pack_name}.tar.zst"
+        install -m644 "${staging_dir}/published-${pack_name}.tar.zst" "app/build/packs/${pack_name}.tar.zst"
+    done
+fi
 python3 tools/release/runtime_inputs.py record
 ./gradlew "${gradle_task}" --console=plain -PndkVersion="${ndk_version}" ${gradle_rust_arg}
 python3 tools/release/check_session_assets.py "app/build/outputs/apk/${build_variant}/app-${build_variant}.apk"
 python3 tools/release/runtime_inputs.py apk "app/build/outputs/apk/${build_variant}/app-${build_variant}.apk"
+# A build that pins no proot or DirectAudio pack installs only over an older install (fresh: "Cannot download proot")
+[[ "${DROIDDECK_SKIP_PACKS:-0}" == 1 ]] || python3 tools/release/check_pack_pins.py "app/build/outputs/apk/${build_variant}/app-${build_variant}.apk" app/build/packs
 
 apk="${repo_root}/app/build/outputs/apk/${build_variant}/app-${build_variant}.apk"
 audio_check="${staging_dir}/audio-check"
@@ -350,14 +453,6 @@ build_tools=$(find "${sdk_dir}/build-tools" -mindepth 1 -maxdepth 1 -type d -pri
 if [[ ! -x "${build_tools}/zipalign" || ! -x "${build_tools}/apksigner" ]]; then
     echo "Android build-tools with zipalign/apksigner are required under ${sdk_dir}/build-tools." >&2
     exit 1
-fi
-
-if [[ -x "${build_tools}/aapt2" ]]; then
-    apk_package=$("${build_tools}/aapt2" dump packagename "${apk}")
-    if [[ "${apk_package}" != "${application_id}" ]]; then
-        echo "The APK's package is ${apk_package}, not ${application_id}." >&2
-        exit 1
-    fi
 fi
 
 "${build_tools}/zipalign" -p -f 4 "${apk}" "${apk}.aligned"
@@ -394,12 +489,6 @@ if [[ -z "${signing_env}" ]]; then
             "$(dirname "$(git -C "${repo_root}" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || echo .)")/.signing.env"; do
         [[ -f "${candidate}" ]] && { signing_env=${candidate}; break; }
     done
-fi
-if [[ -n "${signing_env}" && "${application_id}" != com.droiddeck.launcher ]]; then
-    # sign-apk.sh signs the variants in tools/release/variants.txt; a side-by-side build is signed
-    # by whoever ships it.
-    echo "Not signing ${application_id} with DroidDeck's key: it is not a release variant (test key only)"
-    signing_env=
 fi
 if [[ -n "${signing_env}" ]]; then
     echo "Signing with DroidDeck's key (${signing_env})"

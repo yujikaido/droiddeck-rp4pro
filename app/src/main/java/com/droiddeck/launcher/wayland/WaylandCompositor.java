@@ -45,6 +45,10 @@ public final class WaylandCompositor {
 
     private static volatile long lastFrameNanos;
     private static volatile long frameIntervalNanos;
+    private static volatile long gameFrames; // written by the compositor thread only
+
+    /** Frames the game has presented since the app started; the rate is the difference over time. */
+    public static long gameFrameCount() { return gameFrames; }
 
     public static long recentFrameIntervalMs() {
         long last = lastFrameNanos;
@@ -57,6 +61,7 @@ public final class WaylandCompositor {
         long now = System.nanoTime();
         long previous = lastFrameNanos;
         lastFrameNanos = now;
+        gameFrames++;
         if (previous != 0) {
             long interval = now - previous;
             long smoothed = frameIntervalNanos;
@@ -148,6 +153,7 @@ public final class WaylandCompositor {
                                                      String nativeLibDir);
 
     public static native void nativeSetSurface(Surface surface);
+    public static native boolean nativeWaitSurface(int timeoutMs);
 
     public static native void nativeSendPointer(int action, int x, int y);
 
@@ -160,6 +166,10 @@ public final class WaylandCompositor {
     public static final int CURSOR_BUF_INTS = 6 + 256 * 256;
 
     public static native void nativeSendKey(int evdev, int state);
+
+    public static native boolean nativeFocusTakesTouch();
+
+    public static native boolean nativeCursorInputPos(int[] out);
 
     public static native void nativeVsync(long frameTimeNanos);
 
@@ -183,9 +193,14 @@ public final class WaylandCompositor {
 
     private static volatile java.io.File sessionLogFile;
 
+    /** The session's wayland.log. The compositor outlives a session (it starts once per app process), so a
+     *  later session moves its log there too; before the compositor starts this only sets BL_WAYLAND_LOG's file. */
     public static void setSessionLogFile(java.io.File file) {
         sessionLogFile = file;
+        if (file != null) nativeSetSessionLog(file.getPath());
     }
+
+    private static native void nativeSetSessionLog(String path);
 
     public static java.io.File currentLogFile() {
         return sessionLogFile;
@@ -197,9 +212,15 @@ public final class WaylandCompositor {
 
     public static native void nativeSetOutputSize(int width, int height);
 
+    public static native boolean nativeGamePictureRect(float[] out);
+
     public static native void nativeResizeOutput(int width, int height);
 
     public static native void nativeResetFirstFrame();
+
+    /** What the compositor has seen towards the first frame: gamescope clients connected, GPU frames, frames its
+     *  driver refused (no CPU copy), CPU copies, frames on screen, window redraws. Returns how many were filled. */
+    public static native int nativeFirstFrameProbe(int[] out);
 
 
     public static final int HDR_MODE_OFF = 0, HDR_MODE_ON = 1, HDR_MODE_FORCE = 2;
@@ -265,13 +286,18 @@ public final class WaylandCompositor {
 
     public static native void nativeSetCardboard(boolean enabled, int source, float ipdM, float screenDistM,
                                                  float screenWidthM, float k1, float k2, float fovDeg,
-                                                 float lensInset, float chroma);
+                                                 float lensInset, float chroma, boolean mono, float displayHz);
 
     public static native void nativeSetCardboardPose(float[] rotation, boolean live);
+    public static native void nativeSetCardboardSpatialPose(float[] rotation, float[] position, boolean live);
+    public static native boolean nativeSetSpatialFile(String path);
+    public static native void nativePublishSpatial(java.nio.ByteBuffer snapshot);
 
     public static native void nativeSetCardboardPoseFile(String path);
 
     public static native void nativeSetFpsLimit(int fps);
+
+    public static native void nativeSetRenderOnCommit(boolean on);
 
     public static native void nativeSetGpuTurbo(boolean on);
 
@@ -279,7 +305,7 @@ public final class WaylandCompositor {
 
     public static native void nativeSendSceneInput(int type, int a, int b);
 
-    public static final int FG_ENGINE_LSFG = 0, FG_ENGINE_WINFG = 1;
+    public static final int FG_ENGINE_LSFG = 0, FG_ENGINE_DDFG = 1;
 
     public static native void nativeSetFrameGenEngine(int kind);
 
@@ -289,21 +315,38 @@ public final class WaylandCompositor {
 
     public static native void nativeSetFrameGenTuning(float flowScale, float refreshHz);
 
-    public static native void nativeSetWinFgTuning(int model, int perfPreset);
+    public static native void nativeSetDdFgTuning(int model, int perfPreset);
 
     public static native int nativeFrameGenProblem();
     public static native String nativeFrameGenCapsReason();
 
     public static native float[] nativeFrameGenStats();
 
+    public static native long nativeHudFrameTimes(float[] out);
+
+    /** Stream mode: the scene is the Xbox Cloud Gaming native player's picture, handed over frame by frame. */
+    public static native void nativeStreamMode(boolean on);
+
+    public static native void nativeStreamFrame(android.hardware.HardwareBuffer buffer);
+
+    public static native int nativeStreamFrames();
+
     public static void sendPointerDelta(int dx, int dy) {
         if (dx == 0 && dy == 0) return;
         nativeSendSceneInput(6, dx * 256, dy * 256);
     }
 
+    private static float pendingDeltaX, pendingDeltaY;
+
     public static void sendPointerDelta(float dx, float dy) {
-        int x = Math.round(dx * 256f), y = Math.round(dy * 256f);
+        // Round-to-zero per event would drop slow motion entirely; carry the remainder.
+        pendingDeltaX += dx * 256f;
+        pendingDeltaY += dy * 256f;
+        int x = (int) Math.floor(pendingDeltaX);
+        int y = (int) Math.floor(pendingDeltaY);
         if (x == 0 && y == 0) return;
+        pendingDeltaX -= x;
+        pendingDeltaY -= y;
         nativeSendSceneInput(6, x, y);
     }
 }

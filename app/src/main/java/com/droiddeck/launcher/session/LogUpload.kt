@@ -29,7 +29,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import com.droiddeck.launcher.BuildConfig
-import com.droiddeck.launcher.MainActivity
+import com.droiddeck.launcher.FrontEndActivity
 import com.droiddeck.launcher.R
 import com.droiddeck.launcher.core.DeviceSupport
 import java.io.File
@@ -41,7 +41,7 @@ import java.util.UUID
 
 /* "Send logs to MaliBridge": the same scrubbed zip Share logs makes, uploaded to the MaliBridge log
  * service (a Cloudflare Worker; the zip is kept 90 days and the developer gets a note in a private
- * channel). The player gets a short code (ML-7F3K) to paste into a GitHub issue or on Discord
+ * channel). The player gets a short code to paste into a GitHub issue or on Discord
  * instead of attaching the file. Asked once before the first upload; a note is optional.
  *
  * The upload and its result live in the process, not in the screen that started it: an upload can
@@ -183,7 +183,7 @@ object LogUpload {
 
     private fun send(activity: Activity, folder: () -> File?, note: String) {
         val app = activity.applicationContext
-        // prepare() does nothing while Share logs is packing, and then the upload would never end.
+        // prepare does nothing while Share logs is packing, and then the upload would never end.
         if (SessionLogShare.progress != null || !begin()) return
         appContext = app
         // Keeps the process (and its network) alive if the player leaves the app or stops the session.
@@ -246,7 +246,7 @@ object LogUpload {
         runCatching { context.getSystemService(NotificationManager::class.java)?.cancel(NOTIFICATION_ID) }
     }
 
-    private class Refused(val status: Int) : Exception("HTTP $status")
+    internal class Refused(val status: Int) : Exception("HTTP $status")
     private class Archive : Exception("could not package the logs")
 
     /** The code the service gave this upload. */
@@ -261,18 +261,28 @@ object LogUpload {
             c.setRequestProperty("Content-Type", "application/zip")
             c.setRequestProperty("X-MB-Install", installId(context))
             c.setRequestProperty("X-MB-Device", enc("${Build.MANUFACTURER} ${Build.MODEL}"))
-            c.setRequestProperty("X-MB-Gpu", enc(DeviceSupport.gpuName(context)))
+            c.setRequestProperty("X-MB-Gpu", enc(DeviceSupport.chipLabel(context)))
             c.setRequestProperty("X-MB-Version", enc(BuildConfig.MALIBRIDGE_VERSION.ifEmpty { BuildConfig.VERSION_NAME }))
             if (note.isNotEmpty()) c.setRequestProperty("X-MB-Note", enc(note))
             c.outputStream.use { o -> zip.inputStream().use { it.copyTo(o) } }
             val status = c.responseCode
             if (status != 201) throw Refused(status)
             val body = c.inputStream.bufferedReader().use { it.readText() }
-            return codeIn(body) ?: throw Refused(status)
+            val code = codeIn(body)
+            Log.i("LogUpload", successLine(status, code))
+            return code ?: throw Refused(status)
+        } catch (e: Exception) {
+            if (e !is Refused || e.status != 201) Log.w("LogUpload", failureLine(e))
+            throw e
         } finally {
             c.disconnect()
         }
     }
+
+    internal fun successLine(status: Int, code: String?) = "send logs: HTTP $status, code ${code ?: "none in the reply"}"
+
+    internal fun failureLine(e: Exception) =
+        "send logs: ${if (e is Refused) e.message else "error " + e.javaClass.simpleName + ": " + e.message}"
 
     internal fun codeIn(body: String): String? = CODE.find(body)?.value
 
@@ -316,6 +326,7 @@ object LogUpload {
             orientation = LinearLayout.VERTICAL
             setPadding(pad, pad / 2, pad, 0)
             addView(big); addView(body)
+            addView(siteLink(activity, density))
         }
         codeDialog = AlertDialog.Builder(activity)
             .setTitle(R.string.logsend_done_title)
@@ -328,6 +339,29 @@ object LogUpload {
                 setOnDismissListener { if (codeDialog === this) codeDialog = null }
                 show()
             }
+    }
+
+    private const val SITE = "https://malibridge.com/"
+
+    /** A tappable line under the code that opens the MaliBridge site in the browser. */
+    private fun siteLink(activity: Activity, density: Float) = TextView(activity).apply {
+        tag = "site-link"
+        setText(R.string.logsend_site_link)
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+        setTextColor(android.graphics.Color.rgb(0x4A, 0x9E, 0xFF))
+        paintFlags = paintFlags or android.graphics.Paint.UNDERLINE_TEXT_FLAG
+        setPadding(0, (14 * density).toInt(), 0, (8 * density).toInt())
+        isClickable = true
+        setOnClickListener { openSite(activity) }
+    }
+
+    /** No browser (or one that fails) logs a warning and leaves the dialog as it was. */
+    internal fun openSite(context: Context) {
+        try {
+            context.applicationContext.startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(SITE)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        } catch (e: Exception) {
+            Log.w("LogUpload", "could not open $SITE", e)
+        }
     }
 
     /** The player closed or copied the code: it doesn't come back, and its notification goes. */
@@ -353,7 +387,7 @@ object LogUpload {
     }
 
     private fun openApp(context: Context) = PendingIntent.getActivity(context, NOTIFICATION_ID,
-        Intent(context, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP),
+        Intent(context, FrontEndActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP),
         PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
 
     /** No screen open when the upload failed: says so in the notification, since a toast may go unseen. */

@@ -15,17 +15,8 @@ if [[ ! -f "${apk}" ]]; then
     exit 1
 fi
 
-# The APK's package: com.droiddeck.launcher, or a side-by-side build such as
-# com.droiddeck.launcher.mali (DROIDDECK_APP_ID_SUFFIX=.mali). DROIDDECK_PACKAGE overrides it.
-package=${DROIDDECK_PACKAGE:-}
-if [[ -z "${package}" ]]; then
-    aapt2_bin=$(find "${sdk_dir}/build-tools" -mindepth 2 -maxdepth 2 -name aapt2 -print 2>/dev/null | sort -V | tail -1)
-    [[ -z "${aapt2_bin}" ]] || package=$("${aapt2_bin}" dump packagename "${apk}" 2>/dev/null | tr -d '\r' || true)
-fi
-package=${package:-com.droiddeck.launcher}
-
 serial=$(python3 "${repo_root}/tools/adb_device.py" --adb "${adb_bin}")
 
 "${adb_bin}" -s "${serial}" install -r --no-incremental "${apk}"
-installed_path=$("${adb_bin}" -s "${serial}" shell pm path "${package}" | tr -d '\r')
+installed_path=$("${adb_bin}" -s "${serial}" shell pm path com.droiddeck.launcher | tr -d '\r')
 printf 'Installed on %s: %s\n' "${serial}" "${installed_path}"

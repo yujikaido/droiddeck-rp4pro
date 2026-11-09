@@ -52,20 +52,21 @@ object DeviceInfo {
     })
 
     private fun gpu(context: Context, gpu: GpuInfo) = Section("GPU", buildList<Pair<String, String>> {
-        add("GPU", gpu.name)
+        add("GPU", gpu.displayName(context))
         add("Family", gpu.family.label)
         add("Model found from", when (gpu.modelSource) {
             "kernel" -> "the kernel's GPU name"
             "vulkan" -> "the Vulkan driver (the kernel's name has no model)"
-            "platform" -> "the platform (the kernel's name has no model)"
+            "platform" -> "the platform or SoC (the kernel and Vulkan names have no model)"
             else -> "unknown"
         })
         add("Kernel name", gpu.kgslName)
+        add("Kernel chip id", gpu.kgslChipId)
         val kgsl = "/sys/class/kgsl/kgsl-3d0"
         add("Clock range", gpuRange())
         add("Load", read("$kgsl/gpu_busy_percentage")?.let { if (it.endsWith("%")) it else "$it %" })
         add("Temperature", read("$kgsl/temp")?.toLongOrNull()?.let { if (it > 1000) "${it / 1000} °C" else "$it °C" })
-        add("Support", gpu.supportText(SessionPrefs.vkBridge(context)))
+        add("Support", gpu.supportText(com.droiddeck.launcher.core.DeviceSupport.vkBridge(context), com.droiddeck.launcher.core.DeviceSupport.mali()))
     })
 
     private fun cpu() = Section("CPU", buildList<Pair<String, String>> {

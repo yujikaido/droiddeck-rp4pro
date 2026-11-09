@@ -29,6 +29,18 @@ class ForcedPackageTest {
         LinuxRuntime.rootDir(context).deleteRecursively()
     }
 
+    @Test fun unpackedCacheNameCannotEscapeStoreDirectory() {
+        assertEquals("dxvk-2.7.1-linux", ComponentsManager.unpackedCacheKey(dxvk2))
+        for (filename in listOf("..wcp", "...wcp")) {
+            try {
+                ComponentsManager.unpackedCacheKey(filename)
+                fail("Expected cache traversal name to be rejected: $filename")
+            } catch (_: IllegalArgumentException) {
+                // Expected: the derived path would be a dot segment.
+            }
+        }
+    }
+
     @Test fun adreno6xxForcesDxvk2AndNothingElseDoes() {
         val rule = ComponentsManager.FORCED_PACKAGES.single { GpuInfo.Family.A6XX in it.families }
         assertEquals("dxvk", rule.comp)
@@ -554,11 +566,15 @@ class ForcedPackageTest {
             .put("fetchedAt", 1)
             .put("items", JSONArray().put(JSONObject()
                 .put("file", dxvk2).put("comp", "dxvk").put("release", "Dxvk-Linux")
-                .put("url", cachedUrl).put("size", 4).put("digest", "sha256:" + "ab".repeat(32))))
+                .put("url", cachedUrl).put("size", 4).put("digest", "sha256:" + listed("Dxvk-Linux", dxvk2))))
             .toString())
     }
 
     private fun item(file: String, release: String) = ComponentsManager.CatalogItem(
-        file, "dxvk", release, "https://github.com/The412Banner/Nightlies/releases/download/$release/$file", 4, "sha256:" + "ab".repeat(32),
+        file, "dxvk", release, "https://github.com/The412Banner/Nightlies/releases/download/$release/$file", 4, "sha256:" + listed(release, file),
     )
+
+    /** The listing carries the build MaliBridge pinned (CatalogPinGoldenTest covers a rebuilt one). */
+    private fun listed(release: String, file: String) =
+        com.droiddeck.launcher.core.CatalogPins.nightlySha256(release, file) ?: "ab".repeat(32)
 }

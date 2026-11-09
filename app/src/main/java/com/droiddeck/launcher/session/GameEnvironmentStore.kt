@@ -13,6 +13,7 @@ object GameEnvironmentStore {
     private const val GUEST_FILE = "root/.config/droiddeck/game-environment.json"
     const val DXVK_CONFIG = "dxvkConfig"
     const val DXVK_CONFIG_GAMES = "dxvkConfigGames"
+    const val GAME_DEBUG_LOGS = "gameDebugLogs"
 
     @Synchronized
     fun read(context: Context): GameEnvironment.Config {
@@ -72,11 +73,26 @@ object GameEnvironmentStore {
     fun setGameFexPreset(context: Context, scope: String, preset: String?): GameEnvironment.Config =
         update(context) { GameEnvironment.withGameFexPreset(it, scope, preset) }
 
+    fun setGameSync(context: Context, scope: String, backend: String?): GameEnvironment.Config =
+        update(context) { GameEnvironment.withGameSync(it, scope, backend) }
+
     fun setGameNoSteam(context: Context, scope: String, on: Boolean): GameEnvironment.Config =
         update(context) { GameEnvironment.withGameNoSteam(it, scope, on) }
 
     @Synchronized
-    fun publish(context: Context, config: GameEnvironment.Config = read(context)) {
+    fun setDefault(context: Context, scope: String, name: String, value: String): Boolean {
+        val config = read(context)
+        if (GameEnvironment.hasOverride(config, scope, name)) return false
+        save(context, GameEnvironment.withScopeValue(config, scope, name, value))
+        return true
+    }
+
+    @Synchronized
+    fun publish(
+        context: Context,
+        config: GameEnvironment.Config = read(context),
+        gameDebugLogsOverride: Boolean? = null,
+    ) {
         val resolved = config.copy(shared = GameEnvironment.defaults(SessionPrefs.fexPreset(context), SessionPrefs.forceSsbs(context)) + config.shared)
         val json = encode(resolved)
         val dxvk = TextureFiltering.dxvkOptions(
@@ -99,6 +115,11 @@ object GameEnvironmentStore {
             )
         }
         if (gameDxvk.length() > 0) json.put(DXVK_CONFIG_GAMES, gameDxvk)
+        json.put(
+            GAME_DEBUG_LOGS,
+            gameDebugLogsOverride ?: (SessionPrefs.logsEnabled(context) &&
+                SessionPrefs.gameDebugLogsEnabled(context) && SessionPaths.currentSessionLogsRetained(context)),
+        )
         write(File(LinuxRuntime.rootDir(context), GUEST_FILE), json.toString())
     }
 

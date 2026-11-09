@@ -64,12 +64,6 @@ class LoadingStateScanTest {
         assertTrue(s.clientDownloadAt == s.stepAt)
     }
 
-    @Test fun protonInstallStepIsFoundForTheTranslatedLine() {
-        val step = LoadingState.scan("== STEP 05:00:00 installing Proton 'proton-10-arm64' (large download, several minutes)\n").stepText!!
-        assertEquals("proton-10-arm64", LoadingState.INSTALLING_PROTON.find(step)?.groupValues?.get(1))
-        assertEquals(null, LoadingState.INSTALLING_PROTON.find("installed Proton 'proton-10-arm64'"))
-    }
-
     // rc6: the Steam notification said "Steam is downloading its update" for ~100 s on every start.
 
     @Test fun theNotificationsUpdateTextNeedsTheUpdatesProgress() {
@@ -87,7 +81,51 @@ class LoadingStateScanTest {
         assertFalse(SteamDownloadMonitor.clientUpdateShown(updating = false, active = true, progressSeen = true))
     }
 
-    @Test fun theSessionMenusStopIsNamedStop() {
-        assertEquals("Stop in the session menu", SessionService.STOP_FROM_MENU)
+    @Test fun protonInstallStepIsFoundForTheTranslatedLine() {
+        val step = LoadingState.scan("== STEP 05:00:00 installing Proton 'proton-10-arm64' (large download, several minutes)\n").stepText!!
+        assertEquals("proton-10-arm64", LoadingState.INSTALLING_PROTON.find(step)?.groupValues?.get(1))
+        assertEquals(null, LoadingState.INSTALLING_PROTON.find("installed Proton 'proton-10-arm64'"))
     }
+
+    // The first download: the install step counts the script's own packages, then the client's updater counts its own.
+
+    @Test fun theUpdateShowsMegabytesInEveryLanguage() {
+        val english = start + "[2026-11-03 10:00:00] Downloading update (518727 of 670832 KB)...\n"
+        assertEquals("518 / 670 MB", LoadingState.scan(english).downloadMb)
+        val chinese = start + "[2026-10-26 16:02:17] 正在下载更新 (已下载 27212，共 60708 KB)...\n"
+        assertEquals("27 / 60 MB", LoadingState.scan(chinese).downloadMb)
+        assertEquals(44, shown(chinese))
+        val grouped = start + "[2026-11-03 10:00:00] Downloading update (518,727 of 670,832 KB)...\n"
+        assertEquals("518 / 670 MB", LoadingState.scan(grouped).downloadMb)
+        assertEquals(77, shown(grouped))
+    }
+
+    @Test fun theMegabytesStayWhileItsPercentLinesComeBetween() {
+        val log = start +
+            "[2026-11-03 10:00:00] Downloading update (100000 of 670832 KB)...\n" +
+            "[2026-11-03 10:00:00] Set percent complete: 14\n"
+        assertEquals("100 / 670 MB", LoadingState.scan(log).downloadMb)
+        assertEquals(14, shown(log))
+    }
+
+    @Test fun aFinishedDownloadShowsOnlyItsHundredPercent() {
+        val log = start +
+            "[2026-11-03 10:00:00] Downloading update (670000 of 670832 KB)...\n" +
+            "[2026-11-03 10:00:01] Set percent complete: 100\n"
+        assertEquals(null, LoadingState.scan(log).downloadMb)
+        assertEquals(100, shown(log))
+    }
+
+    @Test fun otherBracketedLinesAreNotTheUpdate() {
+        assertEquals(null, LoadingState.updateKilobytes("[2026-11-03 10:00:00] Package file x.zip.vz.abc_123 missing (size 4 KB)"))
+        assertEquals(null, LoadingState.updateKilobytes("[2026-11-03 10:00:00] Set status message: Installing (3/5)"))
+        assertEquals(null, LoadingState.updateKilobytes("== STEP 08:02:14 downloading Steam: a_all (1/2), 13 of 240 MB"))
+    }
+
+    @Test fun anUpdateWithoutKilobytesStillShowsItsPercent() {
+        val log = start + "[2026-10-26 16:02:17] Set percent complete: 1\n[2026-10-26 16:02:18] Set percent complete: 44\n"
+        assertEquals(null, LoadingState.scan(log).downloadMb)
+        assertEquals(44, shown(log))
+    }
+
 }

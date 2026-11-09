@@ -4,7 +4,6 @@ import java.io.File
 import java.net.ServerSocket
 import java.net.Socket
 import java.nio.file.Files
-import java.security.MessageDigest
 import java.util.Random
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicInteger
@@ -12,15 +11,15 @@ import org.junit.After
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
-import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 
 /**
- * Retries, backoff and mirrors. A plain socket server answers per path from a script, so a test can
- * make one host fail, time out, cut a body short or serve a tampered file.
+ * Retries with backoff (restored from the v0.5.4.x line, fork 8cf7ef306). A plain socket server answers
+ * per path from a script, so a test can make a request fail, refuse or cut a body short. The sleeper only
+ * records the waits.
  */
 class DownloaderRetryTest {
     private lateinit var server: ServerSocket
@@ -30,12 +29,11 @@ class DownloaderRetryTest {
     private val hits = HashMap<String, AtomicInteger>()
 
     /** Path -> answer for the n-th request (0-based) to that path. */
-    @Volatile private var route: (path: String, n: Int, range: String?) -> Answer = { _, _, _ -> Answer.Status(404) }
+    @Volatile private var route: (path: String, n: Int) -> Answer = { _, _ -> Answer.Status(404) }
 
     sealed class Answer {
-        class Body(val bytes: ByteArray, val cutAt: Int = -1) : Answer()
+        class Body(val bytes: ByteArray, val cutAt: Int = -1, val etag: String? = null) : Answer()
         class Status(val code: Int) : Answer()
-        object Hang : Answer()
     }
 
     private val base get() = "http://127.0.0.1:${server.localPort}"
@@ -52,20 +50,13 @@ class DownloaderRetryTest {
             } catch (_: Exception) {
             }
         }.apply { isDaemon = true; start() }
-        Downloader.policy = Downloader.Policy(4, 9, 1_000, 8_000, 2_000, 500)
+        Downloader.policy = Downloader.Policy(4, 9, 1_000, 8_000)
         Downloader.sleeper = Downloader.Sleeper { sleeps.add(it) }
-        Downloader.rawBase = "$base/raw"
-        Downloader.jsdelivrBase = "$base/jsd"
-        Downloader.githubBase = "$base/gh"
-        Downloader.forgetFailure()
     }
 
     @After fun tearDown() {
         Downloader.policy = Downloader.DEFAULT_POLICY
         Downloader.sleeper = Downloader.Sleeper { Thread.sleep(it) }
-        Downloader.rawBase = "https://raw.githubusercontent.com"
-        Downloader.jsdelivrBase = "https://cdn.jsdelivr.net/gh"
-        Downloader.githubBase = "https://github.com"
         server.close()
         dir.deleteRecursively()
     }
@@ -82,18 +73,18 @@ class DownloaderRetryTest {
         requests.add(path + (range?.let { r -> " $r" } ?: ""))
         val n = synchronized(hits) { hits.getOrPut(path) { AtomicInteger() } }.getAndIncrement()
         val out = it.getOutputStream()
-        when (val a = route(path, n, range)) {
+        when (val a = route(path, n)) {
             is Answer.Status -> out.write("HTTP/1.1 ${a.code} X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
-            is Answer.Hang -> { Thread.sleep(3_000); return }
             is Answer.Body -> {
+                val tag = a.etag?.let { e -> "ETag: $e\r\n" } ?: ""
                 val from = range?.removePrefix("bytes=")?.substringBefore('-')?.toIntOrNull()
                 if (from != null) {
                     val rest = a.bytes.size - from
-                    out.write(("HTTP/1.1 206 Partial Content\r\nContent-Range: bytes $from-${a.bytes.size - 1}/${a.bytes.size}\r\n" +
+                    out.write(("HTTP/1.1 206 Partial Content\r\n${tag}Content-Range: bytes $from-${a.bytes.size - 1}/${a.bytes.size}\r\n" +
                         "Content-Length: $rest\r\nConnection: close\r\n\r\n").toByteArray())
                     out.write(a.bytes, from, rest)
                 } else {
-                    out.write("HTTP/1.1 200 OK\r\nContent-Length: ${a.bytes.size}\r\nConnection: close\r\n\r\n".toByteArray())
+                    out.write("HTTP/1.1 200 OK\r\n${tag}Content-Length: ${a.bytes.size}\r\nConnection: close\r\n\r\n".toByteArray())
                     out.write(a.bytes, 0, if (a.cutAt >= 0) a.cutAt else a.bytes.size)
                 }
             }
@@ -101,37 +92,8 @@ class DownloaderRetryTest {
         out.flush()
     }
 
-    private fun sha256(b: ByteArray) = MessageDigest.getInstance("SHA-256").digest(b).joinToString("") { "%02x".format(it) }
-
-    // ---- pure parts ----
-
-    @Test fun repositoryFilesGetTheMirrorsInOrder() {
-        Downloader.rawBase = "https://raw.githubusercontent.com"
-        Downloader.jsdelivrBase = "https://cdn.jsdelivr.net/gh"
-        Downloader.githubBase = "https://github.com"
-        val want = listOf(
-            "https://raw.githubusercontent.com/Droid-Deck/DroidDeck-Components/main/linuxfs.json",
-            "https://cdn.jsdelivr.net/gh/Droid-Deck/DroidDeck-Components@main/linuxfs.json",
-            "https://github.com/Droid-Deck/DroidDeck-Components/raw/main/linuxfs.json",
-        )
-        assertEquals(want, Downloader.candidates(want[0]))
-        assertEquals(listOf(want[1], want[0], want[2]), Downloader.candidates(want[1]))
-        assertEquals(listOf(want[2], want[0], want[1]), Downloader.candidates(want[2]))
-    }
-
-    @Test fun releaseAssetsApiAndQueriesHaveNoMirror() {
-        Downloader.githubBase = "https://github.com"
-        for (url in listOf(
-            "https://github.com/Droid-Deck/Nightlies/releases/download/Dxvk-Linux/dxvk-2.7.1-linux.wcp",
-            "https://api.github.com/repos/Droid-Deck/Nightlies/releases/tags/Dxvk-Linux",
-            "https://raw.githubusercontent.com/o/r/main/catalog.json?checked=1",
-            "https://raw.githubusercontent.com/o/r/main/../x.json",
-            "https://example.com/file.json",
-        )) assertEquals(url, listOf(url), Downloader.candidates(url))
-    }
-
     @Test fun backoffDoublesWithJitterAndIsCapped() {
-        val p = Downloader.Policy(10, 10, 1_000, 8_000, 1, 1)
+        val p = Downloader.Policy(10, 10, 1_000, 8_000)
         val r = Random(7)
         assertEquals(0, Downloader.backoffMs(p, 0, r))
         for ((round, full) in listOf(1 to 1_000L, 2 to 2_000L, 3 to 4_000L, 4 to 8_000L, 5 to 8_000L, 30 to 8_000L)) {
@@ -140,96 +102,113 @@ class DownloaderRetryTest {
                 assertTrue("round $round: $d", d in full / 2..full)
             }
         }
+        assertEquals(0, Downloader.backoffMs(Downloader.SINGLE_TRY, 3, r))
     }
 
-    @Test fun defaultsAreSensible() {
+    @Test fun onlyAnswersThatMayPassAreRetried() {
+        for (code in listOf(408, 425, 429, 500, 502, 503, 504)) assertTrue("$code", Downloader.retryable(code))
+        for (code in listOf(400, 401, 403, 404, 410, 416)) assertFalse("$code", Downloader.retryable(code))
         val p = Downloader.DEFAULT_POLICY
-        assertEquals(15_000, p.connectTimeoutMs)
-        assertEquals(30_000, p.readTimeoutMs)
         assertTrue(p.rounds >= 3 && p.maxTries in 4..12)
-        assertTrue(Downloader.retryable(503) && Downloader.retryable(429) && Downloader.retryable(408))
-        assertFalse(Downloader.retryable(404) || Downloader.retryable(403) || Downloader.retryable(410))
     }
-
-    // ---- text ----
 
     @Test fun serverErrorsAreRetriedWithBackoff() {
-        route = { _, n, _ -> if (n < 2) Answer.Status(503) else Answer.Body("{\"ok\":1}".toByteArray()) }
-        assertEquals("{\"ok\":1}", Downloader.downloadString("$base/plain/catalog.json"))
-        assertEquals(3, requests.size)
-        assertEquals(2, sleeps.size)
-        assertTrue("waits grow: $sleeps", sleeps[0] in 500L..1_000L && sleeps[1] in 1_000L..2_000L)
-        assertNull(Downloader.lastFailure())
+        route = { _, n -> if (n < 2) Answer.Status(503) else Answer.Body("catalog".toByteArray()) }
+        assertEquals("catalog", Downloader.downloadString("$base/catalog.json"))
+        assertEquals(listOf("/catalog.json", "/catalog.json", "/catalog.json"), requests.toList())
+        // Rounds 1 and 2: about 1 s and 2 s, full jitter.
+        assertTrue("waited ${sleeps.sum()} ms", sleeps.sum() in 1_500L..3_000L)
     }
 
     @Test fun notFoundIsNotRetried() {
-        route = { _, _, _ -> Answer.Status(404) }
-        assertNull(Downloader.downloadString("$base/plain/missing.json"))
-        assertEquals(1, requests.size)
+        route = { _, _ -> Answer.Status(404) }
+        assertNull(Downloader.downloadString("$base/missing.json"))
+        assertFalse(Downloader.downloadFile("$base/missing.bin", File(dir, "missing.bin"), false, null))
+        assertEquals(listOf("/missing.json", "/missing.bin"), requests.toList())
         assertTrue(sleeps.isEmpty())
-        val f = Downloader.lastFailure()
-        assertNotNull(f)
-        assertEquals(1, f!!.tries)
-        assertTrue(f.last, f.last.endsWith("HTTP 404"))
     }
 
-    @Test fun aTimedOutTryIsRetried() {
-        route = { _, n, _ -> if (n == 0) Answer.Hang else Answer.Body("late".toByteArray()) }
-        assertEquals("late", Downloader.downloadString("$base/plain/slow.json"))
-        assertEquals(2, requests.size)
+    @Test fun aRefusalIsNotRetried() {
+        route = { _, _ -> Answer.Status(403) }
+        assertNull(Downloader.downloadString("$base/forbidden.json"))
+        assertFalse(Downloader.downloadFile("$base/forbidden.bin", File(dir, "forbidden.bin"), false, null))
+        assertEquals(listOf("/forbidden.json", "/forbidden.bin"), requests.toList())
+        assertTrue(sleeps.isEmpty())
     }
 
-    @Test fun catalogComesFromTheNextHostWhenRawFails() {
-        route = { path, _, _ -> if (path.startsWith("/raw/")) Answer.Status(503) else Answer.Body("from ${path.substring(1, 4)}".toByteArray()) }
-        assertEquals("from jsd", Downloader.downloadString("$base/raw/Droid-Deck/DroidDeck-Components/main/linuxfs.json"))
-        assertEquals(listOf("/raw/Droid-Deck/DroidDeck-Components/main/linuxfs.json", "/jsd/Droid-Deck/DroidDeck-Components@main/linuxfs.json"), requests.toList())
-        assertTrue("another host needs no wait", sleeps.isEmpty())
+    @Test fun everyRoundFailingGivesUp() {
+        route = { _, _ -> Answer.Status(503) }
+        assertFalse(Downloader.downloadFile("$base/down.bin", File(dir, "down.bin"), false, null))
+        assertEquals(4, requests.size)
+        assertNull(Downloader.downloadString("$base/down.json"))
+        assertEquals(8, requests.size)
     }
-
-    @Test fun allHostsDownGivesUpWithAReason() {
-        route = { _, _, _ -> Answer.Status(502) }
-        assertNull(Downloader.downloadString("$base/raw/o/r/main/linuxfs.json"))
-        assertEquals("capped at maxTries", 9, requests.size)
-        assertEquals("waits only between rounds", 2, sleeps.size)
-        val f = Downloader.lastFailure()!!
-        assertEquals(9, f.tries)
-        assertEquals("HTTP 502", f.last.substringAfter(": "))
-    }
-
-    // ---- files ----
 
     @Test fun aCutOffFileIsResumedFromTheSameUrlInOneCall() {
-        val data = ByteArray(200_000) { (it % 253).toByte() }
-        route = { _, n, _ -> Answer.Body(data, if (n == 0) 70_000 else -1) }
-        val target = File(dir, "pkg.tar")
-        assertTrue(Downloader.downloadFile("$base/gh/o/r/releases/download/t/pkg.tar", target, false, null))
+        val data = ByteArray(200_000) { (it % 251).toByte() }
+        route = { _, n -> Answer.Body(data, cutAt = if (n == 0) 50_000 else -1, etag = "\"v1\"") }
+        val target = File(dir, "runtime.tar.zst")
+        assertTrue(Downloader.downloadFile("$base/runtime.tar.zst", target, false, null))
         assertArrayEquals(data, target.readBytes())
-        assertEquals(listOf("/gh/o/r/releases/download/t/pkg.tar", "/gh/o/r/releases/download/t/pkg.tar bytes=70000-"), requests.toList())
-    }
-
-    @Test fun aTamperedFileFromOneHostIsSkippedForTheNext() {
-        val good = ByteArray(50_000) { (it % 7).toByte() }
-        val bad = good.copyOf().also { it[100] = 99 }
-        route = { path, _, _ -> Answer.Body(if (path.startsWith("/raw/")) bad else good) }
-        val target = File(dir, "pkg.wcp")
-        assertTrue(Downloader.downloadFile("$base/raw/o/r/main/pkg.wcp", target, false, null, sha256(good)))
-        assertArrayEquals(good, target.readBytes())
         assertEquals(2, requests.size)
+        assertTrue(requests[1], requests[1].startsWith("/runtime.tar.zst bytes="))
+        assertTrue(requests[1], requests[1].removePrefix("/runtime.tar.zst bytes=").substringBefore('-').toInt() > 0)
     }
 
-    @Test fun everyHostTamperedFailsAndLeavesNoFile() {
-        val good = ByteArray(10_000) { 1 }
-        route = { _, _, _ -> Answer.Body(ByteArray(10_000) { 2 }) }
-        val target = File(dir, "pkg.wcp")
-        assertFalse(Downloader.downloadFile("$base/raw/o/r/main/pkg.wcp", target, false, null, sha256(good)))
-        assertFalse(target.exists())
-        assertEquals("each host once: a mismatch is final for that host", 3, requests.size)
-        assertEquals("checksum mismatch", Downloader.lastFailure()!!.last.substringAfter(": "))
+    @Test fun aCancelDuringTheWaitStopsWithoutAnotherTry() {
+        route = { _, _ -> Answer.Status(503) }
+        var cancelled = false
+        Downloader.sleeper = Downloader.Sleeper { sleeps.add(it); cancelled = true }
+        assertNull(Downloader.downloadString("$base/slow.json") { cancelled })
+        assertEquals(1, requests.size)
     }
 
-    @Test fun withoutAChecksumNoMirrorIsUsedForFiles() {
-        route = { path, _, _ -> if (path.startsWith("/raw/")) Answer.Status(404) else Answer.Body(ByteArray(10)) }
-        assertFalse(Downloader.downloadFile("$base/raw/o/r/main/icon.png", File(dir, "icon.png"), false, null))
-        assertEquals(listOf("/raw/o/r/main/icon.png"), requests.toList())
+    @Test fun theSingleTryPolicyTriesOnce() {
+        Downloader.policy = Downloader.SINGLE_TRY
+        route = { _, _ -> Answer.Status(503) }
+        assertNull(Downloader.downloadString("$base/once.json"))
+        assertEquals(1, requests.size)
+        assertTrue(sleeps.isEmpty())
+    }
+
+    private fun collectAttempts(): MutableList<String> {
+        val lines = CopyOnWriteArrayList<String>()
+        Downloader.attemptSink = Downloader.AttemptSink { lines.add(com.droiddeck.launcher.runtime.RuntimeInstallLog.attemptLine("test", it, 4_000_000_000L)) }
+        return lines
+    }
+
+    @Test fun everyTryOfAFailingDownloadLeavesALineWithTheHostAndTheStatus() {
+        val lines = collectAttempts()
+        try {
+            route = { _, _ -> Answer.Status(503) }
+            assertFalse(Downloader.downloadFile("$base/down.bin", File(dir, "down.bin"), false, null))
+        } finally { Downloader.attemptSink = null }
+        assertEquals(lines.toString(), 4, lines.size)
+        for (l in lines) {
+            assertTrue(l, l.contains("host 127.0.0.1") && l.contains("HTTP 503") && l.contains("free storage 4000 MB"))
+        }
+    }
+
+    @Test fun aCutOffBodyReportsBytesReceivedOfExpected() {
+        val lines = collectAttempts()
+        try {
+            val data = ByteArray(200_000) { 1 }
+            route = { _, n -> Answer.Body(data, cutAt = if (n == 0) 50_000 else -1, etag = "\"v1\"") }
+            assertTrue(Downloader.downloadFile("$base/r.bin", File(dir, "r.bin"), false, null))
+        } finally { Downloader.attemptSink = null }
+        assertTrue(lines.toString(), lines[0].contains("received 50000 of 200000 bytes") && lines[0].contains("body ended early"))
+        assertTrue(lines.toString(), lines.last().contains("DONE"))
+    }
+
+    @Test fun anUnreachableHostReportsTheExceptionClass() {
+        val lines = collectAttempts()
+        try {
+            val port = server.localPort
+            server.close()
+            Downloader.policy = Downloader.SINGLE_TRY
+            assertFalse(Downloader.downloadFile("http://127.0.0.1:$port/x.bin", File(dir, "x.bin"), false, null))
+        } finally { Downloader.attemptSink = null }
+        assertEquals(lines.toString(), 1, lines.size)
+        assertTrue(lines[0], lines[0].contains("error ConnectException") && lines[0].contains("HTTP none"))
     }
 }

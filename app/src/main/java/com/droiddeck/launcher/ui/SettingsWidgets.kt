@@ -34,7 +34,11 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.hoverable
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsFocusedAsState
 import androidx.compose.foundation.interaction.collectIsHoveredAsState
@@ -109,7 +113,7 @@ import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.window.Popup
+import com.droiddeck.launcher.ui.GlidePopup as Popup
 import androidx.compose.ui.window.PopupPositionProvider
 import androidx.compose.ui.window.PopupProperties
 
@@ -141,6 +145,11 @@ internal fun Modifier.controllerBack(onBack: () -> Unit): Modifier = onPreviewKe
     }
 }
 
+internal fun Modifier.blockTouches(): Modifier = pointerInput(Unit) { detectTapGestures { } }
+
+internal fun Modifier.tapOutside(onTap: () -> Unit): Modifier =
+    pointerInput(onTap) { detectTapGestures(onTap = { onTap() }) }
+
 internal fun Modifier.bumpers(onPrevious: () -> Unit, onNext: () -> Unit): Modifier = onPreviewKeyEvent { event ->
     val keyEvent = event.nativeKeyEvent
     val previous = keyEvent.keyCode == KeyEvent.KEYCODE_BUTTON_L1
@@ -157,6 +166,7 @@ internal fun Modifier.bumpers(onPrevious: () -> Unit, onNext: () -> Unit): Modif
 internal fun TabStrip(
     tabs: List<String>, selected: Int, onSelect: (Int) -> Unit,
     modifier: Modifier = Modifier, focusRequesters: List<FocusRequester>? = null,
+    bumpers: Boolean = true, compact: Boolean = false,
 ) {
     val colors = MaterialTheme.colorScheme
     val pal = LocalPalette.current
@@ -164,12 +174,12 @@ internal fun TabStrip(
     val scroll = rememberScrollState()
     var tight by remember(tabs) { mutableStateOf(false) }
     LaunchedEffect(scroll.maxValue) { if (scroll.maxValue in 1 until Int.MAX_VALUE) tight = true }
-    val tabPadding = if (tight) 10.dp else 16.dp
+    val tabPadding = if (compact) 10.dp else if (tight) 10.dp else 16.dp
     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = modifier) {
-        BumperKey("LB", stringResource(R.string.widgets_prev_tab)) { onSelect((selected + tabs.size - 1) % tabs.size) }
+        if (bumpers) BumperKey("LB", stringResource(R.string.widgets_prev_tab)) { onSelect((selected + tabs.size - 1) % tabs.size) }
         Row(
             modifier = Modifier.weight(1f, fill = false).clip(shape).background(colors.surfaceVariant).border(1.dp, pal.line2, shape)
-                .horizontalScroll(scroll).padding(3.dp),
+                .horizontalScroll(scroll).selectableGroup().padding(3.dp),
         ) {
             tabs.forEachIndexed { i, label ->
                 val on = i == selected
@@ -180,7 +190,7 @@ internal fun TabStrip(
                 val reveal = remember { androidx.compose.foundation.relocation.BringIntoViewRequester() }
                 if (on) LaunchedEffect(Unit) { reveal.bringIntoView() }
                 Text(
-                    label, fontSize = 14.sp, fontWeight = if (on) FontWeight.Bold else FontWeight.SemiBold, maxLines = 1,
+                    label, fontSize = if (compact) 12.sp else 14.sp, fontWeight = if (on) FontWeight.Bold else FontWeight.SemiBold, maxLines = 1,
                     color = if (on) pal.onSignal else if (hot) colors.onBackground else colors.onSurfaceVariant,
                     modifier = Modifier
                         .bringIntoViewRequester(reveal)
@@ -189,18 +199,18 @@ internal fun TabStrip(
                         .clip(tabShape)
                         .background(if (on) pal.signal else if (hot) pal.signal.copy(alpha = 0.16f) else Color.Transparent)
                         .glideBorder(hot, tabShape, if (on) colors.onBackground else pal.signal)
-                        .hoverable(src).clickable(interactionSource = src, indication = null, role = Role.Tab, onClick = pick)
+                        .hoverable(src).selectable(selected = on, interactionSource = src, indication = null, role = Role.Tab, onClick = pick)
                         .controllerConfirm(onClick = pick)
-                        .padding(horizontal = tabPadding, vertical = 12.dp),
+                        .padding(horizontal = tabPadding, vertical = if (compact) 6.dp else 12.dp),
                 )
             }
         }
-        BumperKey("RB", stringResource(R.string.widgets_next_tab)) { onSelect((selected + 1) % tabs.size) }
+        if (bumpers) BumperKey("RB", stringResource(R.string.widgets_next_tab)) { onSelect((selected + 1) % tabs.size) }
     }
 }
 
 @Composable
-private fun BumperKey(label: String, description: String, onClick: () -> Unit) {
+internal fun BumperKey(label: String, description: String, onClick: () -> Unit) {
     val colors = MaterialTheme.colorScheme
     val pal = LocalPalette.current
     val cap = RoundedCornerShape(7.dp)
@@ -220,6 +230,7 @@ private fun BumperKey(label: String, description: String, onClick: () -> Unit) {
 }
 
 val LocalChipMinWidth = androidx.compose.runtime.compositionLocalOf { 150.dp }
+internal val LocalCompactSettings = androidx.compose.runtime.compositionLocalOf { false }
 
 class MenuHost {
     var open by mutableStateOf<String?>(null)
@@ -358,8 +369,9 @@ fun MenuItem(
             .then(focusRequester?.let { Modifier.focusRequester(it) } ?: Modifier)
             .clip(RoundedCornerShape(8.dp))
             .background(if (hot && enabled) Color.White.copy(alpha = 0.07f) else Color.Transparent)
+            .glideBorder(hot && enabled, RoundedCornerShape(8.dp), pal.signal)
             .alpha(if (enabled) 1f else 0.4f)
-            .hoverable(src).clickable(interactionSource = src, indication = LocalIndication.current, enabled = enabled, onClick = onClick)
+            .hoverable(src).clickable(role = androidx.compose.ui.semantics.Role.Button, interactionSource = src, indication = LocalIndication.current, enabled = enabled, onClick = onClick)
             .controllerConfirm(enabled = enabled, onClick = onClick)
             .padding(horizontal = 10.dp, vertical = 9.dp),
     ) {
@@ -378,6 +390,7 @@ fun MenuItem(
 
 @Composable
 fun ValueChip(text: String, open: Boolean, enabled: Boolean = true, modifier: Modifier = Modifier, onClick: () -> Unit) {
+    val compact = LocalCompactSettings.current
     val colors = MaterialTheme.colorScheme
     val src = remember { MutableInteractionSource() }
     val hot = src.collectIsFocusedAsState().value || src.collectIsHoveredAsState().value
@@ -392,32 +405,36 @@ fun ValueChip(text: String, open: Boolean, enabled: Boolean = true, modifier: Mo
             .background(colors.surfaceVariant)
             .glideBorder(hot, RoundedCornerShape(10.dp), pal.signal, if (open) pal.signal else pal.line2)
             .alpha(if (enabled) 1f else 0.5f)
-            .hoverable(src).clickable(interactionSource = src, indication = LocalIndication.current, enabled = enabled, onClick = onClick)
+            .hoverable(src).clickable(role = androidx.compose.ui.semantics.Role.Button, interactionSource = src, indication = LocalIndication.current, enabled = enabled, onClick = onClick)
             .controllerConfirm(enabled = enabled, onClick = onClick)
-            .padding(horizontal = 12.dp, vertical = 8.dp),
+            .padding(horizontal = if (compact) 10.dp else 12.dp, vertical = if (compact) 6.dp else 8.dp),
     ) {
         AnimatedContent(
             targetState = text,
             transitionSpec = { (fadeIn(Motion.tw(260)) + slideInVertically(Motion.tw(260)) { it / 2 }) togetherWith (fadeOut(Motion.tw(160)) + slideOutVertically(Motion.tw(160)) { -it / 2 }) },
             label = "chipText",
-        ) { t -> Text(t, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = colors.onBackground, maxLines = 1, overflow = TextOverflow.Ellipsis) }
+        ) { t -> Text(t, fontSize = if (compact) 12.sp else 13.sp,
+            lineHeight = if (compact) 16.sp else androidx.compose.ui.unit.TextUnit.Unspecified,
+            fontWeight = FontWeight.SemiBold, color = colors.onBackground, maxLines = 1, overflow = TextOverflow.Ellipsis) }
         Spacer(Modifier.width(8.dp))
         Text("▾", fontSize = 10.sp, color = colors.onSurfaceVariant, modifier = Modifier.rotate(rot))
     }
 }
 
 @Composable
-fun SettingsGroup(title: String, compact: Boolean = false, content: @Composable ColumnScope.() -> Unit) {
+fun SettingsGroup(title: String, compact: Boolean = false, detail: String? = null, content: @Composable ColumnScope.() -> Unit) {
+    val tight = compact || LocalCompactSettings.current
     val colors = MaterialTheme.colorScheme
     val pal = LocalPalette.current
     Column(Modifier.fillMaxWidth().sheetPiece()) {
     Row(
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(if (compact) 6.dp else 10.dp),
-        modifier = Modifier.fillMaxWidth().padding(top = if (compact) 4.dp else 16.dp, bottom = if (compact) 3.dp else 6.dp),
+        horizontalArrangement = Arrangement.spacedBy(if (tight) 6.dp else 10.dp),
+        modifier = Modifier.fillMaxWidth().padding(top = if (tight) 4.dp else 16.dp, bottom = if (tight) 3.dp else 6.dp),
     ) {
-        Text(title.uppercase(), fontSize = 12.sp, fontWeight = FontWeight.SemiBold, letterSpacing = 1.5.sp, color = colors.onSurfaceVariant)
+        Text(title.uppercase(), fontSize = if (tight) 11.sp else 12.sp, fontWeight = FontWeight.SemiBold, letterSpacing = 1.5.sp, color = colors.onSurfaceVariant)
         Box(modifier = Modifier.weight(1f).height(1.dp).background(pal.line))
+        if (detail != null) Text(detail, fontSize = if (tight) 11.sp else 12.sp, fontWeight = FontWeight.SemiBold, color = colors.onSurfaceVariant)
     }
     Column(modifier = Modifier.fillMaxWidth().clip(GroupShape).background(colors.surface).border(1.dp, pal.line, GroupShape)) { content() }
     }
@@ -425,19 +442,34 @@ fun SettingsGroup(title: String, compact: Boolean = false, content: @Composable 
 
 @Composable
 fun SettingsRow(label: String, hint: String?, highlighted: Boolean = false, hintLines: Int? = null, stacked: Boolean = false, control: @Composable () -> Unit) {
+    val compact = LocalCompactSettings.current
     val colors = MaterialTheme.colorScheme
     val pal = LocalPalette.current
     val bg by animateColorAsState(if (highlighted) pal.signal.copy(alpha = 0.10f) else Color.Transparent, Motion.tw(200), label = "rowBg")
     val hintText: @Composable (androidx.compose.ui.unit.TextUnit) -> Unit = { size ->
         Text(hint ?: "", fontSize = size, color = colors.onSurfaceVariant, modifier = Modifier.padding(top = 2.dp),
+            lineHeight = if (compact) 14.sp else androidx.compose.ui.unit.TextUnit.Unspecified,
             minLines = hintLines ?: 1, maxLines = hintLines ?: Int.MAX_VALUE, overflow = TextOverflow.Ellipsis)
     }
-    if (stacked || LocalNarrowPane.current) Column(
-        modifier = Modifier.fillMaxWidth().background(bg).padding(start = 14.dp, end = 14.dp, top = 11.dp, bottom = 12.dp),
+    if (compact && !stacked) Column(
+        modifier = Modifier.fillMaxWidth().background(bg).padding(horizontal = 10.dp, vertical = 6.dp),
     ) {
-        Text(label, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = colors.onBackground)
-        if (hint != null || hintLines != null) hintText(13.sp)
-        Box(Modifier.padding(top = 8.dp)) { control() }
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(label, fontSize = 13.sp, lineHeight = 16.sp, fontWeight = FontWeight.SemiBold, color = colors.onBackground,
+                modifier = Modifier.weight(1f))
+            control()
+        }
+        if (hint != null || hintLines != null) hintText(11.sp)
+    } else if (stacked || LocalNarrowPane.current) Column(
+        modifier = Modifier.fillMaxWidth().background(bg).padding(
+            horizontal = if (compact) 10.dp else 14.dp,
+            vertical = if (compact) 6.dp else 12.dp),
+    ) {
+        Text(label, fontSize = if (compact) 13.sp else 15.sp,
+            lineHeight = if (compact) 16.sp else androidx.compose.ui.unit.TextUnit.Unspecified,
+            fontWeight = FontWeight.SemiBold, color = colors.onBackground)
+        if (hint != null || hintLines != null) hintText(if (compact) 11.sp else 13.sp)
+        Box(Modifier.padding(top = if (compact) 6.dp else 8.dp)) { control() }
     } else Row(
         verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier.fillMaxWidth().background(bg).padding(horizontal = 14.dp, vertical = 11.dp),
@@ -550,6 +582,7 @@ fun ValueSlider(
     value: Int, range: IntRange, step: Int, enabled: Boolean, label: String?, format: (Int) -> String,
     modifier: Modifier = Modifier, onChange: (Int) -> Unit,
 ) {
+    val compact = LocalCompactSettings.current
     val colors = MaterialTheme.colorScheme
     val pal = LocalPalette.current
     val source = remember { MutableInteractionSource() }
@@ -570,7 +603,7 @@ fun ValueSlider(
         }
     }
     Column(
-        modifier = modifier.fillMaxWidth().heightIn(min = 72.dp)
+        modifier = modifier.fillMaxWidth().heightIn(min = if (compact) 64.dp else 72.dp)
             .clip(shape).background(if (hot) pal.signal.copy(alpha = 0.12f) else Color.Transparent)
             .glideBorder(hot, shape, pal.signal)
             .alpha(if (enabled) 1f else 0.5f)
@@ -599,10 +632,10 @@ fun ValueSlider(
             .padding(horizontal = 8.dp, vertical = 6.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            if (label != null) Text(label, fontSize = 15.sp, fontWeight = FontWeight.SemiBold,
+            if (label != null) Text(label, fontSize = if (compact) 13.sp else 15.sp, fontWeight = FontWeight.SemiBold,
                 color = colors.onBackground, modifier = Modifier.weight(1f))
             else Spacer(Modifier.weight(1f))
-            Text(text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = colors.onBackground, maxLines = 1)
+            Text(text, fontSize = if (compact) 12.sp else 14.sp, fontWeight = FontWeight.SemiBold, color = colors.onBackground, maxLines = 1)
         }
         Canvas(
             Modifier.fillMaxWidth().height(40.dp).onSizeChanged { trackPx = it.width }
@@ -648,8 +681,8 @@ fun MultiRow(
 }
 
 @Composable
-fun ActionRow(label: String, hint: String?, button: String, onClick: () -> Unit, progress: Float? = null) {
-    SettingsRow(label, hint) { SecondaryButton(button, progress = progress, onClick = onClick) }
+fun ActionRow(label: String, hint: String?, button: String, onClick: () -> Unit, progress: Float? = null, modifier: Modifier = Modifier) {
+    SettingsRow(label, hint) { SecondaryButton(button, modifier = modifier, progress = progress, onClick = onClick) }
 }
 
 @Composable
@@ -761,7 +794,8 @@ fun SettingsPage(
 }
 
 @Composable
-fun <T> SegmentedTabs(options: List<Pair<T, String>>, selected: T?, modifier: Modifier = Modifier, onPick: (T) -> Unit) {
+fun <T> SegmentedTabs(options: List<Pair<T, String>>, selected: T?, modifier: Modifier = Modifier,
+    tabModifier: (T) -> Modifier = { Modifier }, onPick: (T) -> Unit) {
     val colors = MaterialTheme.colorScheme
     val pal = LocalPalette.current
     val index = options.indexOfFirst { it.first == selected }
@@ -782,7 +816,7 @@ fun <T> SegmentedTabs(options: List<Pair<T, String>>, selected: T?, modifier: Mo
                     .graphicsLayer { alpha = shown }
                     .clip(pillShape).background(pal.signal),
             )
-            Row {
+            Row(Modifier.selectableGroup()) {
                 options.forEachIndexed { i, (value, label) ->
                     val src = remember { MutableInteractionSource() }
                     val hot = src.collectIsFocusedAsState().value || src.collectIsHoveredAsState().value
@@ -798,12 +832,11 @@ fun <T> SegmentedTabs(options: List<Pair<T, String>>, selected: T?, modifier: Mo
                     val pick = { onPick(value) }
                     Box(
                         contentAlignment = Alignment.Center,
-                        modifier = Modifier.width(segment).fillMaxHeight()
+                        modifier = tabModifier(value).width(segment).fillMaxHeight()
                             .clip(pillShape)
                             .glideBorder(hot, pillShape, if (chosen) pal.onSignal else pal.signal)
-                            .semantics { role = Role.Tab; this.selected = chosen }
                             .hoverable(src)
-                            .clickable(interactionSource = src, indication = LocalIndication.current, onClick = pick)
+                            .selectable(selected = chosen, role = Role.Tab, interactionSource = src, indication = LocalIndication.current, onClick = pick)
                             .controllerConfirm(onClick = pick),
                     ) {
                         Text(label, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = ink, maxLines = 1, softWrap = false)

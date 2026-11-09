@@ -21,6 +21,7 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.Row
@@ -75,6 +76,7 @@ import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
 import com.droiddeck.launcher.core.AppLanguage
 import com.droiddeck.launcher.core.DeviceSupport
+import com.droiddeck.launcher.core.DownloadSource
 import com.droiddeck.launcher.core.PhantomProcessLimit
 import com.droiddeck.launcher.core.PhantomProcessStatus
 import com.droiddeck.launcher.session.SessionPrefs
@@ -83,6 +85,15 @@ import com.droiddeck.launcher.R
 
 
 private enum class CheckState { OK, WARN, BUSY }
+
+private const val STORAGE_TAB = 3
+private const val LAUNCHER_TAB = 2
+
+internal object SetupTabs {
+    var openLauncher = false
+    var openOverview = false
+}
+private const val GLASSES_TAB = 5
 
 @Composable
 private fun CheckRow(state: CheckState, title: String, detail: String?, divider: Boolean = true, action: (@Composable () -> Unit)? = null) {
@@ -130,6 +141,7 @@ internal fun SetupPanel(
     a: FrontEndActions,
     onOpenDeveloperOptions: () -> Unit,
     onRequestWirelessAdb: (Boolean) -> Unit,
+    onPairWirelessDebugging: () -> Unit,
 ) {
     val host = rememberMenuHost()
     val ctx = LocalContext.current
@@ -158,7 +170,6 @@ internal fun SetupPanel(
     val colors = MaterialTheme.colorScheme
     val pal = LocalPalette.current
     val gpu = remember { com.droiddeck.launcher.gpu.GpuInfo.detect() }
-    // A GPU without Adreno's driver that the Mali bridge draws for is a supported setup, not a warning.
     val gpuOk = gpu.support == com.droiddeck.launcher.gpu.GpuInfo.Support.TESTED ||
         (gpu.support == com.droiddeck.launcher.gpu.GpuInfo.Support.UNSUPPORTED && s.vkBridge)
     val gpuName = remember { DeviceSupport.gpuName(ctx) }
@@ -166,24 +177,50 @@ internal fun SetupPanel(
     val signedIn = s.offlineAccount != null
     var showLimitDetails by rememberSaveable { mutableStateOf(false) }
     var editSgdbKey by remember { mutableStateOf(false) }
+    var editDownloadPrefix by remember { mutableStateOf(false) }
+    var editDownloadProxy by remember { mutableStateOf(false) }
     if (editSgdbKey) SgdbKeyDialog(s.sgdbUserKey, onSave = { a.onSgdbKey(it); editSgdbKey = false }, onDismiss = { editSgdbKey = false })
-    val tabs = listOf(stringResource(R.string.setup_tab_overview), stringResource(R.string.setup_tab_controller), stringResource(R.string.setup_tab_launcher), stringResource(R.string.setup_tab_diagnostics))
-    var tab by rememberSaveable { mutableStateOf(0) }
-    val chipFocus = remember { List(4) { FocusRequester() } }
+
+    if (editDownloadPrefix) TextEntryDialog(
+        stringResource(R.string.setup_download_prefix), s.downloadPrefix,
+        onDismiss = { editDownloadPrefix = false },
+        onSave = { a.onDownloadPrefix(it); editDownloadPrefix = false },
+    )
+    if (editDownloadProxy) TextEntryDialog(
+        stringResource(R.string.setup_download_proxy), s.downloadProxy,
+        onDismiss = { editDownloadProxy = false },
+        onSave = { a.onDownloadProxy(it); editDownloadProxy = false },
+    )
+    val tabs = listOf(stringResource(R.string.setup_tab_overview), stringResource(R.string.setup_tab_controller), stringResource(R.string.setup_tab_launcher), stringResource(R.string.setup_tab_storage), stringResource(R.string.setup_tab_diagnostics), stringResource(R.string.setup_tab_glasses))
+    var tab by rememberSaveable { mutableStateOf(if (SetupTabs.openLauncher) LAUNCHER_TAB else 0) }
+    SetupTabs.openLauncher = false
+    if (SetupTabs.openOverview) { tab = 0; SetupTabs.openOverview = false }
+    val chipFocus = remember { List(tabs.size) { FocusRequester() } }
     var tabTurned by remember { mutableStateOf(false) }
     val pick: (Int) -> Unit = { i -> tab = i; tabTurned = true }
     val inputModeManager = LocalInputModeManager.current
+    LaunchedEffect(com.droiddeck.launcher.storage.StorageState.openRequests) {
+        if (com.droiddeck.launcher.storage.StorageState.openPending) {
+            com.droiddeck.launcher.storage.StorageState.openPending = false
+            tab = STORAGE_TAB
+        }
+    }
+    LaunchedEffect(Unit) {
+        while (true) {
+            kotlinx.coroutines.delay(2_000)
+            a.onRefreshPhantomStatus()
+        }
+    }
     LaunchedEffect(tab) {
         if (tabTurned && inputModeManager.inputMode == InputMode.Keyboard) {
             androidx.compose.runtime.withFrameNanos { }
             runCatching { chipFocus[tab].requestFocus() }
         }
     }
-    val wide = !LocalNarrowPane.current
     val runtimeOk = s.ready && !s.busy && !s.removalPending
     val checks = listOf(gpuOk, runtimeOk, !limitBlocks, signedIn)
     val passing = checks.count { it }
-    var showChecks by rememberSaveable { mutableStateOf(false) }
+    var showChecks by rememberSaveable { mutableStateOf(setupChecksOpenAtStart(s.adreno, s.vkBridge)) }
     Rise(0, Modifier.fillMaxSize()) {
         Column(
             modifier = Modifier.fillMaxSize().bumpers(
@@ -192,7 +229,7 @@ internal fun SetupPanel(
             ),
         ) {
             PageHeader(stringResource(R.string.setup_title)) {
-                Box(Modifier.weight(1f)) { SheetChips(tabs, tab, chipFocus, pick) }
+                Box(Modifier.weight(1f)) { SheetChips(tabs, tab, chipFocus, onPick = pick) }
             }
             Column(modifier = Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState()).padding(bottom = 24.dp)) {
                 when (tab) {
@@ -203,16 +240,14 @@ internal fun SetupPanel(
                                 when (gpu.support) {
                                     com.droiddeck.launcher.gpu.GpuInfo.Support.TESTED -> stringResource(R.string.setup_gpu_supported)
                                     com.droiddeck.launcher.gpu.GpuInfo.Support.UNTESTED -> stringResource(R.string.setup_gpu_untested)
-                                    else -> if (s.vkBridge) stringResource(R.string.setup_gpu_bridge) else stringResource(R.string.setup_gpu_unsupported)
+                                    else -> stringResource(setupGpuTitleRes(s.vkBridge, DeviceSupport.mali()))
                                 },
                                 when (gpu.support) {
                                     com.droiddeck.launcher.gpu.GpuInfo.Support.TESTED -> stringResource(R.string.setup_gpu_detail, gpu.displayName(ctx), gpuName)
                                     com.droiddeck.launcher.gpu.GpuInfo.Support.UNTESTED -> stringResource(R.string.setup_gpu_untested_detail, gpu.displayName(ctx), gpu.supportText(ctx).replaceFirstChar { it.lowercase() })
-                                    else -> if (s.vkBridge) stringResource(R.string.setup_gpu_bridge_detail, gpuName)
-                                    else stringResource(R.string.setup_gpu_unsupported_detail, gpuName)
+                                    else -> stringResource(setupGpuDetailRes(s.vkBridge, DeviceSupport.mali()), gpuName)
                                 },
                                 divider = divider || (!s.adreno && s.vkBridge),
-                                // Not an Adreno: the experimental Vulkan bridge is the one way to draw.
                                 action = if (s.adreno) null else { {
                                     SecondaryButton(
                                         stringResource(if (s.vkBridge) R.string.setup_gpu_bridge_on else R.string.setup_gpu_bridge_off),
@@ -220,8 +255,6 @@ internal fun SetupPanel(
                                     )
                                 } },
                             )
-                            // The bridge's mode (MaliBridge server_mode.c): safe keeps its workarounds
-                            // wherever the startup probe has not verified this GPU; off is faster.
                             if (!s.adreno && s.vkBridge) CheckRow(
                                 CheckState.OK,
                                 stringResource(R.string.setup_bridge_safe),
@@ -234,8 +267,6 @@ internal fun SetupPanel(
                                     )
                                 },
                             )
-                            // ComponentsManager.bridgeDxvk: an older DXVK where this GPU's Vulkan is too
-                            // old for Proton's; the player can keep Proton's own instead.
                             if (!s.adreno && s.vkBridge) CheckRow(
                                 CheckState.OK,
                                 stringResource(R.string.setup_bridge_dxvk),
@@ -248,16 +279,27 @@ internal fun SetupPanel(
                                     )
                                 },
                             )
-                            // Steam's menus in software where older Mali drivers draw them black (G57, G68).
                             if (!s.adreno && s.vkBridge) CheckRow(
                                 CheckState.OK,
                                 stringResource(R.string.setup_bridge_menus),
-                                stringResource(when (s.steamMenus) { "software" -> R.string.setup_bridge_menus_software_detail; "gpu" -> R.string.setup_bridge_menus_gpu_detail; else -> R.string.setup_bridge_menus_auto_detail }),
+                                stringResource(when (s.steamMenus) { SessionPrefs.STEAM_MENUS_SOFTWARE -> R.string.setup_bridge_menus_software_detail; SessionPrefs.STEAM_MENUS_GPU -> R.string.setup_bridge_menus_gpu_detail; else -> R.string.setup_bridge_menus_auto_detail }),
                                 divider = divider,
                                 action = {
                                     SecondaryButton(
-                                        stringResource(when (s.steamMenus) { "software" -> R.string.setup_bridge_menus_software; "gpu" -> R.string.setup_bridge_menus_gpu; else -> R.string.setup_bridge_menus_auto }),
+                                        stringResource(when (s.steamMenus) { SessionPrefs.STEAM_MENUS_SOFTWARE -> R.string.setup_bridge_menus_software; SessionPrefs.STEAM_MENUS_GPU -> R.string.setup_bridge_menus_gpu; else -> R.string.setup_bridge_menus_auto }),
                                         enabled = !s.sessionRunning, compact = true, onClick = a.onSteamMenus,
+                                    )
+                                },
+                            )
+                            if (!s.adreno && s.vkBridge) CheckRow(
+                                CheckState.OK,
+                                stringResource(R.string.setup_bridge_composite),
+                                stringResource(when (s.bridgeComposite) { SessionPrefs.BRIDGE_COMPOSITE_UI -> R.string.setup_bridge_composite_ui_detail; SessionPrefs.BRIDGE_COMPOSITE_ALWAYS -> R.string.setup_bridge_composite_always_detail; SessionPrefs.BRIDGE_COMPOSITE_OFF -> R.string.setup_bridge_composite_off_detail; else -> R.string.setup_bridge_composite_auto_detail }),
+                                divider = divider,
+                                action = {
+                                    SecondaryButton(
+                                        stringResource(when (s.bridgeComposite) { SessionPrefs.BRIDGE_COMPOSITE_UI -> R.string.setup_bridge_composite_ui; SessionPrefs.BRIDGE_COMPOSITE_ALWAYS -> R.string.setup_bridge_composite_always; SessionPrefs.BRIDGE_COMPOSITE_OFF -> R.string.setup_bridge_composite_off; else -> R.string.setup_bridge_composite_auto }),
+                                        enabled = !s.sessionRunning, compact = true, onClick = a.onBridgeComposite,
                                     )
                                 },
                             )
@@ -299,7 +341,7 @@ internal fun SetupPanel(
                                 },
                                 divider = divider && !showLimitDetails,
                             ) {
-                                if (limitBlocks) PrimaryButton(if (showLimitDetails) stringResource(R.string.common_hide) else stringResource(R.string.setup_fix_it), compact = true) { showLimitDetails = !showLimitDetails }
+                                if (limitBlocks) PrimaryButton(stringResource(R.string.setup_fix_it), compact = true, onClick = a.onShowPhantomGate)
                                 else if (s.phantomProcessStatus != PhantomProcessStatus.NOT_APPLICABLE) {
                                     SecondaryButton(if (showLimitDetails) stringResource(R.string.common_hide) else stringResource(R.string.setup_details), compact = true) { showLimitDetails = !showLimitDetails }
                                 }
@@ -312,11 +354,7 @@ internal fun SetupPanel(
                                         fontSize = 14.sp, color = colors.onSurfaceVariant, modifier = Modifier.padding(vertical = 4.dp),
                                     )
                                     Actions {
-                                        if (limitBlocks) {
-                                            PrimaryButton(stringResource(R.string.setup_dev_options), compact = true, onClick = onOpenDeveloperOptions)
-                                            SecondaryButton(stringResource(R.string.setup_use_wireless), compact = true, enabled = !processLimitBusy) { setProcessLimit(false) }
-                                            SecondaryButton(stringResource(R.string.setup_check_again), compact = true, onClick = a.onRefreshPhantomStatus)
-                                        } else if (s.phantomProcessStatus == PhantomProcessStatus.DISABLED) {
+                                        if (s.phantomProcessStatus == PhantomProcessStatus.DISABLED) {
                                             SecondaryButton(stringResource(R.string.setup_limit_turn_on), compact = true, enabled = !processLimitBusy) { setProcessLimit(true) }
                                         }
                                     }
@@ -363,6 +401,8 @@ internal fun SetupPanel(
                             }
                         }
                         SettingsGroup(stringResource(R.string.setup_runtime)) { runtimeCheck(false) }
+                        SteamIntegrationGroup(s.integration, s.integrationFocus, a.onIntegration, a.onIntegrationLocation)
+                        SetupAboutGroup(a.onSendLogs)
                     }
                     1 -> {
                         val controller = s.controller
@@ -387,6 +427,8 @@ internal fun SetupPanel(
                                         }
                                     }
                                 }
+                                if (s.theme == Themes.INNER_GAMER) RgbSpeedRow()
+                                if (s.theme == Themes.GRADIENT) GradientColorRows()
                                 ChoiceRow(
                                     host, "app-scale", stringResource(R.string.setup_app_scale), stringResource(R.string.setup_app_scale_hint),
                                     com.droiddeck.launcher.core.AppUiPrefs.scales.map { percent ->
@@ -396,8 +438,16 @@ internal fun SetupPanel(
                                         )
                                     }, s.appScale, onPick = a.onAppScale,
                                 )
+                                ChoiceRow(
+                                    host, "launcher-icon", stringResource(R.string.setup_launcher_icon), null,
+                                    com.droiddeck.launcher.LauncherIcon.options.map { (style, label) -> style to stringResource(label) },
+                                    s.launcherIcon, onPick = a.onLauncherIcon,
+                                )
                                 ToggleRow(host, "launcher-animations", stringResource(R.string.setup_animations), null,
                                     s.animationsEnabled, onChange = a.onAnimationsEnabled)
+                                val railContext = androidx.compose.ui.platform.LocalContext.current
+                                remember { RailLabels.load(railContext) }
+                                ToggleRow(host, "rail-labels", stringResource(R.string.setup_rail_labels), stringResource(R.string.setup_rail_labels_hint), RailLabels.shown) { RailLabels.set(railContext, it) }
                                 LanguageRow(host, s.language, a.onLanguage)
                                 ToggleRow(host, "show-stores", stringResource(R.string.setup_stores), null, s.gameStoresEnabled, onChange = a.onGameStoresEnabled)
                             }
@@ -413,7 +463,12 @@ internal fun SetupPanel(
                                     ActionRow(stringResource(R.string.setup_default_home), s.defaultHomeLabel ?: stringResource(R.string.setup_choose_home), stringResource(R.string.setup_choose), a.onHomeApp)
                                 }
                                 ChoiceRow(
-                                    host, "orientation", stringResource(R.string.setup_orientation), null,
+                                    host, "launcher-orientation", stringResource(R.string.setup_launcher_orientation), null,
+                                    com.droiddeck.launcher.core.AppUiPrefs.orientationOptions.map { (value, label) -> value to stringResource(label) },
+                                    s.launcherOrientation, onPick = a.onLauncherOrientation,
+                                )
+                                ChoiceRow(
+                                    host, "orientation", stringResource(R.string.setup_session_orientation), stringResource(R.string.setup_session_orientation_hint),
                                     SessionPrefs.orientationOptions.map { (value, label) -> value to stringResource(label) },
                                     s.orientation, onPick = a.onOrientation,
                                 )
@@ -422,6 +477,23 @@ internal fun SetupPanel(
                                     if (s.launcherFullscreen) stringResource(R.string.setup_fullscreen_on) else stringResource(R.string.setup_fullscreen_off),
                                     s.launcherFullscreen,
                                 ) { a.onLauncherFullscreen(it) }
+                                if (s.dualScreenDevice) {
+                                    ChoiceRow(
+                                        host, "dual-screen", stringResource(R.string.setup_dual_screen), stringResource(R.string.setup_dual_screen_hint),
+                                        listOf(
+                                            com.droiddeck.launcher.input.DualScreen.MODE_AUTO to stringResource(R.string.setup_dual_screen_auto),
+                                            com.droiddeck.launcher.input.DualScreen.MODE_ON to stringResource(R.string.setup_dual_screen_on),
+                                            com.droiddeck.launcher.input.DualScreen.MODE_OFF to stringResource(R.string.setup_dual_screen_off),
+                                        ),
+                                        s.dualScreenMode, onPick = a.onDualScreenMode,
+                                    )
+                                }
+                                if (s.dualScreenDevice && s.dualScreenMode != com.droiddeck.launcher.input.DualScreen.MODE_OFF) {
+                                    ToggleRow(host, "dual-screen-menu", stringResource(R.string.setup_dual_screen_menu),
+                                        stringResource(R.string.setup_dual_screen_menu_hint), s.dualScreenLauncher) { a.onDualScreenLauncher(it) }
+                                    ToggleRow(host, "dual-screen-controls", stringResource(R.string.setup_dual_screen_controls),
+                                        stringResource(R.string.setup_dual_screen_controls_hint), s.dualScreenControls) { a.onDualScreenControls(it) }
+                                }
                             }
                         }
                         val art: @Composable () -> Unit = {
@@ -433,14 +505,73 @@ internal fun SetupPanel(
                                 )
                             }
                         }
-                        if (wide) Row(horizontalArrangement = Arrangement.spacedBy(16.dp), verticalAlignment = Alignment.Top) {
-                            Column(Modifier.weight(1f)) { look() }
-                            Column(Modifier.weight(1f)) { device(); art() }
-                        } else { look(); device(); art() }
+                        val download: @Composable () -> Unit = {
+                            SettingsGroup(stringResource(R.string.setup_group_download)) {
+                                ChoiceRow(
+                                    host, "download-source", stringResource(R.string.setup_download_source), null,
+                                    listOf(
+                                        DownloadSource.MODE_AUTO to stringResource(R.string.setup_download_source_auto),
+                                        DownloadSource.MODE_DIRECT to stringResource(R.string.setup_download_source_direct),
+                                        DownloadSource.MODE_MIRROR to stringResource(R.string.setup_download_source_mirror),
+                                        DownloadSource.MODE_CUSTOM to stringResource(R.string.setup_download_source_custom),
+                                    ),
+                                    s.downloadSource, onPick = a.onDownloadSource,
+                                )
+                                if (s.downloadSource == DownloadSource.MODE_MIRROR) {
+                                    ChoiceRow(
+                                        host, "download-mirror", stringResource(R.string.setup_download_mirror), null,
+                                        DownloadSource.MIRRORS.map { it.host to it.host },
+                                        s.downloadMirror, onPick = a.onDownloadMirror,
+                                    )
+                                }
+                                if (s.downloadSource == DownloadSource.MODE_CUSTOM) {
+                                    ActionRow(
+                                        stringResource(R.string.setup_download_prefix),
+                                        s.downloadPrefix.takeIf { it.isNotEmpty() },
+                                        stringResource(R.string.mode_sgdb_edit),
+                                        onClick = { editDownloadPrefix = true },
+                                    )
+                                }
+                                ActionRow(
+                                    stringResource(R.string.setup_download_proxy),
+                                    s.downloadProxy.takeIf { it.isNotEmpty() },
+                                    stringResource(R.string.mode_sgdb_edit),
+                                    onClick = { editDownloadProxy = true },
+                                )
+                            }
+                        }
+                        BoxWithConstraints(Modifier.fillMaxWidth()) {
+                            if (maxWidth >= 840.dp && !LocalNarrowPane.current) Row(horizontalArrangement = Arrangement.spacedBy(16.dp), verticalAlignment = Alignment.Top) {
+                                Column(Modifier.weight(1f)) { look() }
+                                Column(Modifier.weight(1f)) { device(); art(); download() }
+                            } else Column { look(); device(); art(); download() }
+                        }
                     }
-                    3 -> {
+                    STORAGE_TAB -> StoragePanel(s, a)
+                    4 -> {
                         SettingsGroup(stringResource(R.string.setup_tab_diagnostics)) {
+                            val deviceLine by androidx.compose.runtime.produceState("", ctx) {
+                                value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                                    runCatching { com.droiddeck.launcher.core.DeviceCard.line(ctx) }
+                                        .onFailure { android.util.Log.w("Setup", "device card failed", it) }.getOrDefault("")
+                                }
+                            }
+                            ActionRow(stringResource(R.string.device_card_title), deviceLine.ifEmpty { stringResource(R.string.common_working) },
+                                stringResource(R.string.device_card_copy), { if (deviceLine.isNotEmpty()) com.droiddeck.launcher.core.copyText(ctx, "MaliBridge device", deviceLine) })
+                            ActionRow(stringResource(R.string.settings_copy_title), stringResource(R.string.settings_copy_hint),
+                                stringResource(R.string.device_card_copy), {
+                                    runCatching { com.droiddeck.launcher.core.SettingsSummary.text(ctx) }
+                                        .onSuccess { com.droiddeck.launcher.core.copyText(ctx, "MaliBridge settings", it) }
+                                        .onFailure { android.util.Log.w("Setup", "settings summary failed", it) }
+                                })
                             ToggleRow(host, "logs", stringResource(R.string.setup_logs), stringResource(R.string.setup_logs_hint), s.logsEnabled) { a.onLogs() }
+                            ToggleRow(
+                                host, "game-debug-logs", stringResource(R.string.setup_game_debug_logs),
+                                stringResource(if (s.gameDebugLogsNeedsRestart) R.string.setup_game_debug_logs_restart else R.string.setup_game_debug_logs_hint),
+                                s.gameDebugLogsEnabled,
+                                enabled = s.logsEnabled,
+                            ) { a.onGameDebugLogs() }
+                            ToggleRow(host, "vacdiag", stringResource(R.string.setup_vac_diag), stringResource(R.string.setup_vac_diag_hint), s.vacDiagnostics) { a.onVacDiagnostics() }
                             ToggleRow(host, "agent-commands", stringResource(R.string.setup_agent_commands), null, s.agentCommands) { a.onAgentCommands() }
                             ActionRow(stringResource(R.string.setup_latest_logs), stringResource(R.string.drawer_logs_hint), stringResource(R.string.drawer_share_logs), a.onShareLogs,
                                 progress = com.droiddeck.launcher.session.SessionLogShare.progress)
@@ -454,7 +585,40 @@ internal fun SetupPanel(
                             ActionRow(stringResource(R.string.setup_reset_settings), stringResource(R.string.setup_reset_settings_hint),
                                 stringResource(R.string.setup_reset_settings_button), a.onResetSettings)
                         }
+                        SettingsGroup(stringResource(R.string.setup_group_memory)) {
+                            ToggleRow(
+                                host, "clear-cached-apps", stringResource(R.string.setup_clear_cached),
+                                stringResource(if (s.adbPaired) R.string.setup_clear_cached_hint else R.string.setup_clear_cached_unpaired),
+                                s.clearCachedApps, enabled = s.adbPaired || s.clearCachedApps,
+                            ) { a.onClearCachedApps(it) }
+                            ChoiceRow(
+                                host, "background-app-limit", stringResource(R.string.setup_bg_limit),
+                                stringResource(if (s.adbPaired) R.string.setup_bg_limit_hint else R.string.setup_clear_cached_unpaired),
+                                listOf(
+                                    com.droiddeck.launcher.core.BackgroundAppLimit.OFF to stringResource(R.string.game_env_off),
+                                    4 to stringResource(R.string.setup_bg_limit_4),
+                                    1 to stringResource(R.string.setup_bg_limit_1),
+                                    0 to stringResource(R.string.setup_bg_limit_0),
+                                ),
+                                s.backgroundAppLimit, enabled = s.adbPaired || s.backgroundAppLimit != com.droiddeck.launcher.core.BackgroundAppLimit.OFF,
+                                onPick = a.onBackgroundAppLimit,
+                            )
+                            ChoiceRow(
+                                host, "memory-hud", stringResource(R.string.setup_memory_hud), stringResource(R.string.setup_memory_hud_hint),
+                                listOf(
+                                    com.droiddeck.launcher.session.SessionPrefs.MEMORY_HUD_OFF to stringResource(R.string.game_env_off),
+                                    com.droiddeck.launcher.session.SessionPrefs.MEMORY_HUD_SIMPLE to stringResource(R.string.setup_memory_hud_simple),
+                                    com.droiddeck.launcher.session.SessionPrefs.MEMORY_HUD_ADVANCED to stringResource(R.string.setup_memory_hud_advanced),
+                                ),
+                                s.memoryHud, onPick = a.onMemoryHud,
+                            )
+                            if (!s.adbPaired) ActionRow(
+                                stringResource(R.string.setup_adb_pair), stringResource(R.string.setup_adb_pair_hint),
+                                stringResource(R.string.setup_adb_pair_button), onPairWirelessDebugging,
+                            )
+                        }
                     }
+                    GLASSES_TAB -> GlassesSetupPanel()
                 }
             }
         }
@@ -503,7 +667,7 @@ private fun FrameGenMenu(s: FrontEndState, a: FrontEndActions, host: MenuHost) {
 }
 
 @Composable
-internal fun LaunchSettings(s: FrontEndState, a: FrontEndActions, host: MenuHost, game: com.droiddeck.launcher.frontend.Library.SteamGame? = null) {
+internal fun LaunchSettings(s: FrontEndState, a: FrontEndActions, host: MenuHost, game: com.droiddeck.launcher.frontend.Library.SteamGame? = null, hopRail: String = "games") {
     val columns = if (LocalNarrowPane.current) 2 else 3
     val controller = a.controller
     val context = androidx.compose.ui.platform.LocalContext.current
@@ -511,13 +675,18 @@ internal fun LaunchSettings(s: FrontEndState, a: FrontEndActions, host: MenuHost
     val wincompKey = game?.takeIf { it.library == com.droiddeck.launcher.frontend.Library.ADDED || it.appId > 0 }?.profileKey
     var wincompOpen by remember(wincompKey) { mutableStateOf<Boolean?>(null) }
     val wincompPicks = remember(wincompKey, wincompOpen) { wincompKey?.let { com.droiddeck.launcher.session.WinComponents.picks(context, it) }.orEmpty() }
-    val cards = buildList<@Composable (Modifier) -> Unit> {
+    val steamScope = game?.let { com.droiddeck.launcher.session.NoSteamLaunch.scope(it) }
+    val steamCard: (@Composable (Modifier) -> Unit)? = if (game != null && steamScope != null) { m ->
+        Box(m) { GameSettingsCard(host, game, steamScope) }
+    } else null
+    val cards = if (game?.library == com.droiddeck.launcher.frontend.Library.EPIC_LAUNCHER) listOfNotNull(steamCard) else buildList<@Composable (Modifier) -> Unit> {
         add { m ->
             val back = stringResource(R.string.hop_from_games)
             SettingCard(stringResource(R.string.setup_card_components), stringResource(R.string.setup_card_components_hint), "card:components", m.hopSource("card:components")) {
                 val at = Hops.sources["card:components"]
-                if (at == null) a.onComponents(true)
-                else Hops.go(HopOrigin("games", HOP_SURFACE_GAMES, null, "card:components", at, back, dest = "components", page = "components")) { a.onComponents(true) }
+                val open = { if (game == null) a.onComponents(true) else a.onGameComponents(game) }
+                if (at == null) open()
+                else Hops.go(HopOrigin(hopRail, HOP_SURFACE_GAMES, null, "card:components", at, back, dest = "components", page = "components"), open)
             }
         }
         add { m ->
@@ -529,6 +698,7 @@ internal fun LaunchSettings(s: FrontEndState, a: FrontEndActions, host: MenuHost
             }
         }
         if (controller != null) add { m -> SettingCard(stringResource(R.string.setup_card_controls), stringResource(R.string.setup_card_controls_hint), "card:controls", m, controller.onMapping) }
+        if (steamCard != null) add(steamCard)
         val cardStore = com.droiddeck.launcher.stores.Store.byId(game?.source.orEmpty())?.takeIf { it == com.droiddeck.launcher.stores.Store.EPIC || it == com.droiddeck.launcher.stores.Store.GOG }
         if (cardStore != null && game?.gameFiles != null) add { m ->
             Box(m) {
@@ -558,6 +728,144 @@ internal fun LaunchSettings(s: FrontEndState, a: FrontEndActions, host: MenuHost
         }
     }
 }
+
+internal class GameSettingsState(private val appContext: android.content.Context, val scope: String) {
+    var config by mutableStateOf(runCatching { com.droiddeck.launcher.session.GameEnvironmentStore.read(appContext) }.getOrNull())
+    var saving by mutableStateOf(false)
+    val noSteam: Boolean get() = config?.let { com.droiddeck.launcher.core.GameEnvironment.gameNoSteam(it, scope) } == true
+
+    fun save(change: (android.content.Context) -> com.droiddeck.launcher.core.GameEnvironment.Config?) {
+        if (saving) return
+        saving = true
+        Thread({
+            val written = runCatching { change(appContext) }
+                .onFailure { android.util.Log.w("GameSettingsCard", "could not save the settings of $scope: ${it.message}") }.getOrNull()
+            val next = written ?: runCatching { com.droiddeck.launcher.session.GameEnvironmentStore.read(appContext) }.getOrNull()
+            com.droiddeck.launcher.stores.StoresState.post {
+                config = next
+                saving = false
+            }
+        }, "game-settings").start()
+    }
+}
+
+@Composable
+internal fun rememberGameSettings(scope: String): GameSettingsState {
+    val appContext = androidx.compose.ui.platform.LocalContext.current.applicationContext
+    return remember(scope) { GameSettingsState(appContext, scope) }
+}
+
+@Composable
+private fun GameSettingsCard(host: MenuHost, game: com.droiddeck.launcher.frontend.Library.SteamGame, scope: String) {
+    val state = rememberGameSettings(scope)
+    SettingCard(stringResource(R.string.game_settings_card), stringResource(if (state.noSteam) R.string.game_steam_without else R.string.game_steam_with), "card:$GAME_SETTINGS_MENU", Modifier.fillMaxSize()) {
+        host.open = if (host.open == GAME_SETTINGS_MENU) null else GAME_SETTINGS_MENU
+    }
+    GameSettingsMenus(host, game, state)
+}
+
+/** The per-game settings menus, opened by setting [MenuHost.open] to [GAME_SETTINGS_MENU]. */
+@Composable
+internal fun GameSettingsMenus(host: MenuHost, game: com.droiddeck.launcher.frontend.Library.SteamGame, state: GameSettingsState) {
+    val appContext = androidx.compose.ui.platform.LocalContext.current.applicationContext
+    val colors = MaterialTheme.colorScheme
+    val scope = state.scope
+    val current = state.config
+    val noSteam = state.noSteam
+    val fex = current?.let { runCatching { com.droiddeck.launcher.core.GameEnvironment.gameFexPreset(it, scope) }.getOrNull() }
+    val sync = current?.let { runCatching { com.droiddeck.launcher.core.GameEnvironment.gameSync(it, scope) }.getOrNull() }
+    val ready = current != null && !state.saving
+    val launcher = game.library == com.droiddeck.launcher.frontend.Library.EPIC_LAUNCHER
+    fun save(change: (android.content.Context) -> com.droiddeck.launcher.core.GameEnvironment.Config?) = state.save(change)
+    val key = GAME_SETTINGS_MENU
+    val fexKey = "game-settings-fex"
+    val syncKey = "game-settings-sync"
+    val syncLabels = mapOf(
+        com.droiddeck.launcher.session.SessionPrefs.SYNC_NTSYNC to stringResource(R.string.sync_backend_ntsync),
+        com.droiddeck.launcher.session.SessionPrefs.SYNC_FSYNC to stringResource(R.string.sync_backend_fsync),
+        com.droiddeck.launcher.session.SessionPrefs.SYNC_ESYNC to stringResource(R.string.sync_backend_esync),
+        com.droiddeck.launcher.session.SessionPrefs.SYNC_WINESERVER to stringResource(R.string.sync_backend_wineserver),
+    )
+    val appSync = syncLabels[com.droiddeck.launcher.session.SessionPrefs.syncBackend(appContext)]
+    val useDefault = stringResource(R.string.comp_game_use_general)
+    val custom = stringResource(R.string.comp_game_fex_custom)
+    val customSync = stringResource(R.string.game_sync_custom)
+    val resetDone = stringResource(R.string.comp_game_reset_done, game.name)
+    AnchoredMenu(host.open == key, onDismiss = { if (host.open == key) host.open = null }, title = stringResource(R.string.game_settings_menu_title, game.name)) { first ->
+        MenuItem(stringResource(R.string.game_no_steam_title), checked = noSteam, enabled = ready,
+            detail = stringResource(R.string.game_no_steam_detail), focusRequester = first) {
+            val on = !noSteam
+            save { com.droiddeck.launcher.session.GameEnvironmentStore.setGameNoSteam(it, scope, on) }
+        }
+        if (!launcher) {
+            val chosen = com.droiddeck.launcher.core.FexPreset.all.firstOrNull { it.id == fex }
+            MenuItem(
+                stringResource(R.string.fex_preset_title), checked = false, enabled = ready,
+                detail = when {
+                    fex == null -> useDefault
+                    chosen == null -> custom
+                    else -> stringResource(chosen.label)
+                },
+                trailing = { Text("›", fontSize = 16.sp, color = colors.onSurfaceVariant) },
+            ) { host.open = fexKey }
+            MenuItem(
+                stringResource(R.string.sync_backend_title), checked = false, enabled = ready,
+                detail = when (sync) {
+                    null -> useDefault
+                    com.droiddeck.launcher.core.GameEnvironment.CUSTOM_SYNC -> customSync
+                    else -> syncLabels[sync]
+                },
+                trailing = { Text("›", fontSize = 16.sp, color = colors.onSurfaceVariant) },
+            ) { host.open = syncKey }
+        }
+        MenuItem(stringResource(R.string.game_settings_default), checked = false, enabled = ready,
+            detail = stringResource(R.string.game_settings_default_detail)) {
+            save {
+                val failure = runCatching { com.droiddeck.launcher.session.GameProfileManager.reset(it, scope) }.exceptionOrNull()
+                com.droiddeck.launcher.stores.StoresState.post {
+                    android.widget.Toast.makeText(
+                        it,
+                        if (failure == null) resetDone else it.getString(R.string.comp_game_reset_failed, failure.message.orEmpty()),
+                        android.widget.Toast.LENGTH_SHORT,
+                    ).show()
+                }
+                null
+            }
+        }
+    }
+    AnchoredMenu(host.open == fexKey, onDismiss = { if (host.open == fexKey) host.open = null }, title = stringResource(R.string.fex_preset_title)) { first ->
+        MenuItem(useDefault, checked = fex == null, enabled = ready, focusRequester = first) {
+            host.open = key
+            save { com.droiddeck.launcher.session.GameEnvironmentStore.setGameFexPreset(it, scope, null) }
+        }
+        if (fex == com.droiddeck.launcher.core.GameEnvironment.CUSTOM_FEX_PRESET) {
+            MenuItem(custom, checked = true, enabled = false) {}
+        }
+        com.droiddeck.launcher.core.FexPreset.all.forEach { option ->
+            MenuItem(stringResource(option.label), checked = fex == option.id, enabled = ready, detail = stringResource(option.detail)) {
+                host.open = key
+                save { com.droiddeck.launcher.session.GameEnvironmentStore.setGameFexPreset(it, scope, option.id) }
+            }
+        }
+    }
+    AnchoredMenu(host.open == syncKey, onDismiss = { if (host.open == syncKey) host.open = null }, title = stringResource(R.string.sync_backend_title)) { first ->
+        MenuItem(useDefault, checked = sync == null, enabled = ready, detail = appSync, focusRequester = first) {
+            host.open = key
+            save { com.droiddeck.launcher.session.GameEnvironmentStore.setGameSync(it, scope, null) }
+        }
+        if (sync == com.droiddeck.launcher.core.GameEnvironment.CUSTOM_SYNC) {
+            MenuItem(customSync, checked = true, enabled = false) {}
+        }
+        com.droiddeck.launcher.core.GameEnvironment.syncBackends.forEach { option ->
+            MenuItem(syncLabels.getValue(option), checked = sync == option, enabled = ready) {
+                host.open = key
+                save { com.droiddeck.launcher.session.GameEnvironmentStore.setGameSync(it, scope, option) }
+            }
+        }
+    }
+}
+
+internal const val GAME_SETTINGS_MENU = "game-settings"
 
 private const val EPIC_RESOLVE_URL = "https://www.epicgames.com/id/login?redirectUrl=https%3A%2F%2Fwww.epicgames.com%2Faccount%2Fpersonal"
 
@@ -629,9 +937,8 @@ private fun SettingCard(label: String, value: String, id: String, modifier: Modi
         verticalArrangement = Arrangement.spacedBy(3.dp),
         modifier = modifier.paneItem(id)
             .graphicsLayer { scaleX = scale; scaleY = scale }
-            .clip(Shape14)
-            .background(if (hot) pal.signal.copy(alpha = 0.10f) else colors.surface)
-            .glideBorder(hot, Shape14, pal.signal, pal.line2)
+            .then(if (LocalGlass.current != null) Modifier.glass(Shape14, if (hot) 0.04f else 0f) else Modifier.clip(Shape14).background(if (hot) pal.signal.copy(alpha = 0.10f) else colors.surface))
+            .glideBorder(hot, Shape14, pal.signal, if (LocalGlass.current != null) Color.Transparent else pal.line2)
             .hoverable(src).clickable(interactionSource = src, indication = LocalIndication.current, role = Role.Button, onClick = onClick)
             .controllerConfirm(onClick = onClick)
             .padding(horizontal = 14.dp, vertical = 12.dp),
@@ -666,9 +973,64 @@ private fun LanguageRow(host: MenuHost, chosen: String, onPick: (String) -> Unit
     }
 }
 
+/** How fast Inner Gamer cycles its colours. */
+@Composable
+private fun RgbSpeedRow() {
+    val ctx = androidx.compose.ui.platform.LocalContext.current.applicationContext
+    SliderRow(stringResource(R.string.theme_rgb_speed), stringResource(R.string.theme_rgb_speed_hint), Themes.rgbSpeed, 1..Themes.RGB_SPEEDS) { Themes.setRgbSpeed(ctx, it) }
+}
+
+/** The two colours of the Gradient theme, each a small square that opens the colour picker. */
+@Composable
+private fun GradientColorRows() {
+    val ctx = androidx.compose.ui.platform.LocalContext.current.applicationContext
+    val (primary, secondary) = Themes.gradientColors
+    var picking by remember { androidx.compose.runtime.mutableIntStateOf(0) }
+    val primaryLabel = stringResource(R.string.theme_gradient_primary)
+    val secondaryLabel = stringResource(R.string.theme_gradient_secondary)
+    SettingsRow(primaryLabel, null) { ColorCube(androidx.compose.ui.graphics.Color(primary), primaryLabel) { picking = 1 } }
+    SettingsRow(secondaryLabel, null) { ColorCube(androidx.compose.ui.graphics.Color(secondary), secondaryLabel) { picking = 2 } }
+    if (picking != 0) ColorPickerDialog(
+        if (picking == 1) primaryLabel else secondaryLabel, if (picking == 1) primary else secondary,
+        onDismiss = { picking = 0 },
+    ) { argb ->
+        if (picking == 1) Themes.setGradient(ctx, argb, secondary) else Themes.setGradient(ctx, primary, argb)
+    }
+}
+
 /** Send logs' button: "Send", or how long the upload has been running. */
 @Composable
 internal fun sendLogsButtonText(): String =
     if (com.droiddeck.launcher.session.LogUpload.sendingSince != null)
         stringResource(R.string.logsend_sending_short, com.droiddeck.launcher.session.LogUpload.sendingSeconds)
     else stringResource(R.string.logsend_send)
+
+/**
+ * Setup's checks start open on a non-Adreno GPU with the Mali bridge on: the bridge switch and its Safe mode
+ * row live in them, and stay in sight after the app's data was cleared. Closed (as before) everywhere else.
+ */
+internal fun setupChecksOpenAtStart(adreno: Boolean, bridge: Boolean): Boolean = !adreno && bridge
+
+/** Setup's GPU row for a non-Adreno GPU: bridge on = it runs; bridge off on a Mali = a choice, not "unsupported". */
+internal fun setupGpuTitleRes(bridge: Boolean, mali: Boolean): Int = when {
+    bridge -> R.string.setup_gpu_bridge
+    mali -> R.string.setup_gpu_bridge_is_off
+    else -> R.string.setup_gpu_unsupported
+}
+
+internal fun setupGpuDetailRes(bridge: Boolean, mali: Boolean): Int = when {
+    bridge -> R.string.setup_gpu_bridge_detail
+    mali -> R.string.setup_gpu_bridge_is_off_detail
+    else -> R.string.setup_gpu_unsupported_detail
+}
+
+/** Setup > Overview: the app version and the Send logs action, so the version can be read off a screenshot. */
+@Composable
+internal fun SetupAboutGroup(onSendLogs: () -> Unit) {
+    SettingsGroup(stringResource(R.string.setup_about)) {
+        SettingsRow(stringResource(R.string.setup_version), null) {
+            Text(com.droiddeck.launcher.core.appVersionLabel(), fontSize = 14.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        ActionRow(stringResource(R.string.drawer_send_logs), stringResource(R.string.logsend_row_hint), sendLogsButtonText(), onSendLogs)
+    }
+}

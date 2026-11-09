@@ -1,5 +1,4 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
- * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
  *
  * bcn_check: uploads random blocks of every BC format (every BC6H and BC7 mode forced in turn),
  * blits the texture to RGBA32F and compares each texel with bcdec's CPU decode. Then the shapes
@@ -10,7 +9,7 @@
  * (the GPU's own BC decoder) and through the bridge with BC emulated. BC6H and BC7 are also checked
  * with their modes at random and one mode an image, and the bridge's BC7 decoder is run directly
  * over the same layouts (`bcn_check bc7` runs only that): a decoder whose mode search depends on
- * the neighbouring blocks fails the mixed layouts and passes the pure ones (MaliBridge#24).
+ * the neighbouring blocks fails the mixed layouts and passes the pure ones.
  *
  * `bcn_check transcode`: the bridge transcodes BC to ETC2 / EAC / ASTC (a GPU that samples those),
  * which is lossy: textures are then made of blocks this file encodes from synthetic images (photo-
@@ -26,6 +25,11 @@
  * `bcn_check transcode astc6` / `astc8` (the server started with VKBRIDGE_BC_ASTC_BLOCK=6x6 / 8x8): the
  * same with BC2 / BC3 / BC7 in ASTC 6x6 / 8x8 blocks, whose PSNR floors are lower; sub-region uploads
  * and copies are placed on that block's edges.
+ * `bcn_check transcode zink`: the same quality check (every BC format, PSNR floors, "exact" fails) with the BC
+ * images made as Zink makes them: usage SAMPLED|TRANSFER_SRC|TRANSFER_DST|COLOR_ATTACHMENT (0x17), flags
+ * MUTABLE_FORMAT|EXTENDED_USAGE (0x108). The bridge must transcode them (they were all decoded). Then blocks
+ * drawn into uncompressed views of such images, as Mesa uploads BC data from a pixel buffer, must show in the texture
+ * (test_zink_upload; a player log). `bcn_check upload` (the bridge decoding) runs that on decoded images after the decoding checks.
  * `bcn_check pcache [file]`: what the driver's pipeline cache spares on two of the transcoders
  * (compute pipelines), in this process and from the data an earlier run left in file.
  */
@@ -51,6 +55,7 @@ static int astc_n = 4; /* ... BC2 / BC3 / BC7 into ASTC 6x6 or 8x8 (argument "as
                         * VKBRIDGE_BC_ASTC_BLOCK=6x6 / 8x8) */
 static int tx_hdr; /* ... BC6H too (to ASTC 4x4 HDR, where the GPU samples it) */
 static double min_psnr;
+static int zink_style; /* BC images made as Zink makes them (argument "zink"): see the header */
 
 static int is_bc1_unorm(VkFormat f) { return f == VK_FORMAT_BC1_RGB_UNORM_BLOCK || f == VK_FORMAT_BC1_RGBA_UNORM_BLOCK; }
 
@@ -83,6 +88,10 @@ F(vkFreeMemory); F(vkGetPhysicalDeviceProperties); F(vkCreateImageView); F(vkDes
 F(vkFreeCommandBuffers); F(vkCmdCopyBufferToImage2); F(vkCmdCopyImage2); F(vkCreateShaderModule); F(vkDestroyShaderModule);
 F(vkCreateDescriptorSetLayout); F(vkCreatePipelineLayout); F(vkCreateComputePipelines); F(vkCreateDescriptorPool);
 F(vkAllocateDescriptorSets); F(vkUpdateDescriptorSets); F(vkCmdBindPipeline); F(vkCmdBindDescriptorSets); F(vkCmdPushConstants);
+F(vkCreateRenderPass); F(vkDestroyRenderPass); F(vkCreateFramebuffer); F(vkDestroyFramebuffer); F(vkCmdBeginRenderPass);
+F(vkCmdEndRenderPass); F(vkCreateGraphicsPipelines); F(vkDestroyPipelineLayout); F(vkDestroyDescriptorSetLayout);
+F(vkDestroyDescriptorPool); F(vkCmdDraw); F(vkCmdSetViewport); F(vkCmdSetScissor); F(vkCmdClearAttachments); F(vkCmdBeginRendering);
+F(vkCmdEndRendering);
 F(vkCmdDispatch); F(vkCreatePipelineCache); F(vkGetPipelineCacheData); F(vkDestroyPipelineCache); F(vkDestroyPipeline);
 #undef F
 
@@ -130,7 +139,7 @@ static void make_block(VkFormat f, uint8_t *b, int bytes, int mode)
 /* Where BC6H / BC7 blocks get their modes: block i mode i (cycled), every block mode `mode` (pure),
  * or a random one (BC7: 1 in 9 the reserved mode 8, a first byte of 0, which decodes to transparent
  * black). A GPU whose mode search depends on the neighbouring blocks fails cycled and random and
- * passes pure (the Mali-G1-Ultra, r54p1, MaliBridge#24). */
+ * passes pure (the Mali-G1-Ultra, r54p1). */
 enum { LAYOUT_CYCLED, LAYOUT_PURE, LAYOUT_RANDOM };
 static const char *const layout_name[3] = {"cycled", "pure", "random"};
 
@@ -1433,6 +1442,8 @@ static double psnr_floor(VkFormat f, int alpha)
 }
 
 static double last_psnr, last_psnr_a; /* of the last compare_level in transcode mode (alpha: 0 if none) */
+static int tiny_slack; /* mixcopy: levels of under 64 texels (one to four blocks), in ASTC 6x6 / 8x8 under 1024 (a few
+                        * blocks: alpha measured 2-3 dB under the floors there, an upload's the same), 5 dB under the floors */
 
 static double psnr(double se, long n, double peak) { return n && se > 0 ? 10 * log10(peak * peak * n / se) : 99; }
 
@@ -1461,9 +1472,12 @@ static VkImage make_image(VkFormat f, uint32_t w, uint32_t h, uint32_t mips, uin
                           const VkFormat *list, uint32_t nlist, VkDeviceMemory *mem)
 {
     VkImageFormatListCreateInfo fl = {VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO, NULL, nlist, list};
+    int zink = zink_style && f >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && f <= VK_FORMAT_BC7_SRGB_BLOCK;
+    if (zink) flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
     VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, nlist ? &fl : NULL, flags, VK_IMAGE_TYPE_2D, f, {w, h, 1}, mips, layers,
                              VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
-                             VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                             VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                                 (zink ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0),
                              VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
     VkImage img;
     if (vkCreateImage(dev, &ici, NULL, &img) != VK_SUCCESS) return VK_NULL_HANDLE;
@@ -1566,8 +1580,9 @@ static int compare_level(VkImage bc, VkFormat f, uint32_t mip, uint32_t layer, c
         if (last_psnr < min_psnr) min_psnr = last_psnr;
         if (getenv("BCN_VERBOSE")) printf("    %s: mip %u layer %u (%ux%u): PSNR %.1f dB, alpha %.1f dB\n", name, mip, layer, lv->w, lv->h, last_psnr, last_psnr_a);
         /* a level of a few texels has no headroom for the HDR floor (one odd texel is the whole level) */
-        double floor_c = psnr_floor(f, 0) - (six && lv->w * lv->h < 16 ? 5 : 0);
-        if (last_psnr < floor_c || (alpha && last_psnr_a < psnr_floor(f, 1))) {
+        double slack = tiny_slack && lv->w * lv->h < (in_astc_n(f) ? 1024u : 64u) ? 5 : 0;
+        double floor_c = psnr_floor(f, 0) - (six && lv->w * lv->h < 16 ? 5 : 0) - slack;
+        if (last_psnr < floor_c || (alpha && last_psnr_a < psnr_floor(f, 1) - slack)) {
             printf("  %s: mip %u layer %u (%ux%u): PSNR %.1f dB, alpha %.1f dB\n", name, mip, layer, lv->w, lv->h, last_psnr, last_psnr_a);
             bad = 1;
         }
@@ -1776,6 +1791,261 @@ static void test_quality(VkFormat f, const char *name, const int *kinds, int nk)
         vkFreeMemory(dev, um, NULL);
         vkFreeMemory(dev, im, NULL);
     }
+}
+
+/* Zink renders BC blocks into uncompressed views of its BC images. Mesa's st_CompressedTexSubImage with a pixel
+ * buffer bound draws the blocks, one texel a block, into an R32G32B32A32_UINT (16-byte blocks) or R16G16B16A16_UINT
+ * (8-byte blocks) view of the level (Zink's images: BLOCK_TEXEL_VIEW_COMPATIBLE | MUTABLE_FORMAT | EXTENDED_USAGE,
+ * COLOR_ATTACHMENT). What is drawn there must be what the BC texture shows afterwards: SOMA's terrain was
+ * black on v0.5.5.2, where the draw went to a stand-in image and stayed there, and garbled on v0.5.5.1,
+ * where the blocks were drawn as colours into the decoded image. Here: level 0 (60x44, 15x11 blocks) gets the first
+ * upload, then new blocks drawn in a viewport inside it and one block value cleared into a rect (vkCmdClearAttachments);
+ * level 1 (30x22, 8x6 blocks: not a halving of 15x11) is drawn whole (with render passes, with the viewport set before
+ * the pass began). Each level is compared with the blocks it should
+ * hold (PSNR; in a decoding run exactly), so blocks left as they were in the drawn region, or the rest of level 0
+ * changed, fail. With render passes, then (dynr) with vkCmdBeginRendering, as Zink records on Vulkan 1.3 (natively, or
+ * through the bridge's render passes where the driver lacks it). A view that is only sampled is made too. */
+static int dynr_ok; /* the device was made with dynamicRendering (Vulkan 1.3) */
+static int zink_decoded; /* argument "upload" (decoding run): test_zink_upload on decoded images too */
+
+static void test_zink_upload(VkFormat f, VkFormat view_fmt, const char *name, int dynr)
+{
+    enum { W = 60, H = 44, NL = 2 };
+    static const uint32_t vs_code[] = {
+#include "bcsink_vert.inc"
+    };
+    static const uint32_t fs_code[] = {
+#include "bcsink_frag.inc"
+    };
+    const int bytes = block_bytes(f), kind = image_for(f);
+    level first[NL], drawn[NL], want[NL];
+    for (int m = 0; m < NL; m++) {
+        uint32_t w = W >> m, h = H >> m, bw = (w + 3) / 4, bh = (h + 3) / 4;
+        first[m] = (level){w, h, bw, bh, image_blocks(f, kind, w, h, 0, 0)};
+        drawn[m] = (level){w, h, bw, bh, image_blocks(f, kind, w, h, 23, 37)};
+        want[m] = (level){w, h, bw, bh, malloc((size_t)bw * bh * bytes)};
+        memcpy(want[m].blocks, first[m].blocks, (size_t)bw * bh * bytes);
+    }
+    /* level 0: drawn in blocks [3, 11) x [2, 7), one block of `drawn` cleared into [0, 3) x [8, 11); level 1: drawn whole */
+    const VkRect2D vp0 = {{3, 2}, {8, 5}}, clr = {{0, 8}, {3, 3}};
+    for (uint32_t y = 0; y < first[0].bh; y++)
+        for (uint32_t x = 0; x < first[0].bw; x++) {
+            size_t i = ((size_t)y * first[0].bw + x) * bytes;
+            if (x >= 3 && x < 11 && y >= 2 && y < 7) memcpy(want[0].blocks + i, drawn[0].blocks + i, bytes);
+            if (x < 3 && y >= 8) memcpy(want[0].blocks + i, drawn[0].blocks, bytes);
+        }
+    memcpy(want[1].blocks, drawn[1].blocks, (size_t)drawn[1].bw * drawn[1].bh * bytes);
+
+    VkDeviceMemory um, dm[NL], im;
+    void *upp, *dp[NL];
+    size_t n0 = (size_t)first[0].bw * first[0].bh * bytes, n1 = (size_t)first[1].bw * first[1].bh * bytes;
+    VkBuffer up = host_buffer(n0 + n1, &um, &upp);
+    memcpy(upp, first[0].blocks, n0);
+    memcpy((uint8_t *)upp + n0, first[1].blocks, n1);
+    VkBuffer db[NL];
+    for (int m = 0; m < NL; m++) {
+        size_t n = (size_t)drawn[m].bw * drawn[m].bh * bytes;
+        db[m] = host_buffer(n, &dm[m], &dp[m]);
+        memcpy(dp[m], drawn[m].blocks, n);
+    }
+    VkImage img = make_image(f, W, H, NL, 1, VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT, NULL, 0, &im);
+    if (!img) {
+        printf("FAIL %s: cannot create the image\n", name);
+        failures++;
+        return;
+    }
+    VkAttachmentDescription ad = {0, view_fmt, VK_SAMPLE_COUNT_1_BIT, VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_STORE_OP_STORE,
+                                  VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                  VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkAttachmentReference ar = {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription sp = {0, VK_PIPELINE_BIND_POINT_GRAPHICS, 0, NULL, 1, &ar, NULL, NULL, 0, NULL};
+    VkRenderPassCreateInfo rpi = {VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, NULL, 0, 1, &ad, 1, &sp, 0, NULL};
+    VkRenderPass rp;
+    VkShaderModuleCreateInfo vsi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, sizeof(vs_code), vs_code};
+    VkShaderModuleCreateInfo fsi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, sizeof(fs_code), fs_code};
+    VkShaderModule vsm, fsm;
+    VkDescriptorSetLayoutBinding lb = {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
+    VkDescriptorSetLayoutCreateInfo lci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, 1, &lb};
+    VkDescriptorSetLayout dsl;
+    VkPushConstantRange pr = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16};
+    VkPipelineLayoutCreateInfo pli = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 1, &dsl, 1, &pr};
+    VkPipelineLayout pl;
+    if (vkCreateRenderPass(dev, &rpi, NULL, &rp) || vkCreateShaderModule(dev, &vsi, NULL, &vsm) || vkCreateShaderModule(dev, &fsi, NULL, &fsm) ||
+        vkCreateDescriptorSetLayout(dev, &lci, NULL, &dsl) || vkCreatePipelineLayout(dev, &pli, NULL, &pl)) {
+        printf("FAIL %s: no render pass, shaders or layouts\n", name);
+        failures++;
+        return;
+    }
+    VkPipelineShaderStageCreateInfo st[2] = {
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_VERTEX_BIT, vsm, "main", NULL},
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fsm, "main", NULL}};
+    VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, NULL, 0,
+                                                 VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_FALSE};
+    VkPipelineViewportStateCreateInfo vps = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, NULL, 0, 1, NULL, 1, NULL};
+    VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, NULL, 0, VK_FALSE, VK_FALSE,
+                                                 VK_POLYGON_MODE_FILL, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, VK_FALSE, 0, 0, 0, 1};
+    VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, NULL, 0, VK_SAMPLE_COUNT_1_BIT};
+    VkPipelineColorBlendAttachmentState cba = {VK_FALSE, 0, 0, 0, 0, 0, 0, 0xf};
+    VkPipelineColorBlendStateCreateInfo cb = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, NULL, 0, VK_FALSE, 0, 1, &cba};
+    VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo ds = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0, 2, dyn};
+    VkPipelineRenderingCreateInfo prci = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, NULL, 0, 1, &view_fmt, VK_FORMAT_UNDEFINED,
+                                          VK_FORMAT_UNDEFINED};
+    VkGraphicsPipelineCreateInfo gpi = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, dynr ? &prci : NULL, 0, 2, st, &vi, &ia, NULL, &vps, &rs,
+                                        &ms, NULL, &cb, &ds, pl, dynr ? VK_NULL_HANDLE : rp, 0, VK_NULL_HANDLE, -1};
+    VkPipeline pipe;
+    if (vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gpi, NULL, &pipe)) {
+        printf("FAIL %s: no graphics pipeline\n", name);
+        failures++;
+        return;
+    }
+    VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NL};
+    VkDescriptorPoolCreateInfo dpi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL, 0, NL, 1, &ps};
+    VkDescriptorPool dpool;
+    vkCreateDescriptorPool(dev, &dpi, NULL, &dpool);
+    VkDescriptorSet sets[NL];
+    VkDescriptorSetLayout dsls[NL] = {dsl, dsl};
+    VkDescriptorSetAllocateInfo dai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, NULL, dpool, NL, dsls};
+    vkAllocateDescriptorSets(dev, &dai, sets);
+    for (int m = 0; m < NL; m++) {
+        VkDescriptorBufferInfo bi = {db[m], 0, VK_WHOLE_SIZE};
+        VkWriteDescriptorSet wr = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, sets[m], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &bi, NULL};
+        vkUpdateDescriptorSets(dev, 1, &wr, 0, NULL);
+    }
+    VkImageView views[NL];
+    VkFramebuffer fbs[NL];
+    int bad = 0;
+    for (int m = 0; m < NL; m++) {
+        VkImageViewCreateInfo vci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, img, VK_IMAGE_VIEW_TYPE_2D, view_fmt,
+                                     {0, 0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)m, 1, 0, 1}};
+        views[m] = VK_NULL_HANDLE;
+        fbs[m] = VK_NULL_HANDLE;
+        if (vkCreateImageView(dev, &vci, NULL, &views[m]) != VK_SUCCESS) {
+            printf("FAIL %s: no view of level %d\n", name, m);
+            bad++;
+            continue;
+        }
+        VkFramebufferCreateInfo fi = {VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, NULL, 0, rp, 1, &views[m], first[m].bw, first[m].bh, 1};
+        if (!dynr && vkCreateFramebuffer(dev, &fi, NULL, &fbs[m]) != VK_SUCCESS) {
+            printf("FAIL %s: no framebuffer for level %d\n", name, m);
+            bad++;
+        }
+    }
+    /* a view only sampled */
+    VkImageViewUsageCreateInfo us = {VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, NULL, VK_IMAGE_USAGE_SAMPLED_BIT};
+    VkImageViewCreateInfo sci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, &us, 0, img, VK_IMAGE_VIEW_TYPE_2D, view_fmt,
+                                 {0, 0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, 0, 1}};
+    VkImageView sampled;
+    if (vkCreateImageView(dev, &sci, NULL, &sampled) != VK_SUCCESS) {
+        printf("FAIL %s: no sampled-only view\n", name);
+        bad++;
+    } else {
+        vkDestroyImageView(dev, sampled, NULL);
+    }
+    if (!bad) {
+        VkCommandBuffer c = begin();
+        barrier_all(c, img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkBufferImageCopy r[NL] = {{0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {W, H, 1}},
+                                   {n0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 1, 0, 1}, {0, 0, 0}, {W / 2, H / 2, 1}}};
+        vkCmdCopyBufferToImage(c, up, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, NL, r);
+        /* as Zink: the BC image to COLOR_ATTACHMENT_OPTIMAL for the draw, SHADER_READ_ONLY after it (here TRANSFER_SRC) */
+        VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                  VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                  VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, img,
+                                  {VK_IMAGE_ASPECT_COLOR_BIT, 0, NL, 0, 1}};
+        vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+        for (int m = 0; m < NL; m++) {
+            VkRenderPassBeginInfo rbi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, NULL, rp, fbs[m], {{0, 0}, {first[m].bw, first[m].bh}}, 0, NULL};
+            VkRenderingAttachmentInfo ra = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, NULL, views[m], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                            VK_RESOLVE_MODE_NONE, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED, VK_ATTACHMENT_LOAD_OP_LOAD,
+                                            VK_ATTACHMENT_STORE_OP_STORE, {{{0}}}};
+            VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, rbi.renderArea, 1, 0, 1, &ra, NULL, NULL};
+            /* level 1 with render passes: the viewport set before the pass begins, as Zink leaves it when it did not change */
+            int pre_vp = m == 1 && !dynr;
+            if (pre_vp) {
+                VkViewport pv = {0, 0, (float)first[1].bw, (float)first[1].bh, 0, 1};
+                VkRect2D ps = {{0, 0}, {first[1].bw, first[1].bh}};
+                vkCmdSetViewport(c, 0, 1, &pv);
+                vkCmdSetScissor(c, 0, 1, &ps);
+            }
+            if (dynr) vkCmdBeginRendering(c, &ri);
+            else vkCmdBeginRenderPass(c, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+            vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+            vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 1, &sets[m], 0, NULL);
+            int32_t pc[4] = {0, 0, (int32_t)first[m].bw, bytes == 8};
+            vkCmdPushConstants(c, pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), pc);
+            VkRect2D area = m ? (VkRect2D){{0, 0}, {first[1].bw, first[1].bh}} : vp0;
+            VkViewport v = {(float)area.offset.x, (float)area.offset.y, (float)area.extent.width, (float)area.extent.height, 0, 1};
+            VkRect2D sc = {{0, 0}, {first[m].bw, first[m].bh}};
+            if (!pre_vp) {
+                vkCmdSetViewport(c, 0, 1, &v);
+                vkCmdSetScissor(c, 0, 1, &sc);
+            }
+            vkCmdDraw(c, 3, 1, 0, 0);
+            if (!m) {
+                VkClearAttachment ca = {VK_IMAGE_ASPECT_COLOR_BIT, 0, {{{0}}}};
+                const uint8_t *blk = drawn[0].blocks;
+                if (bytes == 16) {
+                    memcpy(ca.clearValue.color.uint32, blk, 16);
+                } else {
+                    for (int k = 0; k < 4; k++) ca.clearValue.color.uint32[k] = (uint32_t)blk[2 * k] | ((uint32_t)blk[2 * k + 1] << 8);
+                }
+                VkClearRect cr = {clr, 0, 1};
+                vkCmdClearAttachments(c, 1, &ca, 1, &cr);
+            }
+            if (dynr) vkCmdEndRendering(c);
+            else vkCmdEndRenderPass(c);
+        }
+        b.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        b.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+        vkEndCommandBuffer(c);
+        VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, 1, &c, 0, NULL};
+        VkResult q = vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
+        VkResult w = q == VK_SUCCESS ? vkQueueWaitIdle(queue) : q;
+        vkFreeCommandBuffers(dev, pool, 1, &c);
+        if (w != VK_SUCCESS) {
+            printf("FAIL %s: the draws into the uncompressed views failed (%d)\n", name, w);
+            bad++;
+        }
+    }
+    double p[NL] = {0, 0};
+    for (int m = 0; !bad && m < NL; m++) {
+        char what[160];
+        snprintf(what, sizeof(what), "%s, level %d", name, m);
+        bad += compare_level(img, f, (uint32_t)m, 0, &want[m], tx ? 0 : 2.5f / 255.0f, what) != 0;
+        p[m] = last_psnr;
+    }
+    if (tx)
+        printf("%s %s%s: blocks drawn into uncompressed %d views (level 0 in a viewport and a cleared rect, level 1 whole) show in the "
+               "texture: PSNR %.1f / %.1f dB\n", bad ? "FAIL" : "PASS", name, dynr ? ", dynamic rendering" : "", (int)view_fmt, p[0], p[1]);
+    else
+        printf("%s %s%s: blocks drawn into uncompressed %d views (level 0 in a viewport and a cleared rect, level 1 whole) show in the "
+               "decoded texture\n", bad ? "FAIL" : "PASS", name, dynr ? ", dynamic rendering" : "", (int)view_fmt);
+    failures += bad != 0;
+    for (int m = 0; m < NL; m++) {
+        if (fbs[m]) vkDestroyFramebuffer(dev, fbs[m], NULL);
+        if (views[m]) vkDestroyImageView(dev, views[m], NULL);
+        vkDestroyBuffer(dev, db[m], NULL);
+        vkFreeMemory(dev, dm[m], NULL);
+        free(first[m].blocks);
+        free(drawn[m].blocks);
+        free(want[m].blocks);
+    }
+    vkDestroyPipeline(dev, pipe, NULL);
+    vkDestroyPipelineLayout(dev, pl, NULL);
+    vkDestroyDescriptorSetLayout(dev, dsl, NULL);
+    vkDestroyDescriptorPool(dev, dpool, NULL);
+    vkDestroyShaderModule(dev, vsm, NULL);
+    vkDestroyShaderModule(dev, fsm, NULL);
+    vkDestroyRenderPass(dev, rp, NULL);
+    vkDestroyImage(dev, img, NULL);
+    vkDestroyBuffer(dev, up, NULL);
+    vkFreeMemory(dev, um, NULL);
+    vkFreeMemory(dev, im, NULL);
 }
 
 /* BC7 fields per mode: subsets, partition / rotation / index-selection bits, colour and alpha
@@ -2042,15 +2312,16 @@ static void test_pcache(const uint32_t *code, size_t size, const char *name, con
 /* One of the bridge's shaders from server/bc_spv.h (code, size bytes) run directly over bw x bh
  * blocks of 16 bytes, as the bridge dispatches it: what it wrote, out_bytes (malloc'd), NULL if it
  * cannot run. */
-static uint8_t *run_spv(const uint32_t *code, size_t size, const uint8_t *blocks, uint32_t bw, uint32_t bh, uint32_t flags,
-                        VkDeviceSize out_bytes, double *ms)
+/* in_bytes: of the input (0: bw x bh 16-byte blocks) */
+static uint8_t *run_spv_n(const uint32_t *code, size_t size, const uint8_t *blocks, VkDeviceSize in_bytes, uint32_t bw, uint32_t bh,
+                          uint32_t flags, VkDeviceSize out_bytes, double *ms)
 {
     static VkDescriptorSetLayout dsl;
     static VkPipelineLayout layout;
     static struct {
         const uint32_t *code;
         VkPipeline pipe;
-    } pipes[4];
+    } pipes[32];
     static VkDescriptorPool dpool;
     static VkDescriptorSet set;
     if (!set) {
@@ -2069,10 +2340,10 @@ static uint8_t *run_spv(const uint32_t *code, size_t size, const uint8_t *blocks
     }
     VkPipeline pipe = VK_NULL_HANDLE;
     int k = 0;
-    for (; k < 4 && pipes[k].code; k++)
+    for (; k < 32 && pipes[k].code; k++)
         if (pipes[k].code == code) pipe = pipes[k].pipe;
     if (!pipe) {
-        if (k == 4) return NULL;
+        if (k == 32) return NULL;
         VkShaderModuleCreateInfo smci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, size, code};
         VkShaderModule sm;
         if (vkCreateShaderModule(dev, &smci, NULL, &sm)) return NULL;
@@ -2085,7 +2356,7 @@ static uint8_t *run_spv(const uint32_t *code, size_t size, const uint8_t *blocks
         pipes[k].code = code;
         pipes[k].pipe = pipe;
     }
-    VkDeviceSize n = (VkDeviceSize)bw * bh * 16;
+    VkDeviceSize n = in_bytes ? in_bytes : (VkDeviceSize)bw * bh * 16;
     VkDeviceMemory sm, dm;
     void *sp, *dp;
     VkBuffer src = host_buffer(n, &sm, &sp), dst = host_buffer(out_bytes, &dm, &dp);
@@ -2117,6 +2388,12 @@ static uint8_t *run_spv(const uint32_t *code, size_t size, const uint8_t *blocks
     vkFreeMemory(dev, sm, NULL);
     vkFreeMemory(dev, dm, NULL);
     return out;
+}
+
+static uint8_t *run_spv(const uint32_t *code, size_t size, const uint8_t *blocks, uint32_t bw, uint32_t bh, uint32_t flags,
+                        VkDeviceSize out_bytes, double *ms)
+{
+    return run_spv_n(code, size, blocks, 0, bw, bh, flags, out_bytes, ms);
 }
 
 /* The bridge's BC6H transcoder run directly: the ASTC blocks. Lets the encoder be checked by PSNR
@@ -2249,6 +2526,66 @@ static void test_hdr_shader(void)
     }
 }
 
+/* The re-encoders (bc_decode.comp SRC_RAW: a copy from a decoded BC image into a transcoded one),
+ * run directly (any GPU, ASTC HDR samplers or not): blocks decoded by the bridge's decoder, its
+ * texels re-encoded, against the transcoder on the same blocks. Where the decoder's texels are the
+ * transcoder's own (BC1 / BC3 in RGBA8, BC6H in half floats) and the transcoder has no BC-only path
+ * the blocks must be the same; BC7 (its partitions) and BC4 / BC5 (unrounded values) only reported. */
+static void test_raw_shaders(void)
+{
+    static const struct {
+        VkFormat f;
+        const uint32_t *dec, *raw, *tx;
+        size_t dsz, rsz, tsz;
+        uint32_t texel, out, flags;
+        int same;
+        const char *name;
+    } t[] = {
+        {VK_FORMAT_BC1_RGB_UNORM_BLOCK, spv_bc1, spv_raw_etc2, spv_bc1_etc2, sizeof(spv_bc1), sizeof(spv_raw_etc2), sizeof(spv_bc1_etc2), 4, 8, 1, 1,
+         "BC1 RGB -> ETC2 RGB8"},
+        {VK_FORMAT_BC1_RGBA_UNORM_BLOCK, spv_bc1, spv_raw_etc2, spv_bc1_etc2, sizeof(spv_bc1), sizeof(spv_raw_etc2), sizeof(spv_bc1_etc2), 4, 8, 4, 1,
+         "BC1 RGBA -> ETC2 RGB8A1"},
+        {VK_FORMAT_BC3_UNORM_BLOCK, spv_bc3, spv_raw_astc, spv_bc3_astc, sizeof(spv_bc3), sizeof(spv_raw_astc), sizeof(spv_bc3_astc), 4, 16, 0, 1,
+         "BC3 -> ASTC 4x4"},
+        {VK_FORMAT_BC7_UNORM_BLOCK, spv_bc7, spv_raw_astc, spv_bc7_astc, sizeof(spv_bc7), sizeof(spv_raw_astc), sizeof(spv_bc7_astc), 4, 16, 32, 0,
+         "BC7 -> ASTC 4x4"},
+        {VK_FORMAT_BC4_UNORM_BLOCK, spv_bc4, spv_raw_eac_r, spv_bc4_eac, sizeof(spv_bc4), sizeof(spv_raw_eac_r), sizeof(spv_bc4_eac), 1, 8, 0, 0,
+         "BC4 -> EAC R11"},
+        {VK_FORMAT_BC5_SNORM_BLOCK, spv_bc5, spv_raw_eac_rg, spv_bc5_eac, sizeof(spv_bc5), sizeof(spv_raw_eac_rg), sizeof(spv_bc5_eac), 2, 16, 2, 0,
+         "BC5 snorm -> EAC RG11 snorm"},
+        {VK_FORMAT_BC6H_UFLOAT_BLOCK, spv_bc6h, spv_raw_astc_hdr, spv_bc6h_astc, sizeof(spv_bc6h), sizeof(spv_raw_astc_hdr), sizeof(spv_bc6h_astc),
+         8, 16, 0, 1, "BC6H ufloat -> ASTC 4x4 HDR"},
+        {VK_FORMAT_BC6H_SFLOAT_BLOCK, spv_bc6h, spv_raw_astc_hdr, spv_bc6h_astc, sizeof(spv_bc6h), sizeof(spv_raw_astc_hdr), sizeof(spv_bc6h_astc),
+         8, 16, 2, 1, "BC6H sfloat -> ASTC 4x4 HDR"},
+    };
+    enum { S = 256, BW = S / 4, NB = BW * BW };
+    for (size_t i = 0; i < sizeof(t) / sizeof(t[0]); i++) {
+        uint8_t *bc = image_blocks(t[i].f, is_bc6h(t[i].f) ? IMG_HDR_SKY : image_for(t[i].f), S, S, 0, 0);
+        uint32_t dflags = t[i].flags & 3; /* the decoder's: no alpha, signed */
+        uint8_t *px = run_spv_n(t[i].dec, t[i].dsz, bc, (VkDeviceSize)NB * block_bytes(t[i].f), BW, BW, dflags,
+                                (VkDeviceSize)S * S * t[i].texel, NULL);
+        uint8_t *re = px ? run_spv_n(t[i].raw, t[i].rsz, px, (VkDeviceSize)S * S * t[i].texel, BW, BW, t[i].flags,
+                                     (VkDeviceSize)NB * t[i].out, NULL) : NULL;
+        uint8_t *tx = run_spv_n(t[i].tx, t[i].tsz, bc, (VkDeviceSize)NB * block_bytes(t[i].f), BW, BW, t[i].flags & 7,
+                                (VkDeviceSize)NB * t[i].out, NULL);
+        if (!px || !re || !tx) {
+            printf("FAIL %s re-encoder (shader): cannot run it\n", t[i].name);
+            failures++;
+        } else {
+            int same = 0;
+            for (int b = 0; b < NB; b++) same += !memcmp(re + (size_t)b * t[i].out, tx + (size_t)b * t[i].out, t[i].out);
+            int bad = t[i].same && same != NB;
+            printf("%s %s re-encoder (shader): %d of %d blocks as the transcoder makes them%s\n", bad ? "FAIL" : "PASS", t[i].name, same, NB,
+                   t[i].same ? "" : " (not required)");
+            failures += bad;
+        }
+        free(bc);
+        free(px);
+        free(re);
+        free(tx);
+    }
+}
+
 /* Blocks uploaded into an uncompressed image of the block's size (`uf`: R32G32_UINT for 8-byte
  * blocks, R32G32B32A32_UINT for 16-byte ones) and copied from there into a 60x44 BC image, 2 mips x
  * 2 layers, as D3D11 CopyResource between block-compatible formats does: mip 0 both layers in one
@@ -2347,6 +2684,196 @@ static void test_copy_in(VkFormat f, VkFormat uf, const char *name, float tol)
     vkFreeMemory(dev, im, NULL);
     vkFreeMemory(dev, u0m, NULL);
     vkFreeMemory(dev, u1m, NULL);
+}
+
+/* `bcn_check transcode mixcopy`, with the server deciding by size (VKBRIDGE_BC_TRANSCODE_MAX=256:
+ * the 512x512 images decoded, the 256x256 ones transcoded, as the conversion budget may leave two
+ * images of one texture): copies between a decoded and a transcoded image of one format, as UE4
+ * streams a texture's levels (every level of the old image into the new one's, one level down or
+ * up) and as a sub-region; each destination was uploaded with other colours first, so a copy
+ * skipped shows. Compared by PSNR with what was copied (one conversion on the way). */
+static int upload_levels(VkImage img, VkFormat f, level *lv, uint32_t mips)
+{
+    size_t total = 0, bytes = block_bytes(f);
+    for (uint32_t m = 0; m < mips; m++) total += (size_t)lv[m].bw * lv[m].bh * bytes;
+    VkDeviceMemory um;
+    void *upp;
+    VkBuffer up = host_buffer(total, &um, &upp);
+    VkBufferImageCopy *r = calloc(mips, sizeof(*r));
+    size_t off = 0;
+    for (uint32_t m = 0; m < mips; m++) {
+        memcpy((uint8_t *)upp + off, lv[m].blocks, (size_t)lv[m].bw * lv[m].bh * bytes);
+        r[m] = (VkBufferImageCopy){off, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, m, 0, 1}, {0, 0, 0}, {lv[m].w, lv[m].h, 1}};
+        off += (size_t)lv[m].bw * lv[m].bh * bytes;
+    }
+    VkCommandBuffer cb = begin();
+    barrier_all(cb, img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    vkCmdCopyBufferToImage(cb, up, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, mips, r);
+    barrier_all(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    submit(cb);
+    free(r);
+    vkDestroyBuffer(dev, up, NULL);
+    vkFreeMemory(dev, um, NULL);
+    return 0;
+}
+
+static void chain(VkFormat f, int kind, uint32_t size, uint32_t mips, uint32_t ox, level *lv)
+{
+    for (uint32_t m = 0; m < mips; m++) {
+        uint32_t w = size >> m ? size >> m : 1;
+        lv[m] = (level){w, w, (w + 3) / 4, (w + 3) / 4, image_blocks(f, kind, w, w, ox + m, m)};
+    }
+}
+
+/* Level mip of two images, blitted to RGBA32F: the same texels. */
+static int same_level(VkImage a, VkImage b, uint32_t mip, uint32_t w, uint32_t h)
+{
+    size_t n = (size_t)w * h * 16;
+    VkDeviceMemory bm, im[2];
+    void *map;
+    VkBuffer buf = host_buffer(2 * n, &bm, &map);
+    VkImage rgba[2] = {make_image(VK_FORMAT_R32G32B32A32_SFLOAT, w, h, 1, 1, 0, NULL, 0, &im[0]),
+                       make_image(VK_FORMAT_R32G32B32A32_SFLOAT, w, h, 1, 1, 0, NULL, 0, &im[1])};
+    VkCommandBuffer cb = begin();
+    for (int k = 0; k < 2; k++) {
+        barrier(cb, rgba[k], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkImageBlit bl = {{VK_IMAGE_ASPECT_COLOR_BIT, mip, 0, 1}, {{0, 0, 0}, {(int32_t)w, (int32_t)h, 1}},
+                          {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {(int32_t)w, (int32_t)h, 1}}};
+        vkCmdBlitImage(cb, k ? b : a, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rgba[k], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, VK_FILTER_NEAREST);
+        barrier(cb, rgba[k], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        VkBufferImageCopy rb = {k * n, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {w, h, 1}};
+        vkCmdCopyImageToBuffer(cb, rgba[k], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &rb);
+    }
+    VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT};
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    submit(cb);
+    int same = !memcmp(map, (uint8_t *)map + n, n);
+    for (int k = 0; k < 2; k++) {
+        vkDestroyImage(dev, rgba[k], NULL);
+        vkFreeMemory(dev, im[k], NULL);
+    }
+    vkDestroyBuffer(dev, buf, NULL);
+    vkFreeMemory(dev, bm, NULL);
+    return same;
+}
+
+static void test_mixed_copy(VkFormat f, const char *name, VkImageCreateFlags flags, const VkFormat *list, uint32_t nlist, int want_same)
+{
+    enum { BIG = 512, SMALL = 256, BM = 10, SM = 9 };
+    int bytes = block_bytes(f), six = is_bc6h(f);
+    int ka = six ? IMG_HDR_PHOTO : image_for(f), kb = six ? IMG_HDR_GRADIENT : IMG_GRADIENT, kc = six ? IMG_HDR_SKY : IMG_ROUGH;
+    level lb[BM], ls[SM], lt2[SM], ll2[BM];
+    min_psnr = 99;
+    chain(f, ka, BIG, BM, 0, lb);   /* L: decoded */
+    chain(f, kb, SMALL, SM, 5, ls); /* T: transcoded */
+    chain(f, kc, SMALL, SM, 9, lt2); /* T2 (transcoded) and L2 (decoded): other colours first */
+    chain(f, kc, BIG, BM, 13, ll2);
+    VkDeviceMemory m[4];
+    VkImage L = make_image(f, BIG, BIG, BM, 1, flags, list, nlist, &m[0]), T = make_image(f, SMALL, SMALL, SM, 1, flags, list, nlist, &m[1]);
+    VkImage T2 = make_image(f, SMALL, SMALL, SM, 1, flags, list, nlist, &m[2]), L2 = make_image(f, BIG, BIG, BM, 1, flags, list, nlist, &m[3]);
+    if (!L || !T || !T2 || !L2) {
+        printf("FAIL %s: cannot create the images\n", name);
+        failures++;
+        return;
+    }
+    upload_levels(L, f, lb, BM);
+    upload_levels(T, f, ls, SM);
+    upload_levels(T2, f, lt2, SM);
+    upload_levels(L2, f, ll2, BM);
+    VkCommandBuffer cb = begin();
+    barrier_all(cb, T2, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    barrier_all(cb, L2, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    /* streaming out: L's levels 1-9 into T2's 0-8 (decoded -> transcoded); streaming in: T's 0-8
+     * into L2's 1-9 (transcoded -> decoded) */
+    VkImageCopy out[SM], in[SM];
+    for (uint32_t i = 0; i < SM; i++) {
+        uint32_t w = SMALL >> i ? SMALL >> i : 1;
+        out[i] = (VkImageCopy){{VK_IMAGE_ASPECT_COLOR_BIT, i + 1, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, i, 0, 1}, {0, 0, 0}, {w, w, 1}};
+        in[i] = (VkImageCopy){{VK_IMAGE_ASPECT_COLOR_BIT, i, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, i + 1, 0, 1}, {0, 0, 0}, {w, w, 1}};
+    }
+    vkCmdCopyImage(cb, L, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, T2, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, SM, out);
+    vkCmdCopyImage(cb, T, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, L2, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, SM, in);
+    barrier_all(cb, T2, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    barrier_all(cb, L2, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    submit(cb);
+    int bad = 0;
+    for (uint32_t i = 0; i < SM; i++) {
+        bad += compare_level(T2, f, i, 0, &lb[i + 1], 0, name);
+        bad += compare_level(L2, f, i + 1, 0, &ls[i], 0, name);
+    }
+    double whole = min_psnr;
+    /* T3: L's levels 1-9 uploaded as they are. A re-encoded copy from a decoded image is what an
+     * upload of those colours gives: the same texels where the decoded image holds the decoder's
+     * own (RGBA8) and the transcoder has no BC-only path (BC7's partitions, BC4/BC5's unrounded
+     * values: there it is only near) */
+    VkDeviceMemory m3;
+    VkImage T3 = make_image(f, SMALL, SMALL, SM, 1, flags, list, nlist, &m3);
+    int same = 0;
+    if (T3) {
+        upload_levels(T3, f, lb + 1, SM);
+        for (uint32_t i = 0; i < SM; i++) same += same_level(T2, T3, i, lb[i + 1].w, lb[i + 1].h);
+        vkDestroyImage(dev, T3, NULL);
+        vkFreeMemory(dev, m3, NULL);
+    }
+    if (want_same && same != SM) {
+        printf("  %s: %d of %d levels re-encoded from the decoded image are not what an upload gives\n", name, SM - same, SM);
+        bad++;
+    }
+    /* sub-regions, on 48-texel edges (ASTC 6x6 and 8x8 blocks too): L level 0 (96,48) 96x96 into
+     * T level 0 at (48,96) (vkCmdCopyImage2 where there is one), T level 0 (0,144) 48x96 into L
+     * level 0 at (192,240) */
+    cb = begin();
+    barrier_all(cb, T, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    VkImageCopy r1 = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {96, 48, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {48, 96, 0}, {96, 96, 1}};
+    if (vkCmdCopyImage2) {
+        VkImageCopy2 c2 = {VK_STRUCTURE_TYPE_IMAGE_COPY_2, NULL, r1.srcSubresource, r1.srcOffset, r1.dstSubresource, r1.dstOffset, r1.extent};
+        VkCopyImageInfo2 ci2 = {VK_STRUCTURE_TYPE_COPY_IMAGE_INFO_2, NULL, L, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, T,
+                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c2};
+        vkCmdCopyImage2(cb, &ci2);
+    } else {
+        vkCmdCopyImage(cb, L, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, T, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r1);
+    }
+    barrier_all(cb, T, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    barrier_all(cb, L, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    VkImageCopy r2 = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 144, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {192, 240, 0}, {48, 96, 1}};
+    vkCmdCopyImage(cb, T, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, L, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r2);
+    barrier_all(cb, L, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    submit(cb);
+    /* what T level 0 holds now (r1 into it, before r2 read it), then L level 0 */
+    level t0 = ls[0], l0 = lb[0];
+    t0.blocks = malloc((size_t)t0.bw * t0.bh * bytes);
+    memcpy(t0.blocks, ls[0].blocks, (size_t)t0.bw * t0.bh * bytes);
+    for (uint32_t by = 0; by < 96 / 4; by++)
+        memcpy(t0.blocks + ((size_t)(96 / 4 + by) * t0.bw + 48 / 4) * bytes, lb[0].blocks + ((size_t)(48 / 4 + by) * lb[0].bw + 96 / 4) * bytes,
+               (size_t)(96 / 4) * bytes);
+    l0.blocks = malloc((size_t)l0.bw * l0.bh * bytes);
+    memcpy(l0.blocks, lb[0].blocks, (size_t)l0.bw * l0.bh * bytes);
+    for (uint32_t by = 0; by < 96 / 4; by++)
+        memcpy(l0.blocks + ((size_t)(240 / 4 + by) * l0.bw + 192 / 4) * bytes, t0.blocks + ((size_t)(144 / 4 + by) * t0.bw) * bytes,
+               (size_t)(48 / 4) * bytes);
+    min_psnr = 99;
+    bad += compare_level(T, f, 0, 0, &t0, 0, name);
+    double region_t = last_psnr;
+    bad += compare_level(L, f, 0, 0, &l0, 0, name);
+    double region_l = last_psnr;
+    if (bad) {
+        printf("FAIL %s: %d levels below the PSNR floor\n", name, bad);
+        failures++;
+    } else if (!transcoded(f)) {
+        printf("PASS %s: decoded on both sides (no transcoding of this format here), every level and region exact\n", name);
+    } else {
+        printf("PASS %s: levels 1-9 decoded -> transcoded and 0-8 transcoded -> decoded (min PSNR %.1f dB), regions %.1f / %.1f dB; "
+               "%d of %d re-encoded levels as uploaded\n", name, whole, region_t, region_l, same, SM);
+    }
+    free(t0.blocks);
+    free(l0.blocks);
+    for (uint32_t i = 0; i < BM; i++) free(lb[i].blocks), free(ll2[i].blocks);
+    for (uint32_t i = 0; i < SM; i++) free(ls[i].blocks), free(lt2[i].blocks);
+    VkImage im[4] = {L, T, T2, L2};
+    for (int i = 0; i < 4; i++) {
+        vkDestroyImage(dev, im[i], NULL);
+        vkFreeMemory(dev, m[i], NULL);
+    }
 }
 
 /* What the image costs: through the bridge the decoded image's requirements, natively the BC
@@ -2497,7 +3024,7 @@ static void test_many_cbs(void)
 
 int main(int argc, char **argv)
 {
-    int gpu = 0, hdr_only = 0, bc7_only = 0;
+    int gpu = 0, hdr_only = 0, bc7_only = 0, mix_only = 0, zink_only = 0;
     const char *pcache_file = NULL;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "transcode")) tx = 1;
@@ -2505,6 +3032,9 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "astc8")) astc_n = 8;
         else if (!strcmp(argv[i], "hdr")) hdr_only = 1;
         else if (!strcmp(argv[i], "bc7")) bc7_only = 1;
+        else if (!strcmp(argv[i], "mixcopy")) mix_only = 1;
+        else if (!strcmp(argv[i], "zink")) zink_only = zink_style = 1;
+        else if (!strcmp(argv[i], "upload")) zink_decoded = 1;
         else if (!strcmp(argv[i], "pcache")) pcache_file = i + 1 < argc ? argv[++i] : "bcn_check-pcache.bin";
         else gpu = atoi(argv[i]);
     }
@@ -2533,6 +3063,20 @@ int main(int argc, char **argv)
     VkPhysicalDeviceFeatures en = {0};
     en.textureCompressionBC = VK_TRUE;
     VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, NULL, 0, 1, &qci, 0, NULL, 0, NULL, &en};
+    /* dynamicRendering where the device has it (test_zink_upload records with it too) */
+    VkPhysicalDeviceVulkan13Features f13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    if (props.apiVersion >= VK_API_VERSION_1_3) {
+        PFN_vkGetPhysicalDeviceFeatures2 gf2 = (PFN_vkGetPhysicalDeviceFeatures2)gipa(inst, "vkGetPhysicalDeviceFeatures2");
+        VkPhysicalDeviceFeatures2 q2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f13};
+        if (gf2) gf2(pd, &q2);
+        if (f13.dynamicRendering) {
+            VkPhysicalDeviceVulkan13Features want13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+            want13.dynamicRendering = VK_TRUE;
+            f13 = want13;
+            dci.pNext = &f13;
+            dynr_ok = 1;
+        }
+    }
     if (vkCreateDevice(pd, &dci, NULL, &dev)) return 2;
 #undef G
 #define G(n) n = (PFN_##n)vkGetDeviceProcAddr(dev, #n)
@@ -2541,6 +3085,13 @@ int main(int argc, char **argv)
     G(vkBindBufferMemory); G(vkMapMemory); G(vkCreateImage); G(vkGetImageMemoryRequirements); G(vkBindImageMemory);
     G(vkCmdPipelineBarrier); G(vkCmdCopyBufferToImage); G(vkCmdBlitImage); G(vkCmdCopyImageToBuffer); G(vkDestroyImage);
     G(vkDestroyBuffer); G(vkFreeMemory); G(vkCreateImageView); G(vkDestroyImageView); G(vkCmdCopyImage); G(vkFreeCommandBuffers);
+    G(vkCreateRenderPass); G(vkDestroyRenderPass); G(vkCreateFramebuffer); G(vkDestroyFramebuffer); G(vkCmdBeginRenderPass); G(vkCmdEndRenderPass);
+    G(vkCreateGraphicsPipelines); G(vkDestroyPipelineLayout); G(vkDestroyDescriptorSetLayout); G(vkDestroyDescriptorPool); G(vkCmdDraw);
+    G(vkCmdSetViewport); G(vkCmdSetScissor); G(vkCmdClearAttachments);
+    if (dynr_ok) {
+        G(vkCmdBeginRendering);
+        G(vkCmdEndRendering);
+    }
     if (props.apiVersion >= VK_API_VERSION_1_3) {
         G(vkCmdCopyBufferToImage2);
         G(vkCmdCopyImage2);
@@ -2576,6 +3127,52 @@ int main(int argc, char **argv)
     }
     if (bc7_only) { /* `bcn_check bc7`: only the BC7 decoder, run directly (any GPU) */
         test_bc7_shader();
+        printf("%s\n", failures ? "FAILED" : "OK");
+        return failures ? 1 : 0;
+    }
+    if (mix_only) { /* `bcn_check transcode mixcopy`: copies between decoded and transcoded images (the server with
+                     * VKBRIDGE_BC_TRANSCODE_MAX=256) */
+        tiny_slack = 1;
+        test_raw_shaders();
+        static const VkFormat bc1_list[] = {VK_FORMAT_BC1_RGBA_UNORM_BLOCK, VK_FORMAT_BC1_RGBA_SRGB_BLOCK};
+        static const VkFormat bc7_list[] = {VK_FORMAT_BC7_UNORM_BLOCK, VK_FORMAT_BC7_SRGB_BLOCK};
+        test_mixed_copy(VK_FORMAT_BC1_RGB_UNORM_BLOCK, tx_name(VK_FORMAT_BC1_RGB_UNORM_BLOCK, "BC1 RGB (R5G6B5 decoded) mixed copies"), 0, NULL, 0, 0);
+        test_mixed_copy(VK_FORMAT_BC1_RGBA_UNORM_BLOCK, "BC1 RGBA (A1R5G5B5 decoded) mixed copies", 0, NULL, 0, 0);
+        test_mixed_copy(VK_FORMAT_BC1_RGBA_SRGB_BLOCK, "BC1 RGBA sRGB, mutable as DXVK makes it, mixed copies", VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT,
+                        bc1_list, 2, 1);
+        test_mixed_copy(VK_FORMAT_BC3_UNORM_BLOCK, tx_name(VK_FORMAT_BC3_UNORM_BLOCK, "BC3 -> ASTC 4x4 mixed copies"), 0, NULL, 0, 1);
+        test_mixed_copy(VK_FORMAT_BC7_UNORM_BLOCK, tx_name(VK_FORMAT_BC7_UNORM_BLOCK, "BC7 -> ASTC 4x4, mutable, mixed copies"),
+                        VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT, bc7_list, 2, astc_n != 4);
+        test_mixed_copy(VK_FORMAT_BC7_SRGB_BLOCK, tx_name(VK_FORMAT_BC7_SRGB_BLOCK, "BC7 sRGB -> ASTC 4x4 sRGB mixed copies"), 0, NULL, 0, astc_n != 4);
+        test_mixed_copy(VK_FORMAT_BC4_UNORM_BLOCK, "BC4 mixed copies", 0, NULL, 0, 0);
+        test_mixed_copy(VK_FORMAT_BC4_SNORM_BLOCK, "BC4 snorm mixed copies", 0, NULL, 0, 0);
+        test_mixed_copy(VK_FORMAT_BC5_UNORM_BLOCK, "BC5 mixed copies", 0, NULL, 0, 0);
+        test_mixed_copy(VK_FORMAT_BC5_SNORM_BLOCK, "BC5 snorm mixed copies", 0, NULL, 0, 0);
+        test_mixed_copy(VK_FORMAT_BC6H_UFLOAT_BLOCK, tx_hdr ? "BC6H -> ASTC 4x4 HDR mixed copies" : "BC6H (decoded both sides) copies", 0, NULL, 0, 0);
+        printf("%s\n", failures ? "FAILED" : "OK");
+        return failures ? 1 : 0;
+    }
+    if (zink_only) { /* `bcn_check transcode zink`: Zink's image usage and flags, transcoded all the same */
+        if (!tx) {
+            printf("FAIL zink needs the bridge's transcoding (bcn_check transcode zink)\n");
+            return 1;
+        }
+        static const int photo[] = {IMG_PHOTO, IMG_ROUGH, IMG_GRADIENT}, cut[] = {IMG_PHOTO, IMG_ROUGH, IMG_GRADIENT, IMG_ALPHA_CUT};
+        static const int soft[] = {IMG_PHOTO, IMG_ROUGH, IMG_GRADIENT, IMG_ALPHA_SOFT}, normal[] = {IMG_NORMAL};
+        test_quality(VK_FORMAT_BC1_RGB_UNORM_BLOCK, "BC1 RGB, Zink usage 0x17 flags 0x108", photo, 3);
+        test_quality(VK_FORMAT_BC1_RGBA_UNORM_BLOCK, "BC1 RGBA, Zink usage", cut, 4);
+        test_quality(VK_FORMAT_BC3_UNORM_BLOCK, "BC3, Zink usage", soft, 4);
+        test_quality(VK_FORMAT_BC3_SRGB_BLOCK, "BC3 sRGB, Zink usage", soft, 4);
+        test_quality(VK_FORMAT_BC7_UNORM_BLOCK, "BC7, Zink usage", soft, 4);
+        test_quality(VK_FORMAT_BC4_UNORM_BLOCK, "BC4, Zink usage", photo, 3);
+        test_quality(VK_FORMAT_BC5_UNORM_BLOCK, "BC5, Zink usage", normal, 1);
+        for (int d = 0; d <= dynr_ok; d++) {
+            test_zink_upload(VK_FORMAT_BC3_UNORM_BLOCK, VK_FORMAT_R32G32B32A32_UINT, "BC3, Zink upload through a pixel buffer", d);
+            test_zink_upload(VK_FORMAT_BC7_UNORM_BLOCK, VK_FORMAT_R32G32B32A32_UINT, "BC7, Zink upload through a pixel buffer", d);
+            test_zink_upload(VK_FORMAT_BC5_UNORM_BLOCK, VK_FORMAT_R32G32B32A32_UINT, "BC5, Zink upload through a pixel buffer", d);
+            test_zink_upload(VK_FORMAT_BC1_RGBA_UNORM_BLOCK, VK_FORMAT_R16G16B16A16_UINT, "BC1, Zink upload through a pixel buffer", d);
+            test_zink_upload(VK_FORMAT_BC4_UNORM_BLOCK, VK_FORMAT_R16G16B16A16_UINT, "BC4, Zink upload through a pixel buffer", d);
+        }
         printf("%s\n", failures ? "FAILED" : "OK");
         return failures ? 1 : 0;
     }
@@ -2671,6 +3268,15 @@ int main(int argc, char **argv)
         test_large(VK_FORMAT_BC5_UNORM_BLOCK, "BC5");
     }
     test_many_cbs();
+    if (!tx && zink_decoded) { /* `bcn_check upload`: Zink's BC uploads through a pixel buffer into the bridge's decoded images (transcoded
+                                * ones: `bcn_check transcode zink`; not on a driver's own BC, which lavapipe does not render into) */
+        zink_style = 1;
+        for (int d = 0; d <= dynr_ok; d++) {
+            test_zink_upload(VK_FORMAT_BC3_UNORM_BLOCK, VK_FORMAT_R32G32B32A32_UINT, "BC3, Zink upload through a pixel buffer", d);
+            test_zink_upload(VK_FORMAT_BC1_RGBA_UNORM_BLOCK, VK_FORMAT_R16G16B16A16_UINT, "BC1 RGBA, Zink upload through a pixel buffer", d);
+        }
+        zink_style = 0;
+    }
     printf("%s\n", failures ? "FAILED" : "OK");
     return failures ? 1 : 0;
 }

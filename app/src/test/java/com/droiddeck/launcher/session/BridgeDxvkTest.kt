@@ -17,7 +17,6 @@ import org.robolectric.RuntimeEnvironment
 import org.robolectric.annotation.Config
 import java.io.File
 
-/** The DXVK picked for a bridge session from the Vulkan the games see (ComponentsManager.bridgeDxvk). */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [28], manifest = Config.NONE)
 class BridgeDxvkTest {
@@ -25,7 +24,6 @@ class BridgeDxvkTest {
     private val mid = ComponentsManager.DXVK_FOR_VULKAN_1_3_NO_INT64
     private lateinit var context: Context
 
-    // A tester's OnePlus Ace 2V: Mali-G710 MC10, driver r32p1.
     private val g710 = AppVulkan(1, 1, shaderInt64 = false, maxPushConstants = 128, source = "driver")
     private val promoted = g710.copy(minor = 2, source = "bridge")
     private val full = AppVulkan(1, 3, shaderInt64 = true, maxPushConstants = 256, source = "driver")
@@ -72,13 +70,10 @@ class BridgeDxvkTest {
 
     @Test fun withoutPromotionOnTheDriversVersionCounts() {
         val g710File = g710.copy(source = "bridge")
-        // promotion off: the server offers the driver's version
         val off = "device=Mali-G710 MC10\napi=1.1.177\ndriver_api=1.1.177\npromotion=off\nshader_int64=0\nmax_push_constants=128\n"
         assertEquals(g710File, AppVulkan.fromBridgeFile(off, "Mali-G710 MC10", "1.1.177"))
-        // a file from before the field: its api may be a promotion nobody turned on
         val old = "device=Mali-G710 MC10\napi=1.3.177\ndriver_api=1.1.177\nshader_int64=0\nmax_push_constants=128\n"
         assertEquals(g710File, AppVulkan.fromBridgeFile(old, "Mali-G710 MC10"))
-        // and a file written for another driver version is stale
         assertNull(AppVulkan.fromBridgeFile(off, "Mali-G710 MC10", "1.3.212"))
     }
 
@@ -185,7 +180,6 @@ class BridgeDxvkTest {
         val undo: (String, String) -> String = { id, comp -> ComponentsManager.undoAutoChoice(context, id, comp) }
         run(g710, applyAuto = auto, undoAuto = undo)
         assertEquals("DXVK 1.10.3", d3d11.readText())
-        // bridge off (or not a bridge session): even with nothing known of the Vulkan
         run(null, bridge = false, applyAuto = auto, undoAuto = undo)
         assertEquals("bundled DXVK experimental-11", d3d11.readText())
         assertNull(state().getJSONObject("active").optJSONObject("proton-exp")?.optJSONObject("dxvk"))
@@ -229,7 +223,9 @@ class BridgeDxvkTest {
         undoAuto: (String, String) -> String = { id, comp -> error("undo $id $comp") },
     ) = ComponentsManager.ensureForcedPackages(
         context, mali,
-        lookup = { file, release -> ComponentsManager.CatalogItem(file, "dxvk", release, "https://example.invalid/$file", 4, "sha256:" + "ab".repeat(32)) },
+        // The listing carries the build MaliBridge pinned (CatalogPinGoldenTest covers one that moved).
+        lookup = { file, release -> ComponentsManager.CatalogItem(file, "dxvk", release, "https://example.invalid/$file", 4,
+            "sha256:" + (com.droiddeck.launcher.core.CatalogPins.nightlySha256(release, file) ?: "ab".repeat(32))) },
         fetch = {},
         apply = { id, file -> error("non-automatic apply $id $file") },
         vulkan = vk, bridgeSession = bridge, applyAuto = applyAuto, undoAuto = undoAuto, keepProtonDxvk = keep,

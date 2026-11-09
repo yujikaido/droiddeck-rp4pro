@@ -21,7 +21,8 @@ cd "$(dirname "$0")"
 out=${VKB_OUT:-$PWD/out}
 work=$(mktemp -d)
 cache=$work/c
-mkdir -p "$cache"
+mkdir -p "$cache" "$cache/dump-spirv" # the server reads dump-spirv's presence once, at its first module (vkb_emu_dumping):
+# made before it starts, or an emulation's module (a Mali profile's) would fix it at "absent" before the hang-detector step
 sock=${XDG_RUNTIME_DIR:-/tmp}/vkbridge-bitwise-$$.sock
 log=$work/server.log
 srv=
@@ -146,7 +147,7 @@ grep "^TOTAL" "$work/corpus.log" | sed 's/^/    /'
 step $? "corpus: $(grep -o '[0-9]* modules, .* rewritten ([0-9.]*%)' "$work/corpus.log" | head -1); spirv-val: ${vok:-?} clean, ${vbad:-?} invalid, ${vskip:-?} with an invalid input"
 
 # 8
-grep -q "^#define VKB_PROTOCOL_HASH 0x4a9da939fdf65896ULL" ../common/gen/vkb_gen.h
+grep -q "^#define VKB_PROTOCOL_HASH 0x339e552905c4871cULL" ../common/gen/vkb_gen.h
 step $? "protocol hash $(grep -o '0x[0-9a-f]*' ../common/gen/vkb_gen.h | head -1)"
 
 if [ $fails = 0 ]; then echo "OK: $steps steps"; else echo "FAILED: $fails of $steps steps"; exit 1; fi

@@ -63,7 +63,12 @@ EXT_BLOCK_SUBSTR = [
 STRUCT_BLOCK = {'VkAllocationCallbacks', 'VkDebugUtilsMessengerCreateInfoEXT',
                 'VkDebugReportCallbackCreateInfoEXT', 'VkValidationFeaturesEXT',
                 'VkValidationFlagsEXT', 'VkLayerSettingsCreateInfoEXT',
-                'VkDirectDriverLoadingListLUNARG', 'VkExportMetalObjectCreateInfoEXT'}
+                'VkDirectDriverLoadingListLUNARG', 'VkExportMetalObjectCreateInfoEXT',
+                # present ids and waits are the client's own (client/wsi.c): never sent, and the
+                # server's driver is not asked for them
+                'VkPresentIdKHR', 'VkPhysicalDevicePresentIdFeaturesKHR', 'VkPhysicalDevicePresentWaitFeaturesKHR',
+                'VkPresentId2KHR', 'VkPhysicalDevicePresentId2FeaturesKHR', 'VkSurfaceCapabilitiesPresentId2KHR',
+                'VkPhysicalDevicePresentWait2FeaturesKHR', 'VkSurfaceCapabilitiesPresentWait2KHR', 'VkPresentWait2InfoKHR'}
 EXT_AUTHORS = ('KHR', 'EXT', 'ARM', 'VALVE', 'GOOGLE', 'MESA', 'IMG')
 # Implemented by the client itself (no server round trip, or not on the wire at all).
 CLIENT_EXTENSIONS = {
@@ -71,6 +76,7 @@ CLIENT_EXTENSIONS = {
     'VK_KHR_xlib_surface', 'VK_EXT_headless_surface', 'VK_KHR_get_surface_capabilities2',
     'VK_EXT_swapchain_colorspace', 'VK_KHR_incremental_present', 'VK_EXT_debug_utils',
     'VK_KHR_swapchain_mutable_format',
+    'VK_KHR_present_id', 'VK_KHR_present_wait', 'VK_KHR_present_id2', 'VK_KHR_present_wait2',
 }
 # Extension commands handled entirely client-side (no wire code generated).
 LOCAL_COMMANDS_PREFIX = ('vkCreateDebugUtilsMessengerEXT', 'vkDestroyDebugUtilsMessengerEXT',
@@ -93,6 +99,9 @@ CLIENT_CUSTOM = {
     'vkGetPhysicalDeviceSparseImageFormatProperties', 'vkGetPhysicalDeviceSparseImageFormatProperties2',
     'vkGetPhysicalDeviceToolProperties',
     'vkCreateDevice', 'vkDestroyDevice', 'vkGetDeviceQueue', 'vkGetDeviceQueue2',
+    'vkCreateFence', 'vkDestroyFence', 'vkResetFences', 'vkQueueBindSparse', 'vkCreateEvent', 'vkDestroyEvent',
+    'vkSetEvent', 'vkResetEvent', 'vkCmdSetEvent', 'vkCmdResetEvent', 'vkCmdSetEvent2', 'vkCmdResetEvent2',
+    'vkCreateSemaphore', 'vkDestroySemaphore', 'vkSignalSemaphore',
     'vkAllocateCommandBuffers', 'vkFreeCommandBuffers', 'vkDestroyCommandPool', 'vkResetCommandPool',
     'vkBeginCommandBuffer', 'vkEndCommandBuffer', 'vkResetCommandBuffer',
     'vkAllocateMemory', 'vkFreeMemory', 'vkMapMemory', 'vkUnmapMemory', 'vkMapMemory2KHR',
@@ -105,7 +114,7 @@ CLIENT_CUSTOM = {
     'vkUpdateDescriptorSetWithTemplate', 'vkCmdPushDescriptorSetWithTemplateKHR',
     'vkCreatePrivateDataSlot', 'vkDestroyPrivateDataSlot', 'vkSetPrivateData', 'vkGetPrivateData',
     'vkQueueSubmit', 'vkQueueSubmit2', 'vkQueueWaitIdle', 'vkDeviceWaitIdle', 'vkWaitForFences',
-    'vkGetFenceStatus', 'vkWaitSemaphores', 'vkGetSemaphoreCounterValue',
+    'vkGetFenceStatus', 'vkResetFences', 'vkSetEvent', 'vkResetEvent', 'vkWaitSemaphores', 'vkGetSemaphoreCounterValue',
     'vkGetPhysicalDeviceExternalBufferProperties', 'vkGetPhysicalDeviceQueueFamilyProperties',
     'vkGetPhysicalDeviceQueueFamilyProperties2', 'vkSetDebugUtilsObjectNameEXT',
     'vkSetDebugUtilsObjectTagEXT', 'vkQueueBeginDebugUtilsLabelEXT', 'vkQueueEndDebugUtilsLabelEXT',
@@ -119,7 +128,24 @@ CLIENT_CUSTOM = {
     'vkGetQueryPoolResults', 'vkGetEventStatus', 'vkSetEvent', 'vkCreateBufferView', 'vkDestroyBufferView',
     'vkCreateQueryPool', 'vkDestroyQueryPool', 'vkResetQueryPool', 'vkCmdResetQueryPool', 'vkCmdEndQuery',
     'vkCmdEndQueryIndexedEXT', 'vkCmdWriteTimestamp', 'vkCmdWriteTimestamp2', 'vkCreateCommandPool',
+    'vkCmdEndRenderPass', 'vkCmdEndRenderPass2', 'vkCmdBeginRendering', 'vkCmdEndRendering', 'vkCmdEndRendering2KHR',
+    'vkGetSemaphoreFdKHR', 'vkGetMemoryFdKHR',
     }
+# Server handlers that note their arguments for the crash line (server_crashctx.c) right before
+# the driver's call - a few stores each; a note that returns non-zero leaves the call out (a
+# vkCmdBindPipeline of VK_NULL_HANDLE). After: what the call made, for the crash line's lookups.
+SERVER_NOTE = {
+    'vkBindImageMemory': 'vkb_srv_note_bind_image(image, memory, memoryOffset);',
+    'vkBindImageMemory2': 'vkb_srv_note_bind_image2(bindInfoCount, pBindInfos);',
+    'vkCmdBindPipeline': 'if (vkb_srv_note_bind_pipeline(pipelineBindPoint, pipeline)) return;',
+    'vkCmdSetLineWidth': 'vkb_srv_note_line_width(lineWidth);',
+    'vkCreateGraphicsPipelines': 'vkb_srv_pipe_snap snap_[VKB_PIPE_SNAP]; vkb_srv_note_pipelines_pre(snap_, createInfoCount, pCreateInfos);',
+    'vkCreateImage': 'VkFormat asked_format_ = pCreateInfo ? pCreateInfo->format : VK_FORMAT_UNDEFINED; VkImageTiling asked_tiling_ = pCreateInfo ? pCreateInfo->tiling : VK_IMAGE_TILING_OPTIMAL;',
+}
+SERVER_NOTE_AFTER = {
+    'vkCreateGraphicsPipelines': 'if (r_ >= 0) vkb_srv_note_pipelines(snap_, createInfoCount, pPipelines);',
+    'vkCreateImage': 'if (r_ == VK_SUCCESS && pCreateInfo && pImage) vkb_srv_note_image(c, device, pCreateInfo, *pImage, asked_format_, asked_tiling_);',
+}
 # Commands whose server handler is hand-written (server/*.c defines vkb_sv_<name>).
 SERVER_CUSTOM = {
     'vkCreateInstance', 'vkDestroyInstance', 'vkCreateDevice', 'vkDestroyDevice',
@@ -418,9 +444,11 @@ SERVER_DISPATCH_EXTRA = ['vkMapMemory', 'vkUnmapMemory', 'vkGetMemoryHostPointer
 dispatch_cmds = sorted(set(wire_cmds) | {reg.canon_cmd(c) for c in SERVER_DISPATCH_EXTRA})
 # Wire-only helpers that are not Vulkan commands (handled by hand on both sides).
 # vkbUpdateDescSets: vkUpdateDescriptorSets packed (client/descriptor.c); vkbBatch: queued
-# asynchronous requests as one message (client/conn.c, server_conn.c run_batch).
+# asynchronous requests as one message (client/conn.c, server_conn.c run_batch); vkbHitch: a frame
+# over VKBRIDGE_HITCH_MS, for the server's per-hitch line (client/hitch.c, server_hitch.c);
+# vkbLatency: each present's stage times, VKBRIDGE_LATLOG (client/latency.c, server_latency.c).
 EXTRA_WIRE = ['vkbHello', 'vkbQueryServer', 'vkbDescUpdateRaw', 'vkbPushDescRaw', 'vkbAllocDescSets', 'vkbAllocScanout',
-              'vkbUpdateDescSets', 'vkbBatch']
+              'vkbUpdateDescSets', 'vkbBatch', 'vkbHitch', 'vkbLatency']
 
 # --------------------------------------------------------------------------------------------
 # Struct closure: every struct reachable from wire commands (params, members, pNext extenders).
@@ -1331,8 +1359,12 @@ for c in wire_cmds:
         # where the device lacks the extension (Lee Gao, DroidDeck#165): asked only of one that has it.
         vw(f'if (!vkb_srv_pd_has_ext(c, {params[0].name}, "{g}")) {{ vkb_srv_unsupported(c, "{c}", "{g}"); return; }}')
     vw(f'if (!{fn}) {{ vkb_srv_missing(c, "{c}"); return; }}')
+    if c in SERVER_NOTE:
+        vw(SERVER_NOTE[c])
     if ret != 'void':
         vw(f'{ret} r_ = {fn}({", ".join(call_args)});')
+        if c in SERVER_NOTE_AFTER:
+            vw(SERVER_NOTE_AFTER[c])
         if c in FD_IMPORTS:
             fp = FD_IMPORTS[c]
             vw(f'if (r_ != VK_SUCCESS && {fp} && {fp}->fd >= 0) vkb_close_fd({fp}->fd);')

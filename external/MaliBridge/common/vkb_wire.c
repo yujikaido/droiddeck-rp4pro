@@ -139,7 +139,7 @@ static int enc_grow(vkb_enc *e, size_t add)
     return 1;
 }
 
-void vkb_enc_bytes(vkb_enc *e, const void *p, size_t n)
+void vkb_enc_bytes_slow(vkb_enc *e, const void *p, size_t n)
 {
     if (!n || !enc_grow(e, n)) return;
     if (p) memcpy(e->buf + e->len, p, n);
@@ -147,14 +147,17 @@ void vkb_enc_bytes(vkb_enc *e, const void *p, size_t n)
     e->len += n;
 }
 
-void vkb_enc_u8(vkb_enc *e, uint8_t v) { vkb_enc_bytes(e, &v, 1); }
-void vkb_enc_u32(vkb_enc *e, uint32_t v) { vkb_enc_bytes(e, &v, 4); }
-void vkb_enc_u64(vkb_enc *e, uint64_t v) { vkb_enc_bytes(e, &v, 8); }
-
 static void enc_align(vkb_enc *e)
 {
     size_t pad = (8 - (e->len & 7)) & 7;
-    if (pad) vkb_enc_bytes(e, NULL, pad);
+    if (!pad) return;
+    /* the padding is zeros: one 8-byte store (room for it checked), then len moves by pad */
+    if (!e->oom && e->cap - e->len >= 8) {
+        memset(e->buf + e->len, 0, 8);
+        e->len += pad;
+        return;
+    }
+    vkb_enc_bytes_slow(e, NULL, pad);
 }
 
 size_t vkb_enc_raw(vkb_enc *e, const void *p, size_t n)
@@ -233,11 +236,34 @@ void vkb_enc_append(vkb_enc *e, const vkb_enc *src)
     vkb_enc_bytes(e, src->buf, src->len);
 }
 
+/* Structures the client answers itself, never sent and not worth a warning: present ids and waits
+ * (client/wsi.c; their features in vkGetPhysicalDeviceFeatures2 and vkCreateDevice chains, the
+ * ids in vkQueuePresentKHR's). */
+static int client_side(VkStructureType t)
+{
+    switch ((int)t) {
+    case VK_STRUCTURE_TYPE_PRESENT_ID_KHR:
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR:
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR:
+    case VK_STRUCTURE_TYPE_PRESENT_ID_2_KHR:
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_2_FEATURES_KHR:
+    case VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_PRESENT_ID_2_KHR:
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_2_FEATURES_KHR:
+    case VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_PRESENT_WAIT_2_KHR:
+    case VK_STRUCTURE_TYPE_PRESENT_WAIT_2_INFO_KHR: return 1;
+    default: return 0;
+    }
+}
+
 static const VkBaseInStructure *next_known(const void *p)
 {
     const VkBaseInStructure *b = p;
     while (b) {
         if (vkb_struct_size(b->sType)) return b;
+        if (client_side(b->sType)) {
+            b = b->pNext;
+            continue;
+        }
         VKB_ONCE(VKB_LOG_WARN, "pNext: structure type %d is not bridged; dropped (logged once)", (int)b->sType);
         b = b->pNext;
     }
@@ -293,6 +319,10 @@ static const VkBaseInStructure *next_known_out(const void *p)
     const VkBaseInStructure *b = p;
     while (b) {
         if (vkb_struct_size(b->sType)) return b;
+        if (client_side(b->sType)) {
+            b = b->pNext;
+            continue;
+        }
         VKB_ONCE(VKB_LOG_WARN, "output pNext: structure type %d is not bridged; left unfilled (logged once)", (int)b->sType);
         b = b->pNext;
     }
@@ -350,7 +380,7 @@ void vkb_dec_init(vkb_dec *d, const void *buf, size_t len, vkb_arena *a, int *fd
     d->nfds = nfds;
 }
 
-void vkb_dec_bytes(vkb_dec *d, void *dst, size_t n)
+void vkb_dec_bytes_slow(vkb_dec *d, void *dst, size_t n)
 {
     if (d->err || d->len - d->pos < n) {
         d->err = 1;
@@ -360,10 +390,6 @@ void vkb_dec_bytes(vkb_dec *d, void *dst, size_t n)
     if (dst) memcpy(dst, d->buf + d->pos, n);
     d->pos += n;
 }
-
-uint8_t vkb_dec_u8(vkb_dec *d) { uint8_t v; vkb_dec_bytes(d, &v, 1); return v; }
-uint32_t vkb_dec_u32(vkb_dec *d) { uint32_t v; vkb_dec_bytes(d, &v, 4); return v; }
-uint64_t vkb_dec_u64(vkb_dec *d) { uint64_t v; vkb_dec_bytes(d, &v, 8); return v; }
 
 static void dec_align(vkb_dec *d)
 {

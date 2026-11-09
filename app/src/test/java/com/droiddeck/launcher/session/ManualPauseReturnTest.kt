@@ -10,7 +10,7 @@ class ManualPauseReturnTest {
     }
 
     @Test fun aPauseHeldOffWhileSteamUpdatedIsDroppedOnReturn() {
-        // The player leaves during the client update and comes back 3 s later.
+        // the player left during the client update and came back 3 s later; the held pause then froze the update.
         assertFalse(SessionService.manualPauseOnReturn(requested = true, suspended = false))
         assertFalse(SessionService.manualPauseOnReturn(requested = false, suspended = false))
     }

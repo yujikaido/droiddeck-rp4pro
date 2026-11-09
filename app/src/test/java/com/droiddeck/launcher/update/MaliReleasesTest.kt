@@ -59,6 +59,7 @@ class MaliReleasesTest {
         assertTrue(MaliReleases.compare("v0.5.4", "v0.5.3.1")!! > 0)
         assertTrue(MaliReleases.compare("v0.10", "v0.9.9")!! > 0)
         assertTrue(MaliReleases.compare("v0.5.3.1", "v0.5.3")!! > 0)
+        assertTrue(MaliReleases.compare("v0.5.5.1", "v0.5.5")!! > 0)
         assertEquals(0, MaliReleases.compare("v0.5", "0.5.0"))
         assertTrue(MaliReleases.compare("v1.0", "v0.99")!! > 0)
     }
@@ -91,6 +92,10 @@ class MaliReleasesTest {
         assertEquals(Standing.CURRENT, MaliReleases.standing("v0.5.5", newer))
         assertEquals(Standing.CURRENT, MaliReleases.standing("v0.5.6", newer))
         assertEquals(Standing.UNKNOWN, MaliReleases.standing("", newer))
+        val hotfix = MaliReleases.parseRelease(releaseJson("v0.5.5.1"), repo)
+        assertEquals(Standing.NEWER, MaliReleases.standing("v0.5.5", hotfix))
+        assertEquals(Standing.CURRENT, MaliReleases.standing("v0.5.5.1", hotfix))
+        assertEquals(Standing.CURRENT, MaliReleases.standing("v0.5.5.1", newer))
         val bare = MaliReleases.parseRelease(releaseJson("v0.5.5", emptyList()), repo)
         assertEquals(Standing.NO_APK, MaliReleases.standing("v0.5.4", bare))
     }
@@ -144,6 +149,8 @@ class MaliReleasesTest {
         assertEquals("DroidDeck-MaliBridge-v0.5.3-test.apk", MaliReleases.pickApk(listOf(asset("DroidDeck-MaliBridge-v0.5.3-test.apk")), "v0.5.3")!!.name)
         assertNull(MaliReleases.pickApk(listOf(asset("DroidDeck-MaliBridge-v0.5.3-test.apk")), "v0.5.3.1"))
         assertNull(MaliReleases.pickApk(listOf(asset("DroidDeck-MaliBridge-v0.5.4.apk")), "v0.5.5"))
+        assertEquals("DroidDeck-MaliBridge-v0.5.5.1.apk",
+            MaliReleases.pickApk(listOf(asset("DroidDeck-MaliBridge-v0.5.5.1.apk")), "v0.5.5.1")!!.name)
     }
 
     @Test fun picksNoApkWhenItWouldBeAGuess() {

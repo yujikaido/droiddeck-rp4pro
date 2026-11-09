@@ -2,6 +2,7 @@
 import base64
 import ctypes
 import json
+import math
 import os
 import runpy
 import select
@@ -15,6 +16,56 @@ import time
 HERE = os.path.dirname(os.path.realpath(__file__))
 COMPAT = runpy.run_path(os.path.join(HERE, "steam-compatibility"))
 BINDING = "droiddeckCompatChanged"
+BRIGHTNESS_BINDING = "droiddeckBrightnessChanged"
+CONTROLS_DIR = "/etc/droiddeck-device-controls"
+BRIGHTNESS_JS = r"""
+(() => {
+  if (window.__droiddeckBrightness) return "present";
+  const display = SteamClient.System?.Display;
+  if (!display?.RegisterForBrightnessChanges || !display?.SetBrightness) return "unavailable";
+  const self = { expected: null, updating: true, revision: 0, localAt: -Infinity };
+  // A held stick steps Steam faster than Android's readback returns; those stale readbacks would snap the slider back.
+  const HOLD_MS = 750;
+  // Returns "held" while a readback is being ignored, so the caller retries it after the hold.
+  self.set = value => {
+    if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 1) return true;
+    if (performance.now() - self.localAt < HOLD_MS) return "held";
+    if (!self.updating && self.expected !== null && Math.abs(value - self.expected) < 0.0001) return true;
+    self.expected = value;
+    self.updating = true;
+    const revision = ++self.revision;
+    setTimeout(() => { if (self.revision === revision) self.updating = false; }, 500);
+    display.SetBrightness(value);
+    return true;
+  };
+  self.subscription = display.RegisterForBrightnessChanges(state => {
+    const value = state?.flBrightness;
+    if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 1 || self.expected === null) return;
+    if (Math.abs(value - self.expected) < 0.0001) { self.updating = false; return; }
+    if (self.updating) { self.updating = false; return; }
+    self.expected = value;
+    self.localAt = performance.now();
+    if (typeof window.__BINDING__ === "function") window.__BINDING__(String(value));
+  });
+  window.__droiddeckBrightness = self;
+  return "installed";
+})()
+""".replace("__BINDING__", BRIGHTNESS_BINDING)
+
+
+def brightness_request(payload, directory=CONTROLS_DIR):
+    try:
+        value = float(payload)
+        if not math.isfinite(value) or not 0 <= value <= 1:
+            return
+        path = os.path.join(directory, "brightness.request")
+        with open(path + ".tmp", "w") as target:
+            target.write(str(value) + "\n")
+        os.replace(path + ".tmp", path)
+    except (ValueError, TypeError, OSError):
+        return
+
+
 INSTALL_JS = r"""
 (() => {
   if (window.__droiddeckCompat) return "present";
@@ -105,7 +156,7 @@ INSTALL_JS = r"""
     const body = [];
     uint(1, appid, body);
     const r = await send("CompatManager.GetCompatTools#1", body);
-    if (!r.ok) throw new Error("GetCompatTools " + appid + " failed (" + r.eresult + " " + r.error + ")");
+    if (!r.ok) throw Object.assign(new Error("GetCompatTools " + appid + " failed (" + r.eresult + " " + r.error + ")"), { eresult: r.eresult });
     return { selected: text(r.body, 3), fallback: text(r.body, 4), tools: (r.body[1] || []).map((t) => text(parse(t), 1)) };
   };
   self.set = async (appid, name) => {
@@ -119,13 +170,42 @@ INSTALL_JS = r"""
   };
   self.many = async (apps) => {
     const out = {};
-    for (const app of apps) out[app] = (await self.get(Number(app))).selected;
+    for (const app of apps) {
+      try {
+        out[app] = (await self.get(Number(app))).selected;
+      } catch (e) {
+        if (e.eresult !== 128) throw e;
+      }
+    }
     return out;
   };
   window.__droiddeckCompat = self;
   return "installed";
 })()
 """.replace("__BINDING__", BINDING)
+TOOLS_JS = r"""
+(() => {
+  if (window.__droiddeckTools) return "present";
+  const installs = SteamClient.Installs, downloads = SteamClient.Downloads;
+  if (typeof installs?.OpenInstallWizard !== "function" || typeof installs?.RegisterForShowInstallWizard !== "function" ||
+      typeof installs?.ContinueInstall !== "function" || typeof downloads?.QueueAppUpdate !== "function")
+    throw new Error("the client's install calls are not ready");
+  const self = { asked: new Map() };
+  installs.RegisterForShowInstallWizard((state) => {
+    const app = Number(state?.currentAppID);
+    if (state?.eInstallState === 7 && Date.now() - (self.asked.get(app) || 0) < 120000) {
+      self.asked.delete(app);
+      installs.ContinueInstall();
+    }
+  });
+  self.install = (app) => { self.asked.set(app, Date.now()); installs.OpenInstallWizard([app], "0"); return true; };
+  self.update = (app) => { downloads.QueueAppUpdate(app, "0"); return true; };
+  window.__droiddeckTools = self;
+  return "installed";
+})()
+"""
+TOOL_CHECK_SECONDS = 60
+TOOL_RETRY_SECONDS = 300
 SWITCH_BINDING = "droiddeckSwitchToDesktop"
 SWITCH_JS = r"""
 (() => {
@@ -152,7 +232,326 @@ SWITCH_JS = r"""
   return "installed";
 })()
 """.replace("__BINDING__", SWITCH_BINDING)
+PICK_BINDING = "droiddeckCompatPicked"
+# The Steam UI sends the player's tool choices (CompatManager.SpecifyCompatTool: the general default, or one
+# game) over its transport socket. Seeing them is the only way to tell "the player picked the tool the game
+# already had" from "the game follows the default"; this helper's own socket is left out. The payload is
+# "<app id>\t<tool name>" (an empty name = the pick was cleared); the client's mapping confirms it later.
+PICK_JS = r"""
+(() => {
+  if (window.__droiddeckPicks) return "present";
+  const dec = new TextDecoder();
+  const needle = new TextEncoder().encode("CompatManager.SpecifyCompatTool#");
+  const send = WebSocket.prototype.send;
+  const varint = (b, at) => { let r = 0n, s = 0n, x; do { x = b[at.i++]; r |= BigInt(x & 0x7f) << s; s += 7n; } while ((x & 0x80) && at.i <= b.length); return r; };
+  const fields = (b) => {
+    const f = {}, at = { i: 0 };
+    while (at.i < b.length) {
+      const k = Number(varint(b, at)), n = k >> 3, w = k & 7;
+      let v;
+      if (w === 0) v = varint(b, at);
+      else if (w === 1) { at.i += 8; continue; }
+      else if (w === 5) { at.i += 4; continue; }
+      else if (w === 2) { const len = Number(varint(b, at)); v = b.subarray(at.i, at.i + len); at.i += len; }
+      else return f;
+      (f[n] = f[n] || []).push(v);
+    }
+    return f;
+  };
+  const pick = (data) => {
+    const bytes = data instanceof ArrayBuffer ? new Uint8Array(data)
+      : ArrayBuffer.isView(data) ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength) : null;
+    if (!bytes || bytes.length < 12) return null;
+    const end = Math.min(bytes.length, 256) - needle.length;
+    let found = false;
+    for (let i = 8; i <= end && !found; i++) {
+      let j = 0;
+      while (j < needle.length && bytes[i + j] === needle[j]) j++;
+      found = j === needle.length;
+    }
+    if (!found) return null;
+    const length = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(4, true);
+    if (8 + length > bytes.length) return null;
+    const header = fields(bytes.subarray(8, 8 + length));
+    if (!header[12] || !dec.decode(header[12][0]).startsWith("CompatManager.SpecifyCompatTool#")) return null;
+    const body = fields(bytes.subarray(8 + length));
+    return String(body[1] ? body[1][0] : 0n) + "\t" + (body[2] ? dec.decode(body[2][0]) : "");
+  };
+  WebSocket.prototype.send = function (data) {
+    try {
+      const own = window.__droiddeckCompat && this === window.__droiddeckCompat.ws;
+      if (!own && typeof window.__BINDING__ === "function") {
+        const payload = pick(data);
+        if (payload !== null) window.__BINDING__(payload);
+      }
+    } catch (e) {
+    }
+    return send.call(this, data);
+  };
+  window.__droiddeckPicks = true;
+  return "installed";
+})()
+""".replace("__BINDING__", PICK_BINDING)
 SESSION_SELECT = "/usr/bin/steamos-session-select"
+# Steam opens its Steam Controller welcome tour at every start while the client setting
+# controller_show_ibex_tour (CMsgClientSettings field 140014) is on, and only a finished tour turns it
+# off; closing it leaves it on. The app's pad is an emulated controller, so the tour never applies.
+# A pending firmware update still opens Steam's updater, which checks the update priority instead.
+TOUR_JS = r"""
+(() => {
+  let key = 140014 * 8;
+  const bytes = [];
+  while (key > 127) { bytes.push((key & 127) | 128); key = Math.floor(key / 128); }
+  bytes.push(key, 0);
+  SteamClient.Settings.SetSetting(btoa(String.fromCharCode(...bytes)));
+  return "off";
+})()
+"""
+# Steam keeps the Quick Access Frame Limit as the client setting gamescope_app_target_framerate
+# (CMsgClientSettings field 21002) and offers the values gamescope's display state lists in
+# active_display_info.supported_frame_rates. When the panel's refresh rate changes, a remembered
+# limit that is not one of the new values leaves the slider on its first value while the game runs
+# at the old limit. The limit is kept when it is still offered and moved to the highest value
+# otherwise. Choices are read once they have been unchanged for a moment, since a mode switch can
+# report a passing rate first.
+FRAME_LIMIT_JS = r"""
+(() => {
+  if (window.__droiddeckFrameLimit) return "present";
+  const settings = window.settingsStore;
+  let service = null;
+  try {
+    // Steam's webpack does not expose its module cache; the gamescope service client is found by
+    // the calls its module makes and loaded by id.
+    let require;
+    window.webpackChunksteamui.push([[Symbol("droiddeck-frame-limit")], {}, r => { require = r; }]);
+    for (const id of Object.keys(require.m || {})) {
+      const source = String(require.m[id]);
+      if (!source.includes("SetBlurParams") || !source.includes("RegisterForNotifyStateChanged")) continue;
+      let exports;
+      try { exports = require(id); } catch (e) { continue; }
+      if (!exports || typeof exports !== "object") continue;
+      service = Object.values(exports).find(value => value && typeof value.GetState === "function" &&
+        typeof value.RegisterForNotifyStateChanged === "function" && typeof value.SetBlurParams === "function");
+      if (service) break;
+    }
+  } catch (e) {
+    service = null;
+  }
+  if (!service || !settings?.clientSettings || typeof SteamClient.Settings?.SetSetting !== "function") return "unavailable";
+  const self = { timer: null };
+  const write = value => {
+    const bytes = [];
+    for (let n of [21002 * 8, value]) {
+      while (n > 127) { bytes.push((n & 127) | 128); n = Math.floor(n / 128); }
+      bytes.push(n);
+    }
+    return SteamClient.Settings.SetSetting(btoa(String.fromCharCode(...bytes)));
+  };
+  self.check = async () => {
+    let rates;
+    try {
+      const reply = await service.GetState({});
+      if (!reply.BSuccess()) return;
+      rates = reply.Body().toObject().state?.active_display_info?.supported_frame_rates;
+    } catch (e) {
+      return;
+    }
+    if (!Array.isArray(rates) || rates.length === 0) return;
+    const current = settings.clientSettings;
+    if (!current.gamescope_enable_app_target_framerate || rates.includes(current.gamescope_app_target_framerate)) return;
+    try {
+      await write(Math.max(...rates));
+    } catch (e) {
+    }
+  };
+  self.schedule = () => {
+    clearTimeout(self.timer);
+    self.timer = setTimeout(self.check, 1500);
+  };
+  self.subscription = service.RegisterForNotifyStateChanged(self.schedule);
+  self.interval = setInterval(self.schedule, 5000);
+  self.schedule();
+  window.__droiddeckFrameLimit = self;
+  return "installed";
+})()
+"""
+FILE_BINDING = "droiddeckOpenFileDialog"
+FILE_JS = r"""
+(() => {
+  const cancelled = () => ({ result: 2, message: "" });
+  if (window.__droiddeckFiles) {
+    window.__droiddeckFiles.cancelAll();
+    return "present";
+  }
+  const self = { next: 0, pending: new Map() };
+  const open = function (options) {
+    return new Promise((resolve, reject) => {
+      if (typeof window.__BINDING__ !== "function") { reject(cancelled()); return; }
+      const id = ++self.next;
+      self.pending.set(id, { resolve, reject });
+      try { window.__BINDING__(JSON.stringify({ id, options: options || {} })); }
+      catch (e) { self.pending.delete(id); reject(cancelled()); }
+    });
+  };
+  self.done = (id, path) => {
+    const item = self.pending.get(id);
+    if (!item) return false;
+    self.pending.delete(id);
+    if (typeof path === "string" && path) item.resolve(path); else item.reject(cancelled());
+    return true;
+  };
+  self.cancelAll = () => {
+    const items = Array.from(self.pending.values());
+    self.pending.clear();
+    for (const item of items) item.reject(cancelled());
+  };
+  const patch = (w) => {
+    const system = w?.SteamClient?.System;
+    if (system && system.OpenFileDialog !== open) system.OpenFileDialog = open;
+  };
+  patch(window);
+  if (SteamClient.System.OpenFileDialog !== open) throw new Error("Steam OpenFileDialog could not be redirected");
+  const popups = window.g_PopupManager;
+  if (popups) {
+    for (const popup of popups.GetPopups?.() || []) patch(popup.window);
+    popups.AddPopupCreatedCallback?.((popup) => patch(popup.window));
+  }
+  window.__droiddeckFiles = self;
+  return "installed";
+})()
+""".replace("__BINDING__", FILE_BINDING)
+VR_BINDING = "droiddeckLaunchSteamVr"
+VR_HELPER = "/usr/local/bin/droiddeck-steamvr"
+VR_JS = r"""
+(() => {
+  if (window.__droiddeckSteamVr) return "present";
+  const apps = SteamClient.Apps;
+  if (!apps || typeof apps.RunGame !== "function") throw new Error("Steam RunGame is not ready");
+  const run = apps.RunGame;
+  const self = { running: false, pending: new Map(), lastError: null };
+  const flush = () => {
+    if (!self.running) return;
+    const queued = Array.from(self.pending.values());
+    self.pending.clear();
+    for (const item of queued) {
+      clearTimeout(item.timer);
+      run.call(item.receiver, item.id, ...item.args);
+    }
+  };
+  if (typeof SteamClient.OpenVR?.RegisterForVRModeChange === "function") {
+    self.subscription = SteamClient.OpenVR.RegisterForVRModeChange(running => {
+      self.running = !!running;
+      flush();
+    });
+  }
+  const wrapped = function (id, ...args) {
+    const gameid = String(id);
+    if (typeof window.__BINDING__ !== "function") return run.call(this, id, ...args);
+    if (gameid === "250820") {
+      window.__BINDING__(gameid);
+      return;
+    }
+    const overview = window.appStore?.GetAppOverviewByGameID?.(gameid);
+    const vr = overview?.vr_only === true;
+    if (vr && self.subscription && /^[1-9][0-9]{0,19}$/.test(gameid)) {
+      if (self.pending.has(gameid)) return;
+      self.lastError = null;
+      const item = { receiver: this, id, args, timer: null };
+      item.timer = setTimeout(() => {
+        self.pending.delete(gameid);
+        self.lastError = "SteamVR did not become ready. Start SteamVR from DroidDeck and try the game again.";
+        console.error("DroidDeck: " + self.lastError);
+      }, 600000);
+      self.pending.set(gameid, item);
+      try { window.__BINDING__(gameid); }
+      catch (e) { clearTimeout(item.timer); self.pending.delete(gameid); throw e; }
+      flush();
+      return;
+    }
+    return run.call(this, id, ...args);
+  };
+  apps.RunGame = wrapped;
+  if (apps.RunGame !== wrapped) throw new Error("Steam RunGame could not be redirected");
+  if (typeof SteamClient.OpenVR?.StartVR === "function") {
+    const start = SteamClient.OpenVR.StartVR;
+    SteamClient.OpenVR.StartVR = function (...args) {
+      if (typeof window.__BINDING__ === "function") return window.__BINDING__("250820");
+      return start.apply(this, args);
+    };
+  }
+  window.__droiddeckSteamVr = self;
+  return "installed";
+})()
+""".replace("__BINDING__", VR_BINDING)
+
+
+def launch_steamvr():
+    """Keep downloads/startup off the Steam UI bridge's event loop."""
+    say("SteamVR library launch: using the DroidDeck ARM64 helper")
+    state = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "droiddeck-steamvr")
+    try:
+        os.makedirs(state, exist_ok=True)
+        with open(os.path.join(state, "library-launch.log"), "a") as log:
+            return subprocess.Popen([VR_HELPER, "launch"], stdin=subprocess.DEVNULL,
+                                    stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    except OSError as e:
+        say("SteamVR library launch failed: %s" % e)
+
+
+def choose_file(options):
+    import gi
+    gi.require_version("Gdk", "3.0")
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import Gdk, Gtk
+    directory = bool(options.get("bChooseDirectory"))
+    save = bool(options.get("bSaveMode")) and not directory
+    action = (Gtk.FileChooserAction.SELECT_FOLDER if directory else
+              Gtk.FileChooserAction.SAVE if save else Gtk.FileChooserAction.OPEN)
+    dialog = Gtk.FileChooserDialog(title=str(options.get("strTitle") or ""), action=action)
+    dialog.add_buttons("gtk-cancel", Gtk.ResponseType.CANCEL,
+                       "gtk-save" if save else "gtk-open", Gtk.ResponseType.ACCEPT)
+    dialog.set_default_response(Gtk.ResponseType.ACCEPT)
+    dialog.set_local_only(True)
+    dialog.set_do_overwrite_confirmation(True)
+    for folder in ("/root/Storage", "/mnt/droiddeck-sd"):
+        if os.path.isdir(folder):
+            try:
+                dialog.add_shortcut_folder(folder)
+            except Exception:
+                pass
+    if not directory:
+        for entry in options.get("rgFilters") or []:
+            patterns = [str(p) for p in entry.get("rFilePatterns") or [] if p]
+            if not patterns:
+                continue
+            chosen = Gtk.FileFilter()
+            chosen.set_name(str(entry.get("strFileTypeName") or ", ".join(patterns)))
+            for pattern in patterns:
+                pattern = "*" if pattern == "*.*" else pattern
+                chosen.add_pattern(pattern)
+                if pattern.lower() != pattern.upper():
+                    chosen.add_pattern(pattern.upper())
+            dialog.add_filter(chosen)
+            if entry.get("bUseAsDefault"):
+                dialog.set_filter(chosen)
+    initial = str(options.get("strInitialFile") or "").strip('"')
+    if initial:
+        if os.path.isdir(initial):
+            dialog.set_current_folder(initial)
+        elif save:
+            if os.path.isdir(os.path.dirname(initial)):
+                dialog.set_current_folder(os.path.dirname(initial))
+            dialog.set_current_name(os.path.basename(initial))
+        elif os.path.exists(initial):
+            dialog.set_filename(initial)
+        elif os.path.isdir(os.path.dirname(initial)):
+            dialog.set_current_folder(os.path.dirname(initial))
+    screen = Gdk.Screen.get_default()
+    if screen is not None:
+        dialog.set_default_size(screen.get_width(), screen.get_height())
+    chosen_path = dialog.get_filename() if dialog.run() == Gtk.ResponseType.ACCEPT else None
+    dialog.destroy()
+    return chosen_path
 
 
 class Closed(Exception):
@@ -321,6 +720,9 @@ class Page:
             raise RuntimeError((details.get("exception") or {}).get("description") or details.get("text") or "script failed")
         return result.get("result", {}).get("value")
 
+    def tools(self, call):
+        return self.evaluate("%s;\nwindow.__droiddeckTools.%s" % (TOOLS_JS, call))
+
     def compat(self, call):
         return self.evaluate("%s;\nwindow.__droiddeckCompat.%s" % (INSTALL_JS, call))
 
@@ -397,14 +799,139 @@ class Watcher:
 
 
 class Helper:
-    def __init__(self, steam_root, port, steamos=False):
+    def __init__(self, steam_root, port, steamos=False, files_only=False):
         self.steam_root = steam_root
         self.port = port
         self.steamos = steamos
+        self.files_only = files_only
         self.page = None
         self.known = set()
         self.installed = None
         self.fex_asked = set()
+        self.tools_asked = {}
+        self.tools_checked = None
+        self.vr_launch = None
+        self.chooser = None
+        self.controls_state = None
+        self.controls_installed = False
+        self.frame_limit_state = None
+        self.frame_limit_retry = 0
+        self.claims = []
+        self.fresh_claims = False
+        self.retry_at = None
+        self.unlisted_said = None
+        self.warned = {}
+        self.tracker = COMPAT["GameRunTracker"]()
+        self.tail = COMPAT["GameLogTail"](os.path.join(steam_root, "logs", "gameprocess_log.txt"))
+        try:
+            # The helper starts before the client: earlier sessions' runs are skipped here, so a game the app starts the moment
+            # the client is up is not skipped with them.
+            self.tail.read()
+        except Exception:
+            pass
+        self.games_at = 0.0
+        self.missing_said = set()
+        self.pick_said = set()
+        self.install_asked = set()
+        self.blind_said = False
+
+    def sync_controls(self):
+        try:
+            with open(os.path.join(CONTROLS_DIR, "state.json")) as source:
+                state = json.load(source)
+            value = state.get("brightness")
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 <= value <= 1:
+                return
+            if not self.controls_installed:
+                self.page.call("Runtime.addBinding", {"name": BRIGHTNESS_BINDING})
+                self.controls_installed = self.page.evaluate(BRIGHTNESS_JS) in ("installed", "present")
+                if not self.controls_installed:
+                    return
+            if state != self.controls_state:
+                applied = self.page.evaluate("window.__droiddeckBrightness ? window.__droiddeckBrightness.set(%s) : false" % json.dumps(value))
+                if applied is True:
+                    self.controls_state = state
+                elif applied != "held":
+                    self.controls_installed = False
+                    self.controls_state = None
+        except (OSError, ValueError, TypeError):
+            pass
+
+    def sync_frame_limit(self):
+        # Steam can still be loading its settings and gamescope state when the helper attaches.
+        if self.frame_limit_state in ("installed", "present") or time.monotonic() < self.frame_limit_retry:
+            return
+        try:
+            state = self.page.evaluate(FRAME_LIMIT_JS)
+        except RuntimeError as e:
+            state = "failed (%s)" % e
+        if state != self.frame_limit_state:
+            say("frame limit sync: %s" % state)
+        self.frame_limit_state = state
+        self.frame_limit_retry = time.monotonic() + 10
+
+    def open_chooser(self, payload):
+        try:
+            request = json.loads(payload)
+            ident = int(request["id"])
+            options = request.get("options", {})
+            if not isinstance(options, dict):
+                raise ValueError("options are not an object")
+        except (ValueError, KeyError, TypeError) as e:
+            say("ignored a file dialog request (%s)" % e)
+            return
+        if self.chooser is not None:
+            self.finish_chooser(ident, None)
+            return
+        command = [sys.executable, os.path.realpath(__file__), "--choose-file"]
+        # Gamescope shows the dialog over the client by the AppId on a reaper above it; the x86-64 client has no
+        # native reaper, so the arm64 client's is borrowed when it is installed.
+        data = os.environ.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share")
+        for root in (self.steam_root, os.path.join(data, "Steam")):
+            reaper = os.path.join(root, "steamrtarm64", "reaper")
+            if os.access(reaper, os.X_OK):
+                command = [reaper, "SteamLaunch", "AppId=769", "--"] + command
+                break
+        try:
+            proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL, start_new_session=True)
+            proc.stdin.write(json.dumps(options).encode("utf-8"))
+            proc.stdin.close()
+        except OSError as e:
+            say("could not open a file dialog (%s)" % e)
+            self.finish_chooser(ident, None)
+            return
+        say("file dialog open: %s" % (options.get("strTitle") or "untitled"))
+        self.chooser = (ident, proc)
+
+    def chooser_done(self):
+        ident, proc = self.chooser
+        self.chooser = None
+        out = proc.stdout.read().decode("utf-8", "replace")
+        proc.stdout.close()
+        proc.wait()
+        if proc.returncode == 2:
+            say("file dialog needs GTK 3 and PyGObject, which come with the desktop")
+        try:
+            path = json.loads(out) if proc.returncode == 0 else None
+        except ValueError:
+            path = None
+        self.finish_chooser(ident, path if isinstance(path, str) and path else None)
+
+    def finish_chooser(self, ident, path):
+        say("file dialog %s" % ("chose " + path if path else "cancelled"))
+        self.page.evaluate("window.__droiddeckFiles?.done(%d, %s)" % (ident, json.dumps(path)))
+
+    def close_chooser(self):
+        if self.chooser is not None:
+            _, proc = self.chooser
+            self.chooser = None
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except OSError:
+                pass
+            proc.stdout.close()
+            proc.wait()
 
     def attach(self):
         path = shared_context(self.port)
@@ -414,19 +941,49 @@ class Helper:
         try:
             if page.evaluate("typeof SteamClient === 'object' && typeof SteamClient.WebUITransport === 'object'") is not True:
                 raise LookupError("SteamClient is not ready")
+            if self.files_only:
+                page.call("Runtime.addBinding", {"name": FILE_BINDING})
+                page.evaluate(FILE_JS)
+                self.page = page
+                self.controls_state = None
+                self.controls_installed = False
+                self.sync_controls()
+                return True
             page.call("Runtime.addBinding", {"name": BINDING})
+            page.call("Runtime.addBinding", {"name": VR_BINDING})
+            page.evaluate(VR_JS)
+            page.call("Runtime.addBinding", {"name": FILE_BINDING})
+            page.evaluate(FILE_JS)
+            try:
+                page.evaluate(TOUR_JS)
+            except RuntimeError:
+                # The optional tour setting must not block the compat bridge.
+                pass
             if not self.steamos:
                 page.call("Runtime.addBinding", {"name": SWITCH_BINDING})
                 page.evaluate(SWITCH_JS)
+            if COMPAT["respect_enabled"]():
+                try:
+                    page.call("Runtime.addBinding", {"name": PICK_BINDING})
+                    page.evaluate(PICK_JS)
+                except Exception:
+                    # Seeing the player's picks is an extra; the client's mapping is read either way.
+                    pass
             page.compat("get(0)")
         except Exception:
             page.ws.close()
             raise
         self.page = page
+        self.controls_state = None
+        self.controls_installed = False
+        self.frame_limit_state = None
+        self.frame_limit_retry = 0
+        self.sync_controls()
         return True
 
     def reconcile(self):
         page = self.page
+        respect = COMPAT["respect_enabled"]()
         with COMPAT["locked"]():
             state_file = COMPAT["state_path"]("state.json")
             state = COMPAT["read_json"](state_file)
@@ -435,107 +992,355 @@ class Helper:
             top = page.compat("get(0)")
             self.known = set(top["tools"])
             live = [t for t in catalog if t["name"] in self.known]
+            disk = {t["name"] for t in catalog}
+            unlisted = disk - self.known
+            if respect and state.get("default") in unlisted:
+                # The tool the player's default names is installed but the client has not listed it (yet): a
+                # list read in that moment must not turn the default, and every title on it, back into ours.
+                if self.unlisted_said != state["default"]:
+                    self.unlisted_said = state["default"]
+                    say("the client does not list %s yet; the mapping is left alone" % state["default"])
+                self.retry_at = time.monotonic() + 3
+                return
+            self.unlisted_said = None
             wanted = COMPAT["requested_tool"](request, catalog)
             newer = isinstance(request.get("seq"), int) and request["seq"] > int(state.get("applied", 0) or 0)
             waiting = newer and wanted is not None and wanted not in self.known
-            default, state = COMPAT["choose_default"](top["selected"], state, request, live, apply_request=not waiting)
+            why = {}
+            default, state = COMPAT["choose_default"](top["selected"], state, request, live, apply_request=not waiting,
+                                                      disk=disk if respect else None, why=why)
             installed = COMPAT["installed_apps"](self.steam_root)
-            # Titles the client uninstalled while this helper watched it: a native choice belongs to
-            # that install, so a reinstall starts from the default again. (A title missing at attach,
-            # say on a card that is not in, is not known to be uninstalled and keeps its choice.)
-            uninstalled = set(self.installed) - set(installed) if self.installed is not None else set()
             self.installed = installed
             picks = COMPAT["valve_picks"](self.steam_root)
             prior_auto = state.get("auto", {})
             if not isinstance(prior_auto, dict):
                 prior_auto = {}
-            prior_native = state.get("native", ())
-            native_choices = set(prior_native if isinstance(prior_native, (list, tuple, set)) else ()) - uninstalled
-            set_at = state.get("set_at", {})
-            if not isinstance(set_at, dict):
-                set_at = {}
+            # "native" from earlier builds also lists dual-platform games nobody chose to run natively.
+            prior_native = state.get("native_choices", ())
+            native_choices = set(prior_native if isinstance(prior_native, (list, tuple, set)) else ())
+            picked = COMPAT["picked_apps"](state)
+            runnable = {t["name"].lower() for t in live}
             apps = sorted(set(installed) | set(picks) | set(prior_auto) | native_choices, key=COMPAT["app_order"])
-            overrides = COMPAT["requested_games"](
-                COMPAT["game_requests"](), catalog, [t["name"] for t in live])
-            apps = sorted(set(apps) | set(overrides), key=COMPAT["app_order"])
+            asked = [app for app, request in COMPAT["game_requests"]().items() if COMPAT["valid_game_request"](app, request)]
+            apps = sorted(set(apps) | set(asked), key=COMPAT["app_order"])
+            if COMPAT["fallback_enabled"]() and isinstance(state.get("fallbacks"), dict):
+                apps = sorted(set(apps) | {app for app in state["fallbacks"] if isinstance(app, str) and app.isdecimal()},
+                              key=COMPAT["app_order"])
+            if respect:
+                kept_picks = set(state["chosen"]) if isinstance(state.get("chosen"), dict) else set()
+                apps = sorted(set(apps) | {app for app in kept_picks | {c[0] for c in self.claims} if app != "0"},
+                              key=COMPAT["app_order"])
             current = dict(page.compat("many(%s)" % json.dumps(apps)) or {})
+            refused = set(apps) - set(current)
+            refused_native = native_choices & refused
+            if refused:
+                apps = [app for app in apps if app not in refused]
+                installed = [app for app in installed if app not in refused]
+                picks = [app for app in picks if app not in refused]
+                prior_auto = {app: tool for app, tool in prior_auto.items() if app not in refused}
+                if isinstance(state.get("auto"), dict):
+                    state["auto"] = prior_auto
+                native_choices -= refused
             current["0"] = top["selected"]
             native = COMPAT["native_targets"](self.steam_root, apps)
-            config = os.path.join(self.steam_root, "config", "config.vdf")
-            raw_mapping = COMPAT["read_config_mapping"](config)
-            try:
-                flushed = os.stat(config).st_mtime
-            except OSError:
-                flushed = 0
-            cleared = set()
+            raw_mapping = COMPAT["read_config_mapping"](
+                os.path.join(self.steam_root, "config", "config.vdf"))
             if raw_mapping is None:
                 for app in native_choices:
                     current[app] = ""
+                for app in set(native) - native_choices:
+                    if not current.get(app) and app not in picked:
+                        current.pop(app, None)
             else:
-                cleared = {app for app, name in raw_mapping.items() if app != "0" and not name}
                 for app in set(native) | native_choices:
                     if app in raw_mapping:
-                        current[app] = raw_mapping[app]
-                    elif (app in prior_auto and app not in native_choices and current.get(app) == prior_auto[app]
-                          and flushed <= float(set_at.get(app, 0) or 0)):
-                        # Set by this helper and the client has not written config.vdf since:
-                        # the entry is missing because it is not saved yet, not because it was cleared.
-                        pass
-                    elif app in prior_auto or app in native_choices:
+                        # The client shows an explicit native choice as the tool it inherits, and writes config.vdf late.
+                        if raw_mapping[app] == "" or current.get(app) not in self.known:
+                            current[app] = raw_mapping[app]
+                    elif app in prior_auto or app in native_choices or app in picked and (
+                            not current.get(app) or COMPAT["unrunnable"](current[app], runnable)):
                         current[app] = ""
+                    elif not current.get(app):
+                        current.pop(app, None)
+            follow = COMPAT["followers"](state, current)
+            managed = set(prior_auto)
+            if respect:
+                chosen, self.claims, _, lines = COMPAT["settle_picks"](state, current, self.claims, live=True)
+                state["chosen"] = chosen
+                for line in lines:
+                    say(line)
+                pinned = COMPAT["pinned_apps"](chosen, current)
+                follow = {app: tool for app, tool in follow.items() if app not in pinned}
+                managed -= pinned
+                if self.claims:
+                    self.retry_at = time.monotonic() + 1
+            requests = COMPAT["settled_game_requests"](state, current, catalog)
+            overrides = COMPAT["requested_games"](requests or {}, catalog, [t["name"] for t in live])
+            overrides = {app: tool for app, tool in overrides.items() if app not in refused}
+            new_tools, moved_why = {}, {}
+            if COMPAT["fallback_enabled"]():
+                moved_lines = []
+                chosen_now = state["chosen"] if respect and isinstance(state.get("chosen"), dict) else {}
+                COMPAT["settle_pending_fallbacks"](state, self.steam_root, catalog, [t["name"] for t in live], overrides,
+                                                   chosen_now, moved_lines)
+                overrides.update(COMPAT["settle_fallbacks"](state, current, overrides, chosen_now, disk,
+                                                            {t["name"] for t in live}, moved_why, moved_lines))
+                direct = {app for app, tool in overrides.items() if tool is not None}
+                new_tools = COMPAT["new_title_tools"](
+                    self.steam_root, state, sorted(set(apps) | set(picks), key=COMPAT["app_order"]), catalog,
+                    [t["name"] for t in live], default, chosen_now, native, direct)
+                self.ask_install(state, catalog, COMPAT["new_title_apps"](
+                    self.steam_root, state, sorted(set(apps) | set(picks), key=COMPAT["app_order"]), default, chosen_now, native, direct))
+                for line in moved_lines:
+                    say(line)
             changes, auto = COMPAT["plan_mapping"](
                 current, installed, [t["name"] for t in live], default,
-                COMPAT["followers"](state, current), native, picks, overrides,
-                set(prior_auto) - uninstalled, native_choices, cleared,
-                COMPAT["valve_tools"](self.steam_root, set(native) | native_choices),
-                COMPAT["suggested_games"](catalog, [t["name"] for t in live]))
-            now = time.time()
+                follow, native, picks, overrides,
+                managed, native_choices,
+                COMPAT["suggested_games"](catalog, [t["name"] for t in live]),
+                present=sorted(unlisted) if respect else (), why=why,
+                new_tools=new_tools, override_why=moved_why)
+            allowed, held = COMPAT["guard_prefixes"](
+                self.steam_root, changes, why, current, catalog, [t["name"] for t in live], overrides,
+                present=sorted(unlisted) if respect else (), hold=respect, cache={})
+            for app, name in held.items():
+                auto[app] = name
+            COMPAT["remember_new_title_tools"](state, new_tools, allowed, auto)
             for app, tool in sorted(changes.items(), key=lambda item: COMPAT["app_order"](item[0])):
+                if app in held:
+                    say("app %s: kept %s (it would move to %s: %s)" % (app, held[app], tool, why.get(app, "")))
+                    continue
                 page.compat("set(%d, %s)" % (int(app), json.dumps(tool if tool is not None else "")))
-                say("%s -> %s" % ("default" if app == "0" else "app %s" % app,
-                                   tool if tool is not None else "Steam native default"))
-                if tool is not None:
-                    set_at[app] = now
-            auto_now = {app: tool for app, tool in auto.items() if tool is not COMPAT["NATIVE_CHOICE"]}
+                say("%s -> %s (%s)" % ("default" if app == "0" else "app %s" % app,
+                                       tool if tool is not None else "Steam native default", why.get(app, "")))
+            effective = {app: allowed[app] if app in allowed else name for app, name in current.items()}
+            effective.update({app: tool for app, tool in allowed.items() if tool})
+            effective = {app: (name or effective.get("0") or default) for app, name in effective.items()}
+            warnings = COMPAT["prefix_warnings"](self.steam_root, effective, catalog, {})
+            for app, text in warnings.items():
+                if self.warned.get(app) != text:
+                    say("WARNING " + text)
+            self.warned = warnings
+            state["prefix_warnings"] = warnings
             state.update(
-                auto=auto_now,
-                native=sorted(app for app, tool in auto.items() if tool is COMPAT["NATIVE_CHOICE"]),
-                set_at={app: at for app, at in set_at.items() if app in auto_now},
-                tools=catalog, live=True)
+                auto={app: tool for app, tool in auto.items() if tool is not COMPAT["NATIVE_CHOICE"]},
+                native_choices=sorted(refused_native | {app for app, tool in auto.items() if tool is COMPAT["NATIVE_CHOICE"]}),
+                picked=COMPAT["picked_after"](current, allowed), tools=catalog, live=True,
+                games_applied=COMPAT["applied_game_requests"](requests, overrides, state))
+            state.pop("native", None)
             if waiting:
                 state["pending"] = wanted
                 say("%s is new to the running client; it applies when Steam next starts" % wanted)
             else:
                 state.pop("pending", None)
             COMPAT["write_json"](state_file, state)
-        if (any(app in installed and tool == COMPAT["FEX_TOOL"] for app, tool in native.items()) or
-                COMPAT["FEX_TOOL"] in changes.values() or os.path.exists(COMPAT["fex_wanted_marker"]())):
-            for app in COMPAT["request_fex"](self.steam_root, self.fex_asked):
-                say("asked the client to install %s for x86 Linux titles and programs" % app)
+
+    def watch_games(self):
+        """Steam's gameprocess_log, once a second: a Proton title whose process tree ended within a minute without any of
+        its processes showing a frame is a start failure (see steam-compatibility, start_run_outcome)."""
+        if self.files_only or not COMPAT["fallback_enabled"]():
+            return
+        now = time.monotonic()
+        if now < self.games_at:
+            return
+        self.games_at = now + 1.0
+        try:
+            runs = self.tracker.feed(self.tail.read())
+        except Exception as e:
+            say("could not read Steam's game log (%s)" % e)
+            return
+        for run in runs:
+            if COMPAT["counts_as_run"](run):
+                try:
+                    self.judge_run(run)
+                except Exception as e:
+                    say("could not judge how app %s ended (%s)" % (run.get("app"), e))
+
+    def judge_run(self, run):
+        environ = os.environ
+        seconds = COMPAT["env_int"]("DD_START_FAIL_SECONDS", COMPAT["START_FAIL_SECONDS"], 5, 600)
+        limit = COMPAT["env_int"]("DD_START_FAIL_LIMIT", COMPAT["START_FAIL_LIMIT"], 1, 10)
+        frames = COMPAT["read_frames"](COMPAT["frames_directory"]())
+        evidence = COMPAT["run_evidence"](run, frames)
+        launch_dir = environ.get("BL_LAUNCH_DIR")
+        if launch_dir and os.path.exists(os.path.join(launch_dir, "steam-stop")):
+            return
+        if evidence == "unknown":
+            if not self.blind_said and run["end"] - run["start"] <= seconds:
+                self.blind_said = True
+                say("no frame counts in this session: a title that closes at the start cannot be told from one that was closed")
+            return
+        title = COMPAT["app_title"](self.steam_root, run["app"])
+        decision, record = None, None
+        with COMPAT["locked"]():
+            state_file = COMPAT["state_path"]("state.json")
+            state = COMPAT["read_json"](state_file)
+            before = COMPAT["start_fail_count"](state, run["app"], run["tool"])
+            kind = COMPAT["start_run_outcome"](state, run, evidence, seconds)
+            started = time.strftime("%H:%M:%S", time.gmtime(run["start"]))  # log_time reads the log's local time as UTC
+            if kind == "ok":
+                COMPAT["clear_exit_diag"](run["app"])
+            if kind == "ok" and before:
+                # said, so that the next failure's "(1 in a row)" is not read as this run's verdict
+                say("app %s (%s): the start at %s showed frames on %s, so its count of starts without a frame (%d) is reset" % (
+                    run["app"], title, started, run["tool"], before))
+            if kind == "fail":
+                fails = state["start_runs"][run["app"]][run["tool"]]["fails"]
+                say("app %s (%s): the start at %s closed after %d s on %s without showing a frame (%d in a row)" % (
+                    run["app"], title, started, run["end"] - run["start"], run["tool"], fails))
+                if COMPAT["arm_exit_diag"](run["app"]):
+                    say("app %s (%s): %s" % (run["app"], title, COMPAT["EXIT_DIAG_SAID"]))
+                requests = {app: r for app, r in COMPAT["game_requests"]().items()
+                            if r is not None and COMPAT["valid_game_request"](app, r)}
+                decision, record = COMPAT["decide_fallback"](state, self.steam_root, run["app"], run["tool"], requests, limit=limit)
+                if decision == "picked":
+                    # a tool the player picked is not changed; the player is told once per title and tool
+                    if COMPAT["write_notice"]("picked", run["app"], title, "", replace=False):
+                        COMPAT["remember_pick_notice"](state, run["app"], record["tool"])
+                    else:
+                        decision = "picked-unsent"
+            COMPAT["write_json"](state_file, state)
+        if decision == "switch":
+            say("app %s (%s): closed before showing anything on Proton Experimental %d times in a row, so MaliBridge moves it to %s "
+                "(its own decision, not yours; a tool you pick for it wins)" % (run["app"], title, record["fails"], record["to"]))
+            COMPAT["write_notice"]("switched", run["app"], title, record["to"])
+            self.retry_at = time.monotonic()
+        elif decision in ("picked", "picked-unsent"):
+            key = (run["app"], record["tool"])
+            if decision == "picked" or key not in self.pick_said:
+                self.pick_said.add(key)
+                say("app %s (%s): closed before showing anything on Proton Experimental %d times in a row; you picked this tool for it, "
+                    "so MaliBridge leaves it as it is%s" % (run["app"], title, record["fails"],
+                                                            "" if decision == "picked" else " (the notice could not be shown now)"))
+        elif decision == "missing" and run["app"] not in self.missing_said:
+            self.missing_said.add(run["app"])
+            say("app %s (%s): closed before showing anything on Proton Experimental %d times in a row, but no DroidDeck-Proton "
+                "is installed to move it to; the move waits for one, and the app is asked to get it" % (run["app"], title, limit))
+            if COMPAT["write_notice"]("install", run["app"], title, "", reason="failed", replace=False):
+                self.install_asked.add("failed:" + run["app"])
+
+    def ask_install(self, state, catalog, new_apps):
+        """No DroidDeck-Proton is installed and a move (or the start of a new title) needs one: the app is asked once per
+        session for each reason (compat-notice kind "install"). The app queues the download through the existing
+        ProtonExtras request unless the player declined it (then it asks the player, for a title that closed) or the
+        network is offline or metered (then this asks again in the next session)."""
+        if COMPAT["newest_own_proton"](catalog) is not None:
+            return
+        waiting = state.get("pending_fallbacks") if isinstance(state.get("pending_fallbacks"), dict) else {}
+        for app, record in sorted(waiting.items(), key=lambda item: COMPAT["app_order"](item[0])):
+            key = "failed:" + app
+            if key in self.install_asked or not isinstance(record, dict):
+                continue
+            if COMPAT["write_notice"]("install", app, record.get("title") or app, "", reason="failed", replace=False):
+                self.install_asked.add(key)
+                say("app %s: still waiting for a DroidDeck-Proton to move it to; the app is asked to get one" % app)
+            return
+        if new_apps and "new" not in self.install_asked:
+            title = COMPAT["app_title"](self.steam_root, new_apps[0])
+            if COMPAT["write_notice"]("install", new_apps[0], title, "", reason="new", replace=False):
+                self.install_asked.add("new")
+                say("%d title(s) would start on DroidDeck-Proton but none is installed; the app is asked to get one" % len(new_apps))
+
+    def ensure_tools(self):
+        """Proton, FEX and the runtimes FEX needs are fetched as soon as the client is up, never left pending.
+
+        Not in Steam's offline mode (BL_STEAM_OFFLINE=1): the client cannot download there and answers every
+        ask with a "Failure: Steam is unable to install content when in Offline Mode" dialog, which came up
+        over the next game every 5 minutes (Galaxy Tab S10+, Dark Souls III's title screen took the presses)."""
+        if os.environ.get("BL_STEAM_OFFLINE") == "1":
+            return
+        now = time.monotonic()
+        if self.tools_checked is not None and now - self.tools_checked < TOOL_CHECK_SECONDS:
+            return
+        self.tools_checked = now
+        if COMPAT["game_running"]():
+            return
+        for app, action in COMPAT["tool_downloads"](self.steam_root):
+            if now - self.tools_asked.get(app, -TOOL_RETRY_SECONDS) < TOOL_RETRY_SECONDS:
+                continue
+            self.tools_asked[app] = now
+            try:
+                self.page.tools("%s(%d)" % (action, int(app)))
+                say("asked the client to %s %s" % (action, app))
+            except Exception as e:
+                say("the client could not %s %s (%s)" % (action, app, e))
+                if action == "install":
+                    for asked in COMPAT["request_fex"](self.steam_root, self.fex_asked):
+                        say("asked the client to install %s through steam://install" % asked)
 
     def request_waiting(self):
         request = COMPAT["read_json"](COMPAT["state_path"]("request.json"))
         state = COMPAT["read_json"](COMPAT["state_path"]("state.json"))
         return isinstance(request.get("seq"), int) and request["seq"] > int(state.get("applied", 0) or 0)
 
+    def note_pick(self, payload):
+        app, _, name = payload.partition("\t") if isinstance(payload, str) else ("", "", "")
+        if not (app == "0" or app.isdecimal() and not app.startswith("0") and len(app) <= 10) or len(name) > 200 or "\n" in name:
+            return
+        self.claims.append((app, name, COMPAT["now_ms"]()))
+        self.fresh_claims = True
+
     def drain(self):
         """The page's events; a switch to the desktop is acted on as it comes."""
         events = self.page.drain()
         if any(called(e, SWITCH_BINDING) for e in events):
             switch_to_desktop()
+        for e in events:
+            if called(e, PICK_BINDING):
+                self.note_pick(e.get("params", {}).get("payload"))
+        vr_games = {e.get("params", {}).get("payload") for e in events if called(e, VR_BINDING) and
+                    isinstance(e.get("params", {}).get("payload"), str)}
+        vr_games = {game for game in vr_games if isinstance(game, str) and game.isascii() and
+                    game.isdecimal() and not game.startswith("0") and len(game) <= 20 and
+                    int(game) <= 0xffffffffffffffff}
+        if vr_games and (self.vr_launch is None or self.vr_launch.poll() is not None):
+            say("preparing SteamVR for library app(s): " + ", ".join(sorted(vr_games)))
+            self.vr_launch = launch_steamvr()
+        for e in events:
+            if called(e, BRIGHTNESS_BINDING):
+                brightness_request(e.get("params", {}).get("payload"))
+            if called(e, FILE_BINDING) and isinstance(e.get("params", {}).get("payload"), str):
+                self.open_chooser(e["params"]["payload"])
         return events
 
+    def serve_files(self):
+        say("attached to the client on port %d for its file dialogs" % self.port)
+        while True:
+            self.sync_controls()
+            sources = [self.page.ws] + ([self.chooser[1].stdout] if self.chooser is not None else [])
+            queued = self.page.ws.pending() or bool(self.page.events)
+            ready = [self.page.ws] if queued else select.select(sources, [], [], 0.25)[0]
+            if self.chooser is not None and self.chooser[1].stdout in ready:
+                self.chooser_done()
+            if self.page.ws in ready or self.page.events:
+                self.drain()
+
     def serve(self, watcher):
+        if self.files_only:
+            return self.serve_files()
         with open(COMPAT["state_path"]("live.pid"), "w") as f:
             f.write("%d\n" % os.getpid())
         say("attached to the client on port %d" % self.port)
         self.reconcile()
+        self.ensure_tools()
         while True:
+            self.sync_controls()
+            self.sync_frame_limit()
+            self.watch_games()
             sources = [self.page.ws] + ([watcher] if watcher.fileno() >= 0 else [])
-            ready = [self.page.ws] if self.page.ws.pending() else select.select(sources, [], [], 30 if watcher.fileno() >= 0 else 2)[0]
+            if self.chooser is not None:
+                sources.append(self.chooser[1].stdout)
+            queued = self.page.ws.pending() or bool(self.page.events)
+            ready = [self.page.ws] if queued else select.select(sources, [], [], 0.25)[0]
+            if self.chooser is not None and self.chooser[1].stdout in ready:
+                self.chooser_done()
             due = False
+            if self.retry_at is not None and time.monotonic() >= self.retry_at:
+                self.retry_at = None
+                due = True
             if self.page.ws in ready:
-                due = any(called(e, BINDING) for e in self.drain())
+                due = any(called(e, BINDING) for e in self.drain()) or self.fresh_claims or due
+                self.fresh_claims = False
             if (watcher in ready or watcher.fileno() < 0) and watcher.changed():
                 due = True
             if due:
@@ -543,7 +1348,9 @@ class Helper:
                 if watcher.fileno() >= 0 and select.select([watcher], [], [], 0)[0]:
                     watcher.changed()
                 self.drain()
+                self.fresh_claims = False
                 self.reconcile()
+            self.ensure_tools()
 
 
 def detach():
@@ -559,20 +1366,49 @@ def detach():
             COMPAT["write_json"](state_file, state)
 
 
+def chooser_main():
+    try:
+        options = json.load(sys.stdin)
+    except ValueError:
+        return 1
+    try:
+        path = choose_file(options if isinstance(options, dict) else {})
+    except (ImportError, ValueError):
+        return 2
+    if not path:
+        return 1
+    print(json.dumps(path))
+    return 0
+
+
 def main():
-    steam_root = sys.argv[1]
+    files_only = sys.argv[1:2] == ["--files-only"]
+    steam_root = sys.argv[2 if files_only else 1]
     try:
         port = int(os.environ.get("BL_CDP_PORT", ""))
     except ValueError:
         say("no devtools port for this session; the client's mapping is kept through config.vdf")
         return 0
+    if files_only:
+        helper = Helper(steam_root, port, files_only=True)
+        failures = 0
+        while True:
+            try:
+                helper.attach()
+                failures = 0
+                helper.serve(None)
+            except Exception as e:
+                helper.close_chooser()
+                if helper.page is not None:
+                    say("lost the client (%s); reattaching" % e)
+                    helper.page.ws.close()
+                    helper.page = None
+                failures += 1
+            time.sleep(min(2 * max(failures, 1), 10))
     os.makedirs(COMPAT["COMPAT_DIR"], exist_ok=True)
-    # Every library's steamapps: a new appmanifest_ is how an install shows, and the title has to be
-    # mapped while the client picks its depots, before the first launch.
     watcher = Watcher([COMPAT["state_path"]("request.json"), COMPAT["state_path"]("games.json"),
                        COMPAT["state_path"]("known-games.json")] +
-                      [os.path.join(lib, "steamapps", "libraryfolders.vdf") for lib in
-                       dict.fromkeys([steam_root, COMPAT["LIBRARY"] + "-sd"] + COMPAT["libraries"](steam_root))])
+                      [os.path.join(lib, "steamapps", "libraryfolders.vdf") for lib in (steam_root, COMPAT["LIBRARY"] + "-sd")])
     steamos = os.environ.get("BL_STEAMDECK") == "1" and os.environ.get("BL_STEAM_UI") != "desktop"
     helper = Helper(steam_root, port, steamos)
     failures = 0
@@ -584,6 +1420,7 @@ def main():
             last = None
             helper.serve(watcher)
         except Exception as e:
+            helper.close_chooser()
             if helper.page is not None:
                 say("lost the client (%s); reattaching" % e)
                 helper.page.ws.close()
@@ -597,8 +1434,11 @@ def main():
 
 
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["--choose-file"]:
+        sys.exit(chooser_main())
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     try:
         sys.exit(main())
     finally:
-        detach()
+        if sys.argv[1:2] != ["--files-only"]:
+            detach()

@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "ahb_swapchain.h"
+#include "ahb_offer.h"
 #include "droiddeck_color.h"
 #include "droiddeck_ext.h"
 #include "sc_layer.h"
@@ -48,6 +49,24 @@ struct ahb_buf {
 
 static struct wl_list g_bufs;
 static struct wl_list g_clients;
+
+/* Offered buffers (version 3): an AHardwareBuffer a program's driver handed over on a connection of
+ * its own, waiting for the dma-buf wl_buffer (normally a nested gamescope's) that turns out to be it. */
+struct ahb_offer_ent {
+    struct wl_resource *owner;
+    uint32_t id;
+    AHardwareBuffer *ahb;
+    struct ahb_offer_desc desc;
+    struct ahb_offer_key key;
+    unsigned paired;
+    struct wl_list link;
+};
+#define AHB_OFFERS_PER_OWNER 64
+static struct wl_list g_offers;
+static int g_auto;            /* SDR: only buffers that are their own gralloc buffers go on the layer */
+static int g_offer_mismatch_said;
+struct pair_seen { struct wl_client *client; struct wl_resource *owner; int w, h; };
+static struct pair_seen g_last_pair;
 static uint64_t g_next_id = 1;
 static struct wl_event_loop *g_loop;
 static unsigned g_stat_zero_copy;
@@ -257,6 +276,33 @@ uint32_t ahb_swapchain_ahb_format(const struct dmabuf_buffer *b) {
 
 static void ahb_destroy(struct wl_client *c, struct wl_resource *r) { wl_resource_destroy(r); }
 
+/* The wl_buffer's AHardwareBuffer from now on (our reference to it is handed over). */
+static struct ahb_buf *ahb_buf_bind(struct dmabuf_buffer *b, AHardwareBuffer *ahb, const AHardwareBuffer_Desc *d,
+                                    struct wl_client *c, struct wl_resource *buffer, uint64_t modifier,
+                                    uint32_t image_count, uint32_t stride) {
+    struct ahb_buf *ab = calloc(1, sizeof(*ab));
+    if (!ab) return NULL;
+    int bw, bh;
+    droiddeck_dmabuf_size(b, &bw, &bh);
+    ab->id = g_next_id++;
+    ab->b = b;
+    droiddeck_dmabuf_ref(b);
+    ab->ahb = ahb;
+    ab->w = bw; ab->h = bh;
+    ab->stride = d->stride ? d->stride : stride;
+    ab->image_count = image_count;
+    ab->format = d->format;
+    ab->modifier = modifier;
+    ab->client = c;
+    ab->resource = buffer;
+    ab->resource_destroy.notify = on_buffer_resource_destroyed;
+    wl_resource_add_destroy_listener(buffer, &ab->resource_destroy);
+    ab->fence_fd = -1;
+    wl_list_insert(g_bufs.prev, &ab->link);
+    *droiddeck_dmabuf_ahb_slot(b) = ab;
+    return ab;
+}
+
 static void ahb_attach(struct wl_client *c, struct wl_resource *r, struct wl_resource *buffer, int32_t sock,
                        uint32_t width, uint32_t height, uint32_t stride, uint32_t mod_hi, uint32_t mod_lo,
                        uint32_t image_count) {
@@ -292,25 +338,8 @@ static void ahb_attach(struct wl_client *c, struct wl_resource *r, struct wl_res
         return;
     }
 
-    struct ahb_buf *ab = calloc(1, sizeof(*ab));
+    struct ahb_buf *ab = ahb_buf_bind(b, ahb, &d, c, buffer, modifier, image_count, stride);
     if (!ab) { AHardwareBuffer_release(ahb); wl_client_post_no_memory(c); return; }
-    ab->id = g_next_id++;
-    ab->b = b;
-    droiddeck_dmabuf_ref(b);
-    ab->ahb = ahb;
-    ab->w = bw; ab->h = bh;
-    ab->stride = d.stride ? d.stride : stride;
-    ab->image_count = image_count;
-    ab->format = d.format;
-    ab->modifier = modifier;
-    ab->client = c;
-    ab->resource = buffer;
-    ab->resource_destroy.notify = on_buffer_resource_destroyed;
-    wl_resource_add_destroy_listener(buffer, &ab->resource_destroy);
-    ab->fence_fd = -1;
-    wl_list_insert(g_bufs.prev, &ab->link);
-    *slot = ab;
-
     if (g_last_chain.client != c || g_last_chain.w != bw || g_last_chain.h != bh ||
         g_last_chain.image_count != image_count || g_last_chain.modifier != modifier || g_last_chain.format != d.format) {
         g_last_chain = (struct chain_seen){c, bw, bh, image_count, modifier, d.format};
@@ -320,33 +349,143 @@ static void ahb_attach(struct wl_client *c, struct wl_resource *r, struct wl_res
     }
 }
 
+static void offer_free(struct ahb_offer_ent *o) {
+    wl_list_remove(&o->link);
+    AHardwareBuffer_release(o->ahb);
+    free(o);
+}
+
+static void ahb_offer(struct wl_client *c, struct wl_resource *r, int32_t sock, uint32_t id, uint32_t width,
+                      uint32_t height, uint32_t stride) {
+    struct pollfd p = {.fd = sock, .events = POLLIN};
+    int pr;
+    do { pr = poll(&p, 1, 1000); } while (pr < 0 && errno == EINTR);
+    AHardwareBuffer *ahb = NULL;
+    int rc = pr > 0 ? AHardwareBuffer_recvHandleFromUnixSocket(sock, &ahb) : -1;
+    close(sock);
+    if (rc != 0 || !ahb) {
+        droiddeck_log("layer", "zero-copy: receiving %s's offered AHardwareBuffer failed (%s)", droiddeck_client_name(c),
+                   pr > 0 ? "recvHandleFromUnixSocket" : "nothing on the socket");
+        return;
+    }
+    AHardwareBuffer_Desc d;
+    AHardwareBuffer_describe(ahb, &d);
+    struct ahb_offer_ent *o = calloc(1, sizeof(*o));
+    int fds[AHB_OFFER_MAX_FDS];
+    int nfd = o ? sc_layer_ahb_fds(ahb, fds, AHB_OFFER_MAX_FDS) : 0;
+    if (!o || d.width != width || d.height != height || (d.stride && d.stride != stride) ||
+        ahb_offer_key_from_fds(fds, nfd, &o->key) == 0) {
+        droiddeck_log("layer", "zero-copy: %s offered a %ux%u AHardwareBuffer (stride %u px) %s, ignored", droiddeck_client_name(c),
+                   d.width, d.height, d.stride, !o ? "with no memory left"
+                   : (d.width != width || d.height != height || (d.stride && d.stride != stride))
+                       ? "that is not the size it said" : "whose handle holds no file");
+        free(o);
+        AHardwareBuffer_release(ahb);
+        return;
+    }
+    o->owner = r;
+    o->id = id;
+    o->ahb = ahb;
+    o->desc = (struct ahb_offer_desc){d.width, d.height, d.stride ? d.stride : stride, d.format};
+    /* One live offer per id and per buffer; and a bounded number per program. */
+    int mine = 0;
+    struct ahb_offer_ent *e, *tmp;
+    wl_list_for_each_safe(e, tmp, &g_offers, link) {
+        if ((e->owner == r && e->id == id) || ahb_offer_keys_overlap(&e->key, &o->key)) { offer_free(e); continue; }
+        if (e->owner == r) mine++;
+    }
+    if (mine >= AHB_OFFERS_PER_OWNER) {
+        droiddeck_log("layer", "zero-copy: %s has %d buffers on offer already; this one is ignored", droiddeck_client_name(c), mine);
+        AHardwareBuffer_release(ahb);
+        free(o);
+        return;
+    }
+    wl_list_insert(g_offers.prev, &o->link);
+}
+
+static void ahb_withdraw(struct wl_client *c, struct wl_resource *r, uint32_t id) {
+    struct ahb_offer_ent *e, *tmp;
+    wl_list_for_each_safe(e, tmp, &g_offers, link)
+        if (e->owner == r && e->id == id) offer_free(e);
+}
+
+void ahb_swapchain_dmabuf_created(struct dmabuf_buffer *b, struct wl_client *c, struct wl_resource *buffer) {
+    if (!g_advertised || wl_list_empty(&g_offers) || !b || *droiddeck_dmabuf_ahb_slot(b)) return;
+    int fd = droiddeck_dmabuf_fd(b);
+    struct ahb_offer_ent *o;
+    wl_list_for_each(o, &g_offers, link) {
+        if (!ahb_offer_key_has_fd(&o->key, fd)) continue;
+        struct ahb_offer_plane pl;
+        droiddeck_dmabuf_plane(b, &pl.n_planes, &pl.offset, &pl.stride, &pl.drm_format, &pl.modifier);
+        pl.fd = fd;
+        droiddeck_dmabuf_size(b, &pl.width, &pl.height);
+        const char *why = ahb_offer_mismatch(&o->desc, &pl);
+        if (why) {
+            if (!g_offer_mismatch_said) {
+                g_offer_mismatch_said = 1;
+                droiddeck_log("layer", "zero-copy: %s passed on an offered buffer with %s (%dx%d, stride %u bytes, offset %u, "
+                           "%.4s, modifier 0x%llx; offered %ux%u, stride %u px, %s): it stays on the copy path",
+                           droiddeck_client_name(c), why, pl.width, pl.height, pl.stride, pl.offset, (const char *)&pl.drm_format,
+                           (unsigned long long)pl.modifier, o->desc.width, o->desc.height, o->desc.stride_px,
+                           droiddeck_ahb_format_name(o->desc.ahb_format));
+            }
+            return;
+        }
+        AHardwareBuffer_Desc d;
+        AHardwareBuffer_describe(o->ahb, &d);
+        AHardwareBuffer_acquire(o->ahb);
+        if (!ahb_buf_bind(b, o->ahb, &d, c, buffer, pl.modifier, 0, o->desc.stride_px)) {
+            AHardwareBuffer_release(o->ahb);
+            return;
+        }
+        o->paired++;
+        if (g_last_pair.client != c || g_last_pair.owner != o->owner || g_last_pair.w != pl.width || g_last_pair.h != pl.height) {
+            g_last_pair = (struct pair_seen){c, o->owner, pl.width, pl.height};
+            droiddeck_log("layer", "zero-copy: %s passes on %s's own gralloc buffers (%dx%d, %s, stride %u px): "
+                       "they can go on the display layer without a copy", droiddeck_client_name(c),
+                       droiddeck_client_name(wl_resource_get_client(o->owner)), pl.width, pl.height,
+                       droiddeck_ahb_format_name(o->desc.ahb_format), o->desc.stride_px);
+        }
+        return;
+    }
+}
+
 static const struct banner_ahb_v1_interface ahb_impl = {
     .destroy = ahb_destroy,
     .attach = ahb_attach,
+    .offer = ahb_offer,
+    .withdraw = ahb_withdraw,
 };
 
 static void on_client_resource_destroyed(struct wl_resource *r) {
+    struct ahb_offer_ent *e, *tmp;
+    wl_list_for_each_safe(e, tmp, &g_offers, link)
+        if (e->owner == r) offer_free(e);
+    if (g_last_pair.owner == r) g_last_pair.owner = NULL;
     wl_list_remove(wl_resource_get_link(r));
 }
 
 static void bind_ahb(struct wl_client *c, void *data, uint32_t ver, uint32_t id) {
     static struct wl_client *last_named;
-    if (ver > 2) ver = 2;
+    if (ver > 3) ver = 3;
     struct wl_resource *r = wl_resource_create(c, &banner_ahb_v1_interface, (int)ver, id);
     if (!r) { wl_client_post_no_memory(c); return; }
     wl_resource_set_implementation(r, &ahb_impl, NULL, on_client_resource_destroyed);
     wl_list_insert(&g_clients, wl_resource_get_link(r));
-    if (ver >= BANNER_AHB_V1_MODE_SINCE_VERSION) banner_ahb_v1_send_mode(r, g_zero_copy ? 1u : 0u);
+    if (ver >= BANNER_AHB_V1_MODE_SINCE_VERSION) banner_ahb_v1_send_mode(r, (g_zero_copy || g_auto) ? 1u : 0u);
     if (last_named != c) {
         last_named = c;
         droiddeck_log("layer", "zero-copy: %s bound banner_ahb_v1 version %u (%s)", droiddeck_client_name(c), ver,
-                   ver >= 2 ? "follows the live switch" : "version 1: decides from its launch environment only");
+                   ver >= 3 ? "follows the live switch; can offer buffers another program passes on"
+                   : ver >= 2 ? "follows the live switch" : "version 1: decides from its launch environment only");
     }
 }
 
 void ahb_swapchain_set_mode(int on, int live) {
     on = on ? 1 : 0;
     g_zero_copy = on;
+    const int full = on;
+    on = on || g_auto;
     if (!g_advertised) {
         if (live) droiddeck_log("layer", "zero-copy switched %s from the drawer, but no display layer is available on this device: no change",
                              on ? "on" : "off");
@@ -369,17 +508,24 @@ void ahb_swapchain_set_mode(int on, int live) {
                    on ? "on" : "off", told, told == 1 ? "" : "s",
                    on ? "; frames go on the display layer once the new gralloc swapchain is up"
                       : "; gralloc frames still in flight stay on the layer (or take the copy path) until then");
-    else
+    else if (full || !on)
         droiddeck_log("layer", "zero-copy: %s at launch (%s)", on ? "on" : "off",
-                   on ? "DROIDDECK_WAYLAND_ZERO_COPY=1: games present their own gralloc buffers on the display layer"
-                      : "the drawer's Zero-copy presentation switch turns it on live");
+                   on ? "HDR session: games present their own gralloc buffers on the display layer"
+                      : "only HDR sessions turn it on");
+    else
+        droiddeck_log("layer", "zero-copy: for the game's own buffers at launch (a game frame that is its own gralloc buffer, "
+                   "the one fullscreen window with nothing above it, goes on the display layer without a copy; every other "
+                   "scene is composed and copied as before; DROIDDECK_WAYLAND_ZERO_COPY_AUTO=0 turns this off)");
     if (live) wl_display_flush_clients(droiddeck_get_display());
     droiddeck_request_redraw();
 }
 
+int ahb_swapchain_auto(void) { return g_auto && !g_zero_copy; }
+
 void ahb_swapchain_init(struct wl_display *display) {
     wl_list_init(&g_bufs);
     wl_list_init(&g_clients);
+    wl_list_init(&g_offers);
     if (!sc_layer_available()) {
         droiddeck_log("layer", "zero-copy: no display layer on this device (see the line above): banner_ahb_v1 not advertised");
         return;
@@ -391,11 +537,14 @@ void ahb_swapchain_init(struct wl_display *display) {
         return;
     }
     wl_event_loop_add_fd(g_loop, g_rel_pipe[0], WL_EVENT_READABLE, on_release_pipe, NULL);
-    if (!wl_global_create(display, &banner_ahb_v1_interface, 2, NULL, bind_ahb)) {
+    if (!wl_global_create(display, &banner_ahb_v1_interface, 3, NULL, bind_ahb)) {
         droiddeck_log("error", "zero-copy: banner_ahb_v1 global creation failed");
         return;
     }
     g_advertised = 1;
-    droiddeck_log("layer", "zero-copy: banner_ahb_v1 version 2 advertised (games built for it present their own gralloc buffers while the switch is on)");
+    const char *a = getenv("DROIDDECK_WAYLAND_ZERO_COPY_AUTO");
+    g_auto = !(a && !strcmp(a, "0"));
+    droiddeck_log("layer", "zero-copy: banner_ahb_v1 version 3 advertised (games built for it present their own gralloc buffers "
+               "while the switch is on, directly or through gamescope)");
     ahb_swapchain_set_mode(g_zero_copy, 0);
 }

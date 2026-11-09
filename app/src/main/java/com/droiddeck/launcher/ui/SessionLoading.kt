@@ -24,9 +24,9 @@ import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.tween
 import androidx.compose.material.icons.Icons
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.material.icons.filled.Pause
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material3.Icon
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -68,6 +68,8 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
@@ -78,20 +80,45 @@ import androidx.compose.ui.text.style.TextOverflow
 
 
 @Composable
-fun HudText(text: String) {
+fun HudText(text: String, color: String = "mint", opacity: Int = 70) {
+    if (text.isEmpty()) return
+    val accent = hudInk(color)
+    val wash = (opacity.coerceIn(30, 100) / 100f)
+    val ink = accent.copy(alpha = (0.5f + wash * 0.5f).coerceIn(0.62f, 1f))
     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.TopEnd) {
-        Text(
-            text,
-            fontFamily = FontFamily.Monospace,
-            fontSize = 12.sp,
-            color = Color.White,
+        Column(
+            horizontalAlignment = Alignment.End,
             modifier = Modifier
                 .padding(12.dp)
-                .background(Color(0x8C000000))
-                .padding(horizontal = 8.dp, vertical = 3.dp),
-        )
+                .background(
+                    Brush.verticalGradient(
+                        listOf(accent.copy(alpha = wash * 0.28f), Color.Black.copy(alpha = wash * 0.72f)),
+                    ),
+                    RoundedCornerShape(8.dp),
+                )
+                .padding(horizontal = 8.dp, vertical = 5.dp),
+        ) {
+            Text(
+                text,
+                fontFamily = FontFamily.Monospace,
+                fontSize = 12.sp,
+                color = ink,
+                textAlign = TextAlign.End,
+            )
+        }
     }
 }
+
+private fun hudInk(color: String): Color = Color(
+    when (color) {
+        "white" -> 0xFFF2F5F8
+        "sky" -> 0xFF66C0F4
+        "amber" -> 0xFFFFB74D
+        "violet" -> 0xFFD0A2FF
+        else -> 0xFF3DDC84
+    }.toInt(),
+)
+
 
 private class LoadStage(@androidx.annotation.StringRes val label: Int, @androidx.annotation.StringRes val detail: Int)
 
@@ -121,9 +148,12 @@ fun LoadingOverlay(
     topic: LoadingState.Topic, readable: Boolean,
     title: String = stringResource(R.string.load_starting_steam), steam: Boolean = true, onCancel: (() -> Unit)? = null,
     endedDetail: String? = null,
+    diagnosis: String? = null,
     onRetry: (() -> Unit)? = null,
+    onRepair: (() -> Unit)? = null,
     onShareLogs: (() -> Unit)? = null,
     onSendLogs: (() -> Unit)? = null,
+    onReport: (() -> Unit)? = null,
     onClose: (() -> Unit)? = null,
     flood: Color? = null,
     onFlooded: () -> Unit = {},
@@ -146,7 +176,7 @@ fun LoadingOverlay(
         modifier = Modifier
             .fillMaxSize()
             .background(colors.background)
-            .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) {},
+            .blockTouches(),
     ) {
         CapsuleWall(games, driftMs = 65_000, modifier = Modifier.alpha(0.3f))
         Box(
@@ -182,13 +212,19 @@ fun LoadingOverlay(
                 maxLines = if (ended) 12 else 2, overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.padding(top = 6.dp).widthIn(max = 520.dp),
             )
+            // The first-frame watchdog: which stage of the start stalled (FirstFrameWatch)
+            if (!ended && diagnosis != null) Text(
+                diagnosis, fontSize = 14.sp, lineHeight = 20.sp, color = colors.onBackground, textAlign = TextAlign.Center,
+                maxLines = 5, overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(top = 10.dp).widthIn(max = 560.dp),
+            )
             if (!ended) LoadSegments(stages.size, active, percent, Modifier.padding(top = 18.dp))
             if (ended && endedDetail != null) Text(
                 endedDetail, fontSize = 12.sp, fontFamily = FontFamily.Monospace, color = colors.onSurfaceVariant.copy(alpha = 0.8f),
                 textAlign = TextAlign.Center, maxLines = 3, overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.padding(top = 12.dp).widthIn(max = 520.dp),
             )
-            if (ended) EndedActions(onRetry, onShareLogs, onSendLogs, onClose)
+            if (ended) EndedActions(onRetry, onRepair, onShareLogs, onSendLogs, onReport, onClose)
         }
         if (!ended && hint.isNotEmpty()) Text(
             hint, fontSize = 13.sp, lineHeight = 18.sp, color = colors.onSurfaceVariant.copy(alpha = 0.8f), textAlign = TextAlign.Center,
@@ -201,7 +237,7 @@ fun LoadingOverlay(
 }
 
 @Composable
-private fun EndedActions(onRetry: (() -> Unit)?, onShareLogs: (() -> Unit)?, onSendLogs: (() -> Unit)?, onClose: (() -> Unit)?) {
+private fun EndedActions(onRetry: (() -> Unit)?, onRepair: (() -> Unit)?, onShareLogs: (() -> Unit)?, onSendLogs: (() -> Unit)?, onReport: (() -> Unit)?, onClose: (() -> Unit)?) {
     val first = remember { FocusRequester() }
     LaunchedEffect(Unit) {
         androidx.compose.runtime.withFrameNanos { }
@@ -210,10 +246,15 @@ private fun EndedActions(onRetry: (() -> Unit)?, onShareLogs: (() -> Unit)?, onS
     Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.padding(top = 22.dp)) {
         var firstUsed = false
         fun claim(): Modifier = if (firstUsed) Modifier else { firstUsed = true; Modifier.focusRequester(first) }
-        if (onRetry != null) PrimaryButton(stringResource(R.string.store_try_again), modifier = claim(), onClick = onRetry)
+        if (onRepair != null) PrimaryButton(stringResource(R.string.runtime_repair), modifier = claim(), onClick = onRepair)
+        if (onRetry != null) {
+            if (onRepair != null) SecondaryButton(stringResource(R.string.store_try_again), modifier = claim(), onClick = onRetry)
+            else PrimaryButton(stringResource(R.string.store_try_again), modifier = claim(), onClick = onRetry)
+        }
         if (onShareLogs != null) SecondaryButton(stringResource(R.string.drawer_share_logs), modifier = claim(),
             progress = com.droiddeck.launcher.session.SessionLogShare.progress, onClick = onShareLogs)
         if (onSendLogs != null) SecondaryButton(stringResource(R.string.drawer_send_logs), modifier = claim(), onClick = onSendLogs)
+        if (onReport != null) SecondaryButton(stringResource(R.string.session_end_report), modifier = claim(), onClick = onReport)
         if (onClose != null) SecondaryButton(stringResource(R.string.mode_back), modifier = claim(), onClick = onClose)
     }
 }
@@ -254,6 +295,7 @@ private fun CancelHint(onCancel: () -> Unit, modifier: Modifier = Modifier) {
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp),
         modifier = modifier.heightIn(min = 44.dp).clip(RoundedCornerShape(22.dp))
             .background(if (hot) colors.onBackground.copy(alpha = 0.08f) else Color.Transparent)
+            .glideBorder(hot, RoundedCornerShape(22.dp), LocalPalette.current.signal)
             .hoverable(src).clickable(interactionSource = src, indication = LocalIndication.current, role = Role.Button, onClick = onCancel)
             .padding(horizontal = 12.dp),
     ) {
@@ -265,40 +307,5 @@ private fun CancelHint(onCancel: () -> Unit, modifier: Modifier = Modifier) {
             ))
         }
         Text(stringResource(R.string.common_cancel), fontSize = 13.sp, color = colors.onSurfaceVariant)
-    }
-}
-
-@Composable
-fun SessionPausedOverlay(title: String = stringResource(R.string.load_steam_paused), onResume: () -> Unit) {
-    val colors = MaterialTheme.colorScheme
-    val pal = LocalPalette.current
-    val interactionSource = remember { MutableInteractionSource() }
-    val resumeFocus = remember { FocusRequester() }
-    LaunchedEffect(Unit) {
-        androidx.compose.runtime.withFrameNanos { }
-        runCatching { resumeFocus.requestFocus() }
-    }
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(pal.background.copy(alpha = 0.94f))
-            .clickable(interactionSource = interactionSource, indication = null) {},
-        contentAlignment = Alignment.Center,
-    ) {
-        Column(
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(10.dp),
-            modifier = Modifier.widthIn(max = 440.dp).padding(32.dp),
-        ) {
-            Box(contentAlignment = Alignment.Center, modifier = Modifier.padding(bottom = 6.dp).size(64.dp).border(2.dp, pal.line2, CircleShape)) {
-                Icon(Icons.Filled.Pause, contentDescription = null, tint = colors.onBackground, modifier = Modifier.size(30.dp))
-            }
-            Text(title, fontSize = 28.sp, fontWeight = FontWeight.Bold, color = colors.onBackground, textAlign = TextAlign.Center)
-            PrimaryButton(
-                stringResource(R.string.resume_session),
-                modifier = Modifier.padding(top = 14.dp).focusRequester(resumeFocus).controllerConfirm(onClick = onResume),
-                onClick = onResume,
-            )
-        }
     }
 }

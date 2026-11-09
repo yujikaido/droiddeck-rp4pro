@@ -109,7 +109,8 @@ static long tracer;
 
 static pthread_mutex_t cache_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t bind_lock;
-static void after_fork(void) { pthread_mutex_init(&cache_lock, NULL); pthread_mutex_init(&bind_lock, NULL); }
+static pthread_mutex_t long_lock;
+static void after_fork(void) { pthread_mutex_init(&cache_lock, NULL); pthread_mutex_init(&bind_lock, NULL); pthread_mutex_init(&long_lock, NULL); }
 
 static int traced_by_match(const char *key) {
   static char buf[32768];
@@ -140,6 +141,50 @@ static int traced_by_match(const char *key) {
   return found;
 }
 
+static long init_sys4(long nr, long a, long b, long c, long d) {
+  static long (*real_syscall)(long, ...);
+  if (!real_syscall) real_syscall = (long (*)(long, ...))dlsym(RTLD_NEXT, "syscall");
+  return real_syscall(nr, a, b, c, d);
+}
+
+static long init_sys(long nr, long a, long b, long c) { return init_sys4(nr, a, b, c, 0); }
+
+static int program_32bit(const char *prog, int scripts) {
+  char head[256];
+  long fd = init_sys(SYS_openat, AT_FDCWD, (long)prog, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return 1;
+  long n = init_sys(SYS_read, fd, (long)head, sizeof head - 1);
+  init_sys(SYS_close, fd, 0, 0);
+  if (n < 0) return 1;
+  head[n] = 0;
+  if (n >= 2 && head[0] == '#' && head[1] == '!') {
+    if (scripts <= 0) return 1;
+    char *p = head + 2;
+    while (*p == ' ' || *p == '\t') p++;
+    char *e = p;
+    while (*e && *e != ' ' && *e != '\t' && *e != '\n' && *e != '\r') e++;
+    if (e == p || (!*e && n == (long)sizeof head - 1)) return 1;
+    *e = 0;
+    return program_32bit(p, scripts - 1);
+  }
+  return !(n >= 5 && memcmp(head, "\x7f" "ELF", 4) == 0 && head[4] == 2);
+}
+
+static int fex_runs_32bit(void) {
+  if (strcmp(program_invocation_short_name, "FEX") != 0 && strcmp(program_invocation_short_name, "FEXInterpreter") != 0)
+    return 0;
+  char args[PATH_MAX + 64];
+  long fd = init_sys(SYS_openat, AT_FDCWD, (long)"/proc/self/cmdline", O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return 1;
+  long n = init_sys(SYS_read, fd, (long)args, sizeof args - 1);
+  init_sys(SYS_close, fd, 0, 0);
+  if (n <= 0) return 1;
+  args[n] = 0;
+  const char *prog = args + strlen(args) + 1;
+  if (prog >= args + n || !*prog) return 1;
+  return program_32bit(prog, 4);
+}
+
 static int in_tracer(struct bind *bd) {
   char h[PATH_MAX];
   if (snprintf(h, sizeof h, "/proc/%ld%s", tracer, bd->host + 10) >= (int)sizeof h) return 0;
@@ -156,6 +201,7 @@ static void fp_init(void) {
   const char *r = getenv("PROOT_FP_ROOT"), *b = getenv("PROOT_FP_BINDS"), *t = getenv("PROOT_FP_TTL_MS");
   const char *key = getenv("PROOT_FP_KEY");
   if (!r || !*r || !key || !*key || getenv("PROOT_FP_OFF")) return;
+  if (fex_runs_32bit()) return;
   void *p = mmap((void *)FP_STUB_ADDR, FP_STUB_SIZE, PROT_READ | PROT_WRITE,
                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
   if (p != (void *)FP_STUB_ADDR) {
@@ -293,34 +339,73 @@ static int to_guest(const char *h, char *g, size_t size) {
   return 0;
 }
 
-static int guest_text(const char *h, char *g) {
-  int in = h[0] == '/' && under(h, root, rootlen);
-  for (int i = 0; h[0] == '/' && !in && i < nbinds; i++) {
-    int live = held(&binds[i]);
-    if (live < 0) return -1;
-    in = live && under(h, binds[i].host, binds[i].hlen);
+static int host_order[MAX_BINDS + 1], norder, ordered;
+
+static int contains(const char *a, const char *b) {
+  size_t la = strlen(a);
+  return strlen(b) > la && under(b, a, la);
+}
+
+static const char *side_of(int i, int host) {
+  return host ? (i < 0 ? root : binds[i].host) : (i < 0 ? "/" : binds[i].guest);
+}
+
+static int insort(int *list, int m, int i, int host) {
+  const char *p = side_of(i, host);
+  int prev = -1;
+  for (int j = 0; j < m; j++) {
+    const char *q = side_of(list[j], host);
+    if (!strcmp(p, q) && !host) {
+      list[j] = i;
+      return m;
+    }
+    if (!strcmp(p, q) || contains(p, q)) prev = j;
   }
-  if (in) return to_guest(h, g, PATH_MAX);
-  memcpy(g, h, strlen(h) + 1);
+  memmove(list + prev + 2, list + prev + 1, (m - prev - 1) * sizeof *list);
+  list[prev + 1] = i;
+  return m + 1;
+}
+
+static int order_binds(void) {
+  if (__atomic_load_n(&ordered, __ATOMIC_ACQUIRE)) return 0;
+  for (int i = 0; i < nbinds; i++)
+    if (held(&binds[i]) < 0) return -1;
+  if (pthread_mutex_trylock(&bind_lock) != 0) return -1;
+  if (!ordered) {
+    int pending[MAX_BINDS + 1], m = 1;
+    pending[0] = -1;
+    for (int i = 0; i < nbinds; i++)
+      if (!binds[i].dropped) m = insort(pending, m, i, 0);
+    norder = 0;
+    for (int j = m - 1; j >= 0; j--) norder = insort(host_order, norder, pending[j], 1);
+    __atomic_store_n(&ordered, 1, __ATOMIC_RELEASE);
+  }
+  pthread_mutex_unlock(&bind_lock);
   return 0;
 }
 
 static int host_bind(const char *h) {
-  int found = -1;
-  for (int i = 0; i < nbinds; i++) {
-    int live = held(&binds[i]);
-    if (live < 0) return -2;
-    if (!live || !under(h, binds[i].host, binds[i].hlen)) continue;
-    if (found < 0 || binds[i].hlen > binds[found].hlen) found = i;
-    else if (binds[i].hlen == binds[found].hlen && strcmp(binds[i].guest, binds[found].guest) != 0) found = -3;
-  }
-  return found == -3 ? -2 : found;
+  if (order_binds() < 0) return -2;
+  for (int j = 0; j < norder; j++)
+    if (host_order[j] >= 0 && under(h, binds[host_order[j]].host, binds[host_order[j]].hlen)) return host_order[j];
+  return -1;
+}
+
+static int guest_text(const char *h, char *g) {
+  if (h[0] == '/' && under(h, root, rootlen)) return to_guest(h, g, PATH_MAX);
+  int i = h[0] == '/' ? host_bind(h) : -1;
+  if (i == -2) return -1;
+  if (i >= 0)
+    return snprintf(g, PATH_MAX, "%s%s", binds[i].guest, h + binds[i].hlen) >= PATH_MAX || reserved(g) ? -1 : 0;
+  memcpy(g, h, strlen(h) + 1);
+  return 0;
 }
 
 static long detranslated(char *text, const char *at) {
   if (text[0] != '/') return 0;
   if (!under(at, root, rootlen) && !under(text, root, rootlen)) {
     int own = host_bind(at), to = host_bind(text);
+    if (to == -1) return 0;
     if (own == -2 || to == -2) return FP_SLOW;
     if (own >= 0 && to >= 0 && strcmp(binds[own].host, binds[to].host) == 0) {
       const struct bind *bd = &binds[to];
@@ -421,7 +506,7 @@ static long own_exe(char *g) {
     memcpy(g, exe_text, n + 1);
     return n;
   }
-  long t = syscall(SYS_readlinkat, AT_FDCWD, "/proc/self/exe", g, PATH_MAX - 1);
+  long t = init_sys4(SYS_readlinkat, AT_FDCWD, (long)"/proc/self/exe", (long)g, PATH_MAX - 1);
   if (t <= 0 || t >= PATH_MAX - 1) return FP_SLOW;
   g[t] = 0;
   static pthread_mutex_t exe_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -493,10 +578,60 @@ static int pop(char *g) {
 #define MAY_BE_UNSEEN 2
 #define GLUE 3
 
+/* A clean absolute path: "/a/b/c", no "." or ".." component, no "//", no trailing "/", not "/" itself. */
+static int clean_absolute(const char *t) {
+  if (t[0] != '/' || !t[1]) return 0;
+  for (const char *c = t; *c;) {
+    const char *e = strchrnul(c + 1, '/');
+    size_t n = e - c - 1;
+    if (n == 0 || (n == 1 && c[1] == '.') || (n == 2 && c[1] == '.' && c[2] == '.')) return 0;
+    c = e;
+  }
+  return 1;
+}
+
+static long walk_n(struct res *r, const char *text, int follow, int last, int *links, int nested);
+
+/* The final component was a link to the clean absolute `target`. Reach the target's directory through
+ * the verified-parent cache, as resolve_in does for the path it is given (walking and remembering it on
+ * a miss), so that only the leaf is left to walk. Wine stats and reads the xattrs of every entry of a
+ * Proton prefix's system32, whose builtin DLLs are absolute links into the Proton install, and walking
+ * every component of every target was most of the cost (B9, Steam's CEG step). On success r->guest is
+ * the directory's canonical guest path and `target` holds the leaf; otherwise -1, r is as it was, and
+ * the caller walks the whole target as before. */
+static int link_parent(struct res *r, char *target, int *links) {
+  char *slash = strrchr(target, '/');
+  if (slash == target || !clean_absolute(target) || under(target, "/proc", 5)) return -1;
+  int moving = r->moving, magic = r->magic;
+  *slash = 0;
+  unsigned h = hash_of(target);
+  if (!cached(target, h, r->guest)) {
+    strcpy(r->guest, "/");
+    r->moving = 0;
+    long w = walk_n(r, target, 1, 0, links, 1);
+    if (w != 0 || r->magic || !S_ISDIR(r->st.st_mode)) {
+      *slash = '/';
+      r->moving = moving;
+      r->magic = magic;
+      return -1;
+    }
+    if (!r->moving) remember(target, h, r->guest);
+    r->moving |= moving;
+  }
+  r->exists = 0;
+  memmove(target, slash + 1, strlen(slash + 1) + 1);
+  return 0;
+}
+
 static long walk(struct res *r, const char *text, int follow, int last) {
+  int links = 0;
+  return walk_n(r, text, follow, last, &links, 0);
+}
+
+static long walk_n(struct res *r, const char *text, int follow, int last, int *links, int nested) {
   char rest[PATH_MAX];
   size_t len = strlen(text);
-  int links = 0, stated = 0;
+  int stated = 0;
   if (len >= sizeof rest) return FP_SLOW;
   memcpy(rest, text, len + 1);
   char *c = rest;
@@ -535,7 +670,7 @@ static long walk(struct res *r, const char *text, int follow, int last) {
     if (S_ISLNK(r->st.st_mode) && (!final || follow)) {
       char target[PATH_MAX];
       long t;
-      if (++links > MAX_LINKS || binding_below(r->guest)) return FP_SLOW;
+      if (++*links > MAX_LINKS || binding_below(r->guest)) return FP_SLOW;
       if (under(r->guest, "/proc", 5)) {
         t = proc_link(r, target, final && last);
         if (t == FP_SLOW) return FP_SLOW;
@@ -551,6 +686,11 @@ static long walk(struct res *r, const char *text, int follow, int last) {
         target[t] = 0;
         if (detranslated(target, r->host) == FP_SLOW) return FP_SLOW;
         t = strlen(target);
+        if (!nested && !*e && link_parent(r, target, links) == 0) {
+          strcpy(rest, target);
+          c = rest;
+          continue;
+        }
       }
       if (target[0] == '/') strcpy(r->guest, "/");
       else pop(r->guest);
@@ -591,8 +731,9 @@ static long resolve_in(const char *base, const char *path, int follow, struct re
   char norm[PATH_MAX];
   size_t o = 0;
   int dotdot = 0;
-  size_t plen = strlen(path);
-  int trailing = plen > 1 && path[plen - 1] == '/';
+  size_t plen = strlen(path), end = plen;
+  while (end > 1 && path[end - 1] == '/') end--;
+  int trailing = (plen > 1 && path[plen - 1] == '/') || (end > 0 && path[end - 1] == '.' && (end == 1 || path[end - 2] == '/'));
   for (int part = base ? 0 : 1; part < 2; part++) {
     for (const char *c = part ? path : base; *c;) {
       while (*c == '/') c++;
@@ -791,20 +932,100 @@ int __fxstat(int ver, int fd, struct stat *st) {
 }
 int __fxstat64(int ver, int fd, struct stat64 *st) { return __fxstat(ver, fd, (struct stat *)st); }
 
-int statx(int dirfd, const char *path, int flags, unsigned mask, struct statx *out) {
-  REAL(statx, int (*)(int, const char *, int, unsigned, struct statx *));
+#ifndef STATX__RESERVED
+#define STATX__RESERVED 0x80000000U
+#endif
+
+static int statx_missing;
+
+static unsigned int dev_major(unsigned long long dev) {
+  return ((dev >> 8) & 0xfff) | ((unsigned int)(dev >> 32) & ~0xfffU);
+}
+static unsigned int dev_minor(unsigned long long dev) {
+  return (dev & 0xff) | ((unsigned int)(dev >> 12) & ~0xffU);
+}
+
+static void fill_statx(struct statx *out, const struct stat *st) {
+  memset(out, 0, sizeof *out);
+  out->stx_mask = STATX_BASIC_STATS;
+  out->stx_blksize = st->st_blksize;
+  out->stx_nlink = st->st_nlink;
+  out->stx_uid = st->st_uid;
+  out->stx_gid = st->st_gid;
+  out->stx_mode = st->st_mode;
+  out->stx_ino = st->st_ino;
+  out->stx_size = st->st_size;
+  out->stx_blocks = st->st_blocks;
+  out->stx_atime.tv_sec = st->st_atim.tv_sec;
+  out->stx_atime.tv_nsec = st->st_atim.tv_nsec;
+  out->stx_ctime.tv_sec = st->st_ctim.tv_sec;
+  out->stx_ctime.tv_nsec = st->st_ctim.tv_nsec;
+  out->stx_mtime.tv_sec = st->st_mtim.tv_sec;
+  out->stx_mtime.tv_nsec = st->st_mtim.tv_nsec;
+  out->stx_rdev_major = dev_major(st->st_rdev);
+  out->stx_rdev_minor = dev_minor(st->st_rdev);
+  out->stx_dev_major = dev_major(st->st_dev);
+  out->stx_dev_minor = dev_minor(st->st_dev);
+}
+
+/* Emulate statx on older kernels < 4.11 */
+static long statx_call(int dirfd, const char *path, int flags, unsigned mask, struct statx *out) {
+  struct stat st;
+  long rs;
+  if ((flags & ~(AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_STATX_SYNC_TYPE)) ||
+      (flags & AT_STATX_SYNC_TYPE) == AT_STATX_SYNC_TYPE)
+    return -EINVAL;
+  if (!statx_missing) {
+    rs = sc(SYS_statx, dirfd, (long)path, flags, mask, (long)out);
+    if (rs != -ENOSYS) return rs;
+    statx_missing = 1;
+  }
+  if (flags & AT_STATX_SYNC_TYPE) return -ENOSYS;
+  rs = sc(SYS_newfstatat, dirfd, (long)path, (long)&st,
+          flags & (AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT), 0);
+  if (rs < 0) return rs;
+  fill_statx(out, &st);
+  return 0;
+}
+
+/* Android before 11 (API 30) leaves statx out of the app seccomp allowlist: the kernel answers it with SIGSYS
+ * before proot's filter can let the trampoline's call through, and proot emulates it as a guest call. The path
+ * the fast path hands over is already a host path, so proot would translate it a second time; on a phone
+ * /data/user/0 is a link to /data/data and the canonical host path does not exist inside the guest, so every
+ * statx answered ENOENT (Rust's metadata(), uutils mkdir -p "Already exists", ls "cannot access"). There, statx
+ * goes the traced way with the guest's own path, as without the fast path. */
+static int statx_refused_by_android(void) {
+  static int refused = -1;
+  if (refused < 0) {
+    const char *value = getenv("PROOT_FP_ANDROID_API");
+    char *end = NULL;
+    long api = value && *value ? strtol(value, &end, 10) : 0;
+    refused = end && !*end && api > 0 && api < 30;
+  }
+  return refused;
+}
+
+static long fp_statx(int dirfd, const char *path, int flags, unsigned mask, struct statx *out) {
   struct res r;
   long rs;
-  if ((flags & AT_EMPTY_PATH) && !path[0] && fp_ready()) {
-    hits++;
-    return ret(sc(SYS_statx, dirfd, (long)"", flags, mask, (long)out));
-  }
+  if (statx_refused_by_android()) return FP_SLOW;
+  if (mask & STATX__RESERVED) return -EINVAL;
+  if (!out) return -EFAULT;
+  if (!path) return flags & AT_EMPTY_PATH ? FP_SLOW : -EFAULT;
+  if ((flags & AT_EMPTY_PATH) && !path[0] && fp_ready())
+    return statx_call(dirfd, "", flags, mask, out);
   rs = (flags & ~(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_STATX_SYNC_TYPE)) ? FP_SLOW
        : resolve(dirfd, path, (flags & AT_SYMLINK_NOFOLLOW ? 0 : 1) | MAY_BE_UNSEEN, &r);
   if (rs == 1) rs = -ENOENT;
   if (rs == 0 || rs == UNSEEN)
-    rs = sc(SYS_statx, AT_FDCWD, (long)r.host, flags | (rs == 0 && !r.magic ? AT_SYMLINK_NOFOLLOW : 0), mask, (long)out);
-  ANSWER(rs, dirfd, path, real_statx(dirfd, path, flags, mask, out));
+    rs = statx_call(AT_FDCWD, r.host, flags | (rs == 0 && !r.magic ? AT_SYMLINK_NOFOLLOW : 0), mask, out);
+  return rs;
+}
+
+int statx(int dirfd, const char *path, int flags, unsigned mask, struct statx *out) {
+  REAL(statx, int (*)(int, const char *, int, unsigned, struct statx *));
+  ANSWER(fp_statx(dirfd, path, flags, mask, out), dirfd, path,
+         real_statx ? real_statx(dirfd, path, flags, mask, out) : ret(sc(SYS_statx, dirfd, (long)path, flags, mask, (long)out)));
 }
 
 
@@ -812,8 +1033,7 @@ static int effective_is_real(void) {
   return !getauxval(AT_SECURE) && getuid() == geteuid() && getgid() == getegid();
 }
 
-static int access_common(int dirfd, const char *path, int mode, int flags) {
-  REAL(faccessat, int (*)(int, const char *, int, int));
+static long fp_access(int dirfd, const char *path, int mode, int flags) {
   struct res r;
   if ((flags & AT_EACCESS) && effective_is_real()) flags &= ~AT_EACCESS;
   long rs = (flags & ~AT_SYMLINK_NOFOLLOW) == 0
@@ -821,6 +1041,12 @@ static int access_common(int dirfd, const char *path, int mode, int flags) {
   if (rs == 1) rs = -ENOENT;
   if (rs == 0 && S_ISLNK(r.st.st_mode)) rs = FP_SLOW;
   if (rs == 0 || rs == UNSEEN) rs = sc(SYS_faccessat, AT_FDCWD, (long)r.host, mode, 0, 0);
+  return rs;
+}
+
+static int access_common(int dirfd, const char *path, int mode, int flags) {
+  REAL(faccessat, int (*)(int, const char *, int, int));
+  long rs = fp_access(dirfd, path, mode, flags);
   if (rs != FP_SLOW) { hits++; return ret(rs); }
   missed(__func__, dirfd, path);
   if (flags == 0) return (int)syscall(SYS_faccessat, dirfd, path, mode);
@@ -848,33 +1074,35 @@ static long link_text(const struct res *r, char *text, size_t size, int *changed
   return (long)strlen(text);
 }
 
-static ssize_t readlink_common(int dirfd, const char *path, char *buf, size_t size) {
-  REAL(readlinkat, ssize_t (*)(int, const char *, char *, size_t));
+static long fp_readlink(int dirfd, const char *path, char *buf, size_t size, size_t *written) {
   struct res r;
   char text[PATH_MAX];
   int changed;
   long rs = size ? resolve(dirfd, path, 0, &r) : FP_SLOW;
   if (rs == 1) rs = -ENOENT;
   if (rs == 0) rs = link_text(&r, text, size, &changed);
-  if (rs == FP_SLOW) {
-    missed(__func__, dirfd, path);
-    return real_readlinkat(dirfd, path, buf, size);
-  }
-  hits++;
-  if (rs < 0) return ret(rs);
+  if (rs < 0) return rs;
   size_t n = rs;
   if (!changed) {
     n = n < size ? n : size;
     memcpy(buf, text, n);
+    if (written) *written = n;
     return n;
   }
   size_t max = size < PATH_MAX ? size : PATH_MAX;
   if (n + 1 < max) {
     memcpy(buf, text, n + 1);
+    if (written) *written = n + 1;
     return n;
   }
   memcpy(buf, text, max);
+  if (written) *written = max;
   return max;
+}
+
+static ssize_t readlink_common(int dirfd, const char *path, char *buf, size_t size) {
+  REAL(readlinkat, ssize_t (*)(int, const char *, char *, size_t));
+  ANSWER(fp_readlink(dirfd, path, buf, size, NULL), dirfd, path, real_readlinkat(dirfd, path, buf, size));
 }
 ssize_t readlinkat(int dirfd, const char *path, char *buf, size_t size) { return readlink_common(dirfd, path, buf, size); }
 ssize_t readlink(const char *path, char *buf, size_t size) { return readlink_common(AT_FDCWD, path, buf, size); }
@@ -937,12 +1165,15 @@ char *__getcwd_chk(char *buf, size_t size, size_t room) {
 }
 
 
-int mkdirat(int dirfd, const char *path, mode_t mode) {
-  REAL(mkdirat, int (*)(int, const char *, mode_t));
+static long fp_mkdir(int dirfd, const char *path, mode_t mode) {
   struct res r;
   long rs = resolve(dirfd, path, MAY_BE_UNSEEN, &r);
   if (rs == 0 || rs == 1 || rs == UNSEEN) rs = sc(SYS_mkdirat, AT_FDCWD, (long)r.host, mode, 0, 0);
-  ANSWER(rs, dirfd, path, real_mkdirat(dirfd, path, mode));
+  return rs;
+}
+int mkdirat(int dirfd, const char *path, mode_t mode) {
+  REAL(mkdirat, int (*)(int, const char *, mode_t));
+  ANSWER(fp_mkdir(dirfd, path, mode), dirfd, path, real_mkdirat(dirfd, path, mode));
 }
 int mkdir(const char *path, mode_t mode) { return mkdirat(AT_FDCWD, path, mode); }
 
@@ -988,8 +1219,7 @@ int unlinkat(int dirfd, const char *path, int flags) { return unlink_common(dirf
 int unlink(const char *path) { return unlink_common(AT_FDCWD, path, 0); }
 int rmdir(const char *path) { return unlink_common(AT_FDCWD, path, AT_REMOVEDIR); }
 
-static int rename_common(int olddirfd, const char *old, int newdirfd, const char *new, unsigned flags) {
-  REAL(renameat2, int (*)(int, const char *, int, const char *, unsigned));
+static long fp_rename(int olddirfd, const char *old, int newdirfd, const char *new, unsigned flags) {
   struct res from, to;
   long rs = flags & ~RENAME_NOREPLACE || trailing_slash(old) || trailing_slash(new) ? FP_SLOW : resolve(olddirfd, old, 0, &from);
   if (rs == 1) rs = -ENOENT;
@@ -1004,6 +1234,11 @@ static int rename_common(int olddirfd, const char *old, int newdirfd, const char
       if (rs == 0) forget();
     }
   }
+  return rs;
+}
+static int rename_common(int olddirfd, const char *old, int newdirfd, const char *new, unsigned flags) {
+  REAL(renameat2, int (*)(int, const char *, int, const char *, unsigned));
+  long rs = fp_rename(olddirfd, old, newdirfd, new, flags);
   if (rs != FP_SLOW) { hits++; return ret(rs); }
   missed(__func__, olddirfd, old);
   if (!flags) return (int)syscall(SYS_renameat, olddirfd, old, newdirfd, new);
@@ -1015,30 +1250,35 @@ int renameat2(int olddirfd, const char *old, int newdirfd, const char *new, unsi
 int renameat(int olddirfd, const char *old, int newdirfd, const char *new) { return rename_common(olddirfd, old, newdirfd, new, 0); }
 int rename(const char *old, const char *new) { return rename_common(AT_FDCWD, old, AT_FDCWD, new, 0); }
 
-int symlinkat(const char *target, int dirfd, const char *path) {
-  REAL(symlinkat, int (*)(const char *, int, const char *));
+static long fp_symlink(const char *target, int dirfd, const char *path) {
   struct res r;
   long rs = trailing_slash(path) ? FP_SLOW : resolve(dirfd, path, MAY_BE_UNSEEN, &r);
   if (rs == 0 || rs == 1 || rs == UNSEEN) {
     rs = sc(SYS_symlinkat, (long)target, AT_FDCWD, (long)r.host, 0, 0);
     if (rs == 0) forget();
   }
-  ANSWER(rs, dirfd, path, real_symlinkat(target, dirfd, path));
+  return rs;
+}
+int symlinkat(const char *target, int dirfd, const char *path) {
+  REAL(symlinkat, int (*)(const char *, int, const char *));
+  ANSWER(fp_symlink(target, dirfd, path), dirfd, path, real_symlinkat(target, dirfd, path));
 }
 int symlink(const char *target, const char *path) { return symlinkat(target, AT_FDCWD, path); }
 
-int fchmodat(int dirfd, const char *path, mode_t mode, int flags) {
-  REAL(fchmodat, int (*)(int, const char *, mode_t, int));
+static long fp_chmod(int dirfd, const char *path, mode_t mode, int flags) {
   struct res r;
   long rs = flags ? FP_SLOW : resolve(dirfd, path, 1 | MAY_BE_UNSEEN, &r);
   if (rs == 1) rs = -ENOENT;
   if (rs == 0 || rs == UNSEEN) rs = sc(SYS_fchmodat, AT_FDCWD, (long)r.host, mode, 0, 0);
-  ANSWER(rs, dirfd, path, real_fchmodat(dirfd, path, mode, flags));
+  return rs;
+}
+int fchmodat(int dirfd, const char *path, mode_t mode, int flags) {
+  REAL(fchmodat, int (*)(int, const char *, mode_t, int));
+  ANSWER(fp_chmod(dirfd, path, mode, flags), dirfd, path, real_fchmodat(dirfd, path, mode, flags));
 }
 int chmod(const char *path, mode_t mode) { return fchmodat(AT_FDCWD, path, mode, 0); }
 
-static int utimens_common(int dirfd, const char *path, const struct timespec times[2], int flags) {
-  REAL(utimensat, int (*)(int, const char *, const struct timespec[2], int));
+static long fp_utimens(int dirfd, const char *path, const struct timespec times[2], int flags) {
   struct res r;
   long rs;
   if (!path && fp_ready()) {
@@ -1048,7 +1288,11 @@ static int utimens_common(int dirfd, const char *path, const struct timespec tim
     if (rs == 1) rs = -ENOENT;
     if (rs == 0 || rs == UNSEEN) rs = sc(SYS_utimensat, AT_FDCWD, (long)r.host, (long)times, flags, 0);
   }
-  ANSWER(rs, dirfd, path, real_utimensat(dirfd, path, times, flags));
+  return rs;
+}
+static int utimens_common(int dirfd, const char *path, const struct timespec times[2], int flags) {
+  REAL(utimensat, int (*)(int, const char *, const struct timespec[2], int));
+  ANSWER(fp_utimens(dirfd, path, times, flags), dirfd, path, real_utimensat(dirfd, path, times, flags));
 }
 int utimensat(int dirfd, const char *path, const struct timespec times[2], int flags) {
   return utimens_common(dirfd, path, times, flags);
@@ -1075,23 +1319,29 @@ int utime(const char *path, const struct utimbuf *times) {
   return utimens_common(AT_FDCWD, path, ts, 0);
 }
 
-int truncate(const char *path, off_t length) {
-  REAL(truncate, int (*)(const char *, off_t));
+static long fp_truncate(const char *path, off_t length) {
   struct res r;
   long rs = resolve(AT_FDCWD, path, 1 | MAY_BE_UNSEEN, &r);
   if (rs == 1) rs = -ENOENT;
   if (rs == 0 || rs == UNSEEN) rs = sc(SYS_truncate, (long)r.host, length, 0, 0, 0);
-  ANSWER(rs, AT_FDCWD, path, real_truncate(path, length));
+  return rs;
+}
+int truncate(const char *path, off_t length) {
+  REAL(truncate, int (*)(const char *, off_t));
+  ANSWER(fp_truncate(path, length), AT_FDCWD, path, real_truncate(path, length));
 }
 int truncate64(const char *path, off_t length) __attribute__((alias("truncate")));
 
-static int statfs_common(const char *path, struct statfs *buf, int (*real)(const char *, struct statfs *)) {
+static long fp_statfs(const char *path, struct statfs *buf) {
   struct res r;
   long rs = resolve(AT_FDCWD, path, 1, &r);
   if (rs == 1) rs = -ENOENT;
   if (rs == 0 && under(r.guest, "/dev/shm", 8)) rs = FP_SLOW;
   if (rs == 0) rs = sc(SYS_statfs, (long)r.host, (long)buf, 0, 0, 0);
-  ANSWER(rs, AT_FDCWD, path, real(path, buf));
+  return rs;
+}
+static int statfs_common(const char *path, struct statfs *buf, int (*real)(const char *, struct statfs *)) {
+  ANSWER(fp_statfs(path, buf), AT_FDCWD, path, real(path, buf));
 }
 int statfs(const char *path, struct statfs *buf) {
   REAL(statfs, int (*)(const char *, struct statfs *));
@@ -1139,12 +1389,16 @@ int statvfs64(const char *path, struct statvfs64 *buf) {
   return statvfs_common(path, (struct statvfs *)buf, real_statvfs64);
 }
 
-static ssize_t getxattr_common(const char *path, const char *name, void *value, size_t size, int follow,
-                               ssize_t (*real)(const char *, const char *, void *, size_t)) {
+static long fp_getxattr(const char *path, const char *name, void *value, size_t size, int follow) {
   struct res r;
   long rs = resolve(AT_FDCWD, path, follow | MAY_BE_UNSEEN, &r);
   if (rs == 1) rs = -ENOENT;
   if (rs == 0 || rs == UNSEEN) rs = sc(follow ? SYS_getxattr : SYS_lgetxattr, (long)r.host, (long)name, (long)value, size, 0);
+  return rs;
+}
+static ssize_t getxattr_common(const char *path, const char *name, void *value, size_t size, int follow,
+                               ssize_t (*real)(const char *, const char *, void *, size_t)) {
+  long rs = fp_getxattr(path, name, value, size, follow);
   if (rs != FP_SLOW) { hits++; return rs < 0 ? ret(rs) : rs; }
   missed(__func__, AT_FDCWD, path);
   return real(path, name, value, size);
@@ -1158,12 +1412,16 @@ ssize_t lgetxattr(const char *path, const char *name, void *value, size_t size) 
   return getxattr_common(path, name, value, size, 0, real_lgetxattr);
 }
 
-static ssize_t listxattr_common(const char *path, char *list, size_t size, int follow,
-                                ssize_t (*real)(const char *, char *, size_t)) {
+static long fp_listxattr(const char *path, char *list, size_t size, int follow) {
   struct res r;
   long rs = resolve(AT_FDCWD, path, follow | MAY_BE_UNSEEN, &r);
   if (rs == 1) rs = -ENOENT;
   if (rs == 0 || rs == UNSEEN) rs = sc(follow ? SYS_listxattr : SYS_llistxattr, (long)r.host, (long)list, size, 0, 0);
+  return rs;
+}
+static ssize_t listxattr_common(const char *path, char *list, size_t size, int follow,
+                                ssize_t (*real)(const char *, char *, size_t)) {
+  long rs = fp_listxattr(path, list, size, follow);
   if (rs != FP_SLOW) { hits++; return rs < 0 ? ret(rs) : rs; }
   missed(__func__, AT_FDCWD, path);
   return real(path, list, size);
@@ -1177,18 +1435,79 @@ ssize_t llistxattr(const char *path, char *list, size_t size) {
   return listxattr_common(path, list, size, 0, real_llistxattr);
 }
 
-int inotify_add_watch(int fd, const char *path, uint32_t mask) {
-  REAL(inotify_add_watch, int (*)(int, const char *, uint32_t));
+static long fp_inotify(int fd, const char *path, uint32_t mask) {
   struct res r;
   long rs = resolve(AT_FDCWD, path, (mask & IN_DONT_FOLLOW ? 0 : 1) | MAY_BE_UNSEEN, &r);
-  if (rs == 1) rs = -ENOENT;
-  if (rs == 0 || rs == UNSEEN) rs = sc(SYS_inotify_add_watch, fd, (long)r.host, mask, 0, 0);
-  ANSWER(rs, AT_FDCWD, path, real_inotify_add_watch(fd, path, mask));
+  if (rs == 0 || rs == 1 || rs == UNSEEN) rs = sc(SYS_inotify_add_watch, fd, (long)r.host, mask, 0, 0);
+  return rs;
+}
+int inotify_add_watch(int fd, const char *path, uint32_t mask) {
+  REAL(inotify_add_watch, int (*)(int, const char *, uint32_t));
+  ANSWER(fp_inotify(fd, path, mask), AT_FDCWD, path, real_inotify_add_watch(fd, path, mask));
 }
 
 
-static long socket_address(const struct sockaddr *addr, socklen_t len, int follow, struct sockaddr_un *out, socklen_t *out_len) {
+/* The kernel reports a socket named through /proc/self/fd/N/<name> under that name: map it back, per socket. */
+enum { LONG_SELF, LONG_PEER };
+static struct { unsigned long ino; int kind; char name[sizeof ((struct sockaddr_un *)0)->sun_path]; char guest[sizeof ((struct sockaddr_un *)0)->sun_path]; } long_names[64];
+static unsigned long_next;
+static pthread_mutex_t long_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static const char *fd_name(const char *path) {
+  if (strncmp(path, "/proc/self/fd/", 14) != 0) return NULL;
+  const char *p = path + 14;
+  if (*p < '0' || *p > '9') return NULL;
+  while (*p >= '0' && *p <= '9') p++;
+  return *p == '/' && p[1] ? p + 1 : NULL;
+}
+
+static unsigned long socket_ino(int fd) {
+  struct stat st;
+  return sc(SYS_newfstatat, fd, (long)"", (long)&st, AT_EMPTY_PATH, 0) == 0 ? (unsigned long)st.st_ino : 0;
+}
+
+static void remember_long(int fd, int kind, const char *name, const char *guest) {
+  unsigned long ino = socket_ino(fd);
+  if (!ino || !name || strlen(name) >= sizeof long_names[0].name || strlen(guest) >= sizeof long_names[0].guest) return;
+  unsigned count = sizeof long_names / sizeof long_names[0], i = count;
+  pthread_mutex_lock(&long_lock);
+  for (unsigned n = 0; n < count && i == count; n++)
+    if (long_names[n].ino == ino && long_names[n].kind == kind) i = n;
+  if (i == count) i = long_next++ % count;
+  long_names[i].ino = ino;
+  long_names[i].kind = kind;
+  snprintf(long_names[i].name, sizeof long_names[i].name, "%s", name);
+  snprintf(long_names[i].guest, sizeof long_names[i].guest, "%s", guest);
+  pthread_mutex_unlock(&long_lock);
+}
+
+static int long_entry(int fd, int kind, const char *name, char *guest, size_t size) {
+  unsigned long ino = socket_ino(fd);
+  int found = -1;
+  if (!ino || !name) return -1;
+  pthread_mutex_lock(&long_lock);
+  for (unsigned n = 0; n < sizeof long_names / sizeof long_names[0] && found < 0; n++)
+    if (long_names[n].ino == ino && long_names[n].kind == kind && strcmp(long_names[n].name, name) == 0
+        && strlen(long_names[n].guest) < size) {
+      memcpy(guest, long_names[n].guest, strlen(long_names[n].guest) + 1);
+      found = 0;
+    }
+  pthread_mutex_unlock(&long_lock);
+  return found;
+}
+
+static void remember_long_address(int fd, int kind, const struct sockaddr *addr, socklen_t len, const struct sockaddr_un *used) {
   const struct sockaddr_un *un = (const struct sockaddr_un *)addr;
+  char guest[sizeof un->sun_path + 1];
+  size_t glen = strnlen(un->sun_path, len - offsetof(struct sockaddr_un, sun_path));
+  memcpy(guest, un->sun_path, glen);
+  guest[glen] = 0;
+  remember_long(fd, kind, fd_name(used->sun_path), guest);
+}
+
+static long socket_address(const struct sockaddr *addr, socklen_t len, int follow, struct sockaddr_un *out, socklen_t *out_len, long *dir) {
+  const struct sockaddr_un *un = (const struct sockaddr_un *)addr;
+  *dir = -1;
   size_t room = sizeof un->sun_path;
   if (!addr || len <= offsetof(struct sockaddr_un, sun_path) || addr->sa_family != AF_UNIX || un->sun_path[0] == 0)
     return 0;
@@ -1204,10 +1523,20 @@ static long socket_address(const struct sockaddr *addr, socklen_t len, int follo
   if (rs == 1 && follow) return -ENOENT;
   if (r.magic) return FP_SLOW;
   size_t hlen = strlen(r.host);
-  if (hlen >= room) return FP_SLOW;
   memset(out, 0, sizeof *out);
   out->sun_family = AF_UNIX;
-  memcpy(out->sun_path, r.host, hlen + 1);
+  if (hlen >= room) {
+    /* proot would bind it to a temporary name the fast path cannot see: name it through its directory. */
+    char *slash = strrchr(r.host, '/');
+    if (!slash || slash == r.host) return FP_SLOW;
+    *slash = 0;
+    *dir = sc(SYS_openat, AT_FDCWD, (long)r.host, O_PATH | O_DIRECTORY | O_CLOEXEC, 0, 0);
+    if (*dir < 0) return FP_SLOW;
+    hlen = snprintf(out->sun_path, room, "/proc/self/fd/%ld/%s", *dir, slash + 1);
+    if (hlen >= room) { sc(SYS_close, *dir, 0, 0, 0, 0); *dir = -1; return FP_SLOW; }
+  } else {
+    memcpy(out->sun_path, r.host, hlen + 1);
+  }
   *out_len = offsetof(struct sockaddr_un, sun_path) + hlen + 1;
   return 1;
 }
@@ -1221,10 +1550,15 @@ int connect(int fd, const struct sockaddr *addr, socklen_t len) {
   REAL(connect, int (*)(int, const struct sockaddr *, socklen_t));
   struct sockaddr_un un;
   socklen_t un_len;
-  long rs = fp_ready() ? socket_address(addr, len, 1, &un, &un_len) : FP_SLOW;
+  long dir = -1;
+  long rs = fp_ready() ? socket_address(addr, len, 1, &un, &un_len, &dir) : FP_SLOW;
   if (rs == 0 && !(addr && addr->sa_family == AF_UNIX) && !nonblocking(fd)) rs = FP_SLOW;
   if (rs == 0) rs = sc(SYS_connect, fd, (long)addr, len, 0, 0);
   else if (rs == 1) rs = sc(SYS_connect, fd, (long)&un, un_len, 0, 0);
+  if (dir >= 0) {
+    sc(SYS_close, dir, 0, 0, 0, 0);
+    if (rs == 0 || rs == -EINPROGRESS) remember_long_address(fd, LONG_PEER, addr, len, &un);
+  }
   ANSWER(rs, AT_FDCWD, "(connect)", real_connect(fd, addr, len));
 }
 
@@ -1232,13 +1566,18 @@ int bind(int fd, const struct sockaddr *addr, socklen_t len) {
   REAL(bind, int (*)(int, const struct sockaddr *, socklen_t));
   struct sockaddr_un un;
   socklen_t un_len;
-  long rs = fp_ready() ? socket_address(addr, len, 0, &un, &un_len) : FP_SLOW;
+  long dir = -1;
+  long rs = fp_ready() ? socket_address(addr, len, 0, &un, &un_len, &dir) : FP_SLOW;
   if (rs == 0) rs = sc(SYS_bind, fd, (long)addr, len, 0, 0);
   else if (rs == 1) rs = sc(SYS_bind, fd, (long)&un, un_len, 0, 0);
+  if (dir >= 0) {
+    sc(SYS_close, dir, 0, 0, 0, 0);
+    if (rs == 0) remember_long_address(fd, LONG_SELF, addr, len, &un);
+  }
   ANSWER(rs, AT_FDCWD, "(bind)", real_bind(fd, addr, len));
 }
 
-static void report_address(const struct sockaddr_storage *got, socklen_t got_len, struct sockaddr *addr, socklen_t *len) {
+static void report_address(int fd, int kind, const struct sockaddr_storage *got, socklen_t got_len, struct sockaddr *addr, socklen_t *len) {
   struct sockaddr_storage shown = *got;
   socklen_t shown_len = got_len;
   const struct sockaddr_un *un = (const struct sockaddr_un *)got;
@@ -1248,7 +1587,7 @@ static void report_address(const struct sockaddr_storage *got, socklen_t got_len
     memcpy(h, un->sun_path, hl);
     h[hl] = 0;
     struct sockaddr_un *out = (struct sockaddr_un *)&shown;
-    if (to_guest(h, g, sizeof g) == 0 && strlen(g) < sizeof out->sun_path) {
+    if ((long_entry(fd, kind, fd_name(h), g, sizeof g) == 0 || to_guest(h, g, sizeof g) == 0) && strlen(g) < sizeof out->sun_path) {
       memset(out->sun_path, 0, sizeof out->sun_path);
       strcpy(out->sun_path, g);
       shown_len = offsetof(struct sockaddr_un, sun_path) + strlen(g) + 1;
@@ -1258,6 +1597,22 @@ static void report_address(const struct sockaddr_storage *got, socklen_t got_len
   *len = shown_len;
 }
 
+
+static void inherit_long_name(int listener, int accepted) {
+  unsigned long ino = socket_ino(listener);
+  char name[sizeof long_names[0].name], guest[sizeof long_names[0].guest];
+  int found = -1;
+  if (!ino) return;
+  pthread_mutex_lock(&long_lock);
+  for (unsigned n = 0; n < sizeof long_names / sizeof long_names[0] && found < 0; n++)
+    if (long_names[n].ino == ino && long_names[n].kind == LONG_SELF) {
+      snprintf(name, sizeof name, "%s", long_names[n].name);
+      snprintf(guest, sizeof guest, "%s", long_names[n].guest);
+      found = 0;
+    }
+  pthread_mutex_unlock(&long_lock);
+  if (found == 0) remember_long(accepted, LONG_SELF, name, guest);
+}
 
 static int pending(int fd) {
   struct pollfd p = { .fd = fd, .events = POLLIN };
@@ -1269,11 +1624,12 @@ static int accept_common(int fd, struct sockaddr *addr, socklen_t *len, int flag
   REAL(accept4, int (*)(int, struct sockaddr *, socklen_t *, int));
   if (!fp_ready() || (addr && !len) || (!nonblocking(fd) && !pending(fd))) { missed(__func__, AT_FDCWD, "(accept)"); return real_accept4(fd, addr, len, flags); }
   hits++;
-  if (!addr) return ret(sc(SYS_accept4, fd, 0, 0, flags, 0));
   struct sockaddr_storage got;
   socklen_t got_len = sizeof got;
-  long r = sc(SYS_accept4, fd, (long)&got, (long)&got_len, flags, 0);
-  if (r >= 0) report_address(&got, got_len, addr, len);
+  long r = sc(SYS_accept4, fd, addr ? (long)&got : 0, addr ? (long)&got_len : 0, flags, 0);
+  if (r >= 0) inherit_long_name(fd, (int)r);
+  if (!addr) return ret(r);
+  if (r >= 0) report_address((int)r, LONG_PEER, &got, got_len, addr, len);
   return ret(r);
 }
 int accept4(int fd, struct sockaddr *addr, socklen_t *len, int flags) { return accept_common(fd, addr, len, flags); }
@@ -1285,7 +1641,7 @@ static int name_common(long nr, int fd, struct sockaddr *addr, socklen_t *len, i
   struct sockaddr_storage got;
   socklen_t got_len = sizeof got;
   long r = sc(nr, fd, (long)&got, (long)&got_len, 0, 0);
-  if (r == 0) report_address(&got, got_len, addr, len);
+  if (r == 0) report_address(fd, nr == SYS_getsockname ? LONG_SELF : LONG_PEER, &got, got_len, addr, len);
   return ret(r);
 }
 int getsockname(int fd, struct sockaddr *addr, socklen_t *len) {
@@ -1583,3 +1939,5 @@ struct passwd *getpwuid(uid_t uid) {
   missed(__func__, AT_FDCWD, "(passwd)");
   return real_getpwuid(uid);
 }
+
+#include "svc-patch.h"

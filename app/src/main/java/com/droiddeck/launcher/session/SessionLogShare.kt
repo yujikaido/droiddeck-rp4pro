@@ -12,6 +12,7 @@ import androidx.compose.runtime.setValue
 import androidx.core.content.FileProvider
 import com.droiddeck.launcher.R
 import com.droiddeck.launcher.core.LogRedactor
+import com.droiddeck.launcher.runtime.BattleNet
 import com.droiddeck.launcher.runtime.LinuxRuntime
 import java.io.File
 import java.util.zip.ZipEntry
@@ -39,21 +40,26 @@ object SessionLogShare {
 
     fun zipFolder(context: Context, folder: File, onProgress: ((Float) -> Unit)? = null): File? {
         if (!folder.isDirectory) return null
-        val files = folder.walkTopDown().filter { it.isFile }
-            .filterNot { it.parentFile?.name == "steam" && it.length() > STEAM_LOG_MAX_BYTES }.toList()
+        val files = sessionFiles(folder)
         if (files.isEmpty()) return null
+        // A session that never ran (start cancelled during the runtime download, or stopped at once) holds
+        // almost nothing; the problem the player means is in the last one that ran, so that one comes along.
+        val earlier = if (ran(folder)) null else lastRunBefore(context, folder)
+        val earlierFiles = earlier?.let(::sessionFiles).orEmpty()
         val out = shareDir(context).apply { mkdirs() }
         pruneShared(out)
         val zip = File(out, "DroidDeck-${folder.name}.zip")
         val part = File(out, zip.name + ".part")
         LogRedactor.learnFromRuntime(LinuxRuntime.rootDir(context))
+        val diag = exitDiagCut(folder, files, out)
         val live = liveSteamLogs(context, folder)
         val proton = protonLogs(context, files, out)
         val game = gameLogs(context, files, out)
         val logs = LinuxRuntime.logDir(context)
         val stores = recent(File(logs, STORES_DIR))
         val tools = recent(File(logs, SessionPaths.TOOLS_DIR))
-        val total = (files + live + proton + stores + tools + game.map { it.first }).sumOf { it.length() }.coerceAtLeast(1L)
+        val battleNet = battleNetLogs(context)
+        val total = (files + earlierFiles + live + proton + game.map { it.first } + stores + tools + battleNet.map { it.second }).sumOf { it.length() }.coerceAtLeast(1L)
         var done = 0L
         var shown = -1
         fun advance(f: File) {
@@ -62,33 +68,45 @@ object SessionLogShare {
             if (percent != shown) { shown = percent; onProgress?.invoke(percent / 100f) }
         }
         ZipOutputStream(part.outputStream().buffered()).use { z ->
-            files.forEach { f -> addEntry(z, folder.name + "/" + f.relativeTo(folder).path, f); advance(f) }
+            files.forEach { f -> addEntry(z, folder.name + "/" + f.relativeTo(folder).invariantSeparatorsPath, diag[f] ?: f); advance(f) }
+            if (earlier != null) earlierFiles.forEach { f -> addEntry(z, earlier.name + "/" + f.relativeTo(earlier).invariantSeparatorsPath, f); advance(f) }
             live.forEach { f -> addEntry(z, folder.name + "/steam/" + f.name, f); advance(f) }
             proton.forEach { f -> addEntry(z, folder.name + "/proton/" + f.name, f); advance(f) }
             game.forEach { (f, name) -> addEntry(z, folder.name + "/game/" + name, f); advance(f) }
             stores.forEach { f -> addEntry(z, "$STORES_DIR/" + f.name, f); advance(f) }
             tools.forEach { f -> addEntry(z, SessionPaths.TOOLS_DIR + "/" + f.name, f); advance(f) }
+            battleNet.forEach { (name, f) -> addEntry(z, "$BATTLENET_DIR/$name", f); advance(f) }
         }
         /* Renamed into place: an app still reading the zip shared before keeps the copy it opened. */
         if (!part.renameTo(zip)) { part.delete(); return null }
         return zip
     }
 
+    /** Every entry is scrubbed line by line, whatever its size: a raw copy can carry tokens out of the device. */
+    private fun sessionFiles(folder: File): List<File> = folder.walkTopDown().filter { it.isFile }
+        .filterNot { it.parentFile?.name == "steam" && it.length() > STEAM_LOG_MAX_BYTES }.toList()
+
+    /** The session got as far as starting its programs: session.log is written from then on. */
+    internal fun ran(folder: File): Boolean = File(folder, "session.log").isFile
+
+    /** The newest session before [folder] that ran, if any. */
+    internal fun lastRunBefore(context: Context, folder: File): File? {
+        val all = SessionPaths.sessionFolders(context)
+        val at = all.indexOfFirst { it.canonicalPath == folder.canonicalPath }
+        return (if (at < 0) all else all.take(at)).lastOrNull { it.canonicalPath != folder.canonicalPath && ran(it) }
+    }
+
     private fun addEntry(z: ZipOutputStream, name: String, f: File) {
         z.putNextEntry(ZipEntry(name))
-        if (LogRedactor.isText(f)) {
-            val w = z.bufferedWriter()
-            LogRedactor.scrubForShare(f, w)
-            w.flush()
-        } else {
-            f.inputStream().use { it.copyTo(z) }
-        }
+        val w = z.bufferedWriter()
+        LogRedactor.scrubForShare(f, w)
+        w.flush()
         z.closeEntry()
     }
 
     private fun liveSteamLogs(context: Context, folder: File): List<File> {
         if (folder != SessionPaths.current() || File(folder, "steam").exists()) return emptyList()
-        val logs = File(LinuxRuntime.rootDir(context), "root/.local/share/Steam/logs")
+        val logs = File(SessionPrefs.activeSteamRoot(context), "logs")
         return logs.listFiles()?.filter { it.isFile && it.length() <= STEAM_LOG_MAX_BYTES }.orEmpty()
     }
 
@@ -98,8 +116,8 @@ object SessionLogShare {
     private fun protonLogs(context: Context, files: List<File>, out: File): List<File> {
         val from = files.minOfOrNull { it.lastModified() } ?: return emptyList()
         val to = files.maxOf { it.lastModified() }
-        val home = File(LinuxRuntime.rootDir(context), "root")
-        val logs = home.listFiles { f -> f.isFile && PROTON_LOG.matches(f.name) && f.lastModified() in from..to }.orEmpty()
+        val homes = listOf("root", "root/.droiddeck-x64").map { File(LinuxRuntime.rootDir(context), it) }
+        val logs = homes.flatMap { home -> home.listFiles { f -> f.isFile && PROTON_LOG.matches(f.name) && f.lastModified() in from..to }.orEmpty().toList() }
         return logs.sortedBy { it.name }.map { f -> if (f.length() <= PROTON_LOG_MAX_BYTES) f else tail(f, File(out, f.name)) }
     }
 
@@ -113,7 +131,8 @@ object SessionLogShare {
     private fun gameLogs(context: Context, files: List<File>, out: File): List<Pair<File, String>> {
         val from = files.minOfOrNull { it.lastModified() } ?: return emptyList()
         val to = maxOf(files.maxOf { it.lastModified() }, System.currentTimeMillis())
-        val steam = File(LinuxRuntime.rootDir(context), "root/.local/share/Steam")
+        val steams = listOf("arm64", "x86_64").map { SessionPrefs.steamRoot(context, it) }.filter { it.isDirectory }
+        val steam = steams.firstOrNull() ?: return emptyList()
         val found = mutableListOf<Pair<File, String>>()
         val seen = HashSet<String>()
         fun take(candidates: Sequence<File>, name: (File) -> String) {
@@ -127,7 +146,7 @@ object SessionLogShare {
                 found += kept to entry
             }
         }
-        for (prefix in File(steam, "steamapps/compatdata").listFiles().orEmpty()) {
+        for (prefix in steams.flatMap { File(it, "steamapps/compatdata").listFiles().orEmpty().toList() }) {
             val user = File(prefix, "pfx/drive_c/users/steamuser")
             val appData = File(user, "AppData")
             if (!user.isDirectory) continue
@@ -144,7 +163,7 @@ object SessionLogShare {
                     File(user, "$docs/My Games").walkTopDown().maxDepth(3)
                         .filter { it.isFile && (it.extension == "log" || it.extension == "txt") }
                 },
-            ).flatten()) { f -> prefix.name + "/" + f.relativeTo(if (f.startsWith(appData)) appData else user).path }
+            ).flatten()) { f -> prefix.name + "/" + f.relativeTo(if (f.startsWith(appData)) appData else user).invariantSeparatorsPath }
         }
         for ((library, appIds) in installLibraries(context, steam)) {
             // Two directory levels per library (<game>/ and <game>/<project>/): a few hundred
@@ -157,7 +176,7 @@ object SessionLogShare {
                 File(s, "Logs").listFiles { f -> f.name.endsWith(".log") }.orEmpty().asSequence() +
                     File(s, "Crashes").listFiles().orEmpty().asSequence().flatMap(::unrealCrash)
             }) { f ->
-                val path = f.relativeTo(library).path
+                val path = f.relativeTo(library).invariantSeparatorsPath
                 (appIds[path.substringBefore('/')] ?: "added") + "/" + path
             }
         }
@@ -191,12 +210,21 @@ object SessionLogShare {
         return out + added.filter { it.isDirectory }.distinctBy { it.absolutePath }.map { it to emptyMap() }
     }
 
-    private fun tail(f: File, to: File): File {
+    /* Exit-at-start diagnostics (droiddeck-game-env take_exit_diag): the launch after a title closed without a frame writes
+     * Proton's log (+loaddll, +seh: large) into <session>/exit-diag/. Each file comes along cut to its last
+     * EXIT_DIAG_MAX_BYTES, where the exit is; the cut copies live in the share folder and go with it (pruneShared). */
+    private fun exitDiagCut(folder: File, files: List<File>, out: File): Map<File, File> {
+        val dir = File(folder, EXIT_DIAG_DIR)
+        return files.filter { it.parentFile == dir && it.length() > EXIT_DIAG_MAX_BYTES }
+            .associateWith { f -> tail(f, File(out, "$EXIT_DIAG_DIR-${f.name}"), EXIT_DIAG_MAX_BYTES) }
+    }
+
+    private fun tail(f: File, to: File, keep: Long = PROTON_LOG_MAX_BYTES): File {
         java.io.RandomAccessFile(f, "r").use { r ->
-            r.seek(f.length() - PROTON_LOG_MAX_BYTES)
+            r.seek(f.length() - keep)
             r.readLine() // from the next whole line
             to.outputStream().buffered().use { o ->
-                o.write("[first ${f.length() - PROTON_LOG_MAX_BYTES} bytes left out]\n".toByteArray())
+                o.write("[first ${f.length() - keep} bytes left out]\n".toByteArray())
                 val buf = ByteArray(64 * 1024)
                 while (true) { val n = r.read(buf); if (n < 0) break; o.write(buf, 0, n) }
             }
@@ -211,11 +239,34 @@ object SessionLogShare {
     private val NOT_PROJECTS = setOf("Binaries", "Content", "Engine", "Saved")
     private const val PROTON_LOG_MAX_BYTES = 8L * 1024 * 1024
     private const val STEAM_LOG_MAX_BYTES = 8L * 1024 * 1024
+    private const val EXIT_DIAG_DIR = "exit-diag"
+    private const val EXIT_DIAG_MAX_BYTES = 4L * 1024 * 1024
 
     const val STORES_DIR = "stores"
     private const val RECENT_DAYS = 7
 
     private fun shareDir(context: Context): File = File(context.cacheDir, "share")
+
+    private const val BATTLENET_DIR = "battlenet"
+
+    private fun battleNetLogs(context: Context): List<Pair<String, File>> {
+        val drive = File(BattleNet.prefix(context), "pfx/drive_c")
+        val data = File(drive, "ProgramData/Battle.net")
+        fun logsUnder(dir: File, prefix: String) = dir.listFiles { f -> f.isDirectory && f.name.startsWith(prefix) }.orEmpty().map { File(it, "Logs") }
+        return newest("droiddeck", listOf(File(LinuxRuntime.rootDir(context), "root/.cache/droiddeck/battlenet")), 2, setOf("battlenet.log", "spawned.log")) +
+            newest("client", listOf(File(drive, "users/steamuser/AppData/Local/Battle.net/Logs")), 6) +
+            newest("agent", listOf(File(data, "Agent/Logs")) + logsUnder(File(data, "Agent"), "Agent."), 10, byDir = true) +
+            newest("setup", logsUnder(File(data, "Setup"), ""), 3, byDir = true)
+    }
+
+    private fun newest(folder: String, dirs: List<File>, count: Int, names: Set<String>? = null, byDir: Boolean = false): List<Pair<String, File>> {
+        val since = System.currentTimeMillis() - RECENT_DAYS * 86_400_000L
+        return dirs.flatMap { dir ->
+            dir.listFiles { f -> f.isFile && f.name.endsWith(".log") && (names == null || f.name in names) && f.lastModified() >= since && f.length() <= STEAM_LOG_MAX_BYTES }.orEmpty().toList()
+        }.sortedByDescending { it.lastModified() }.take(count).map { f ->
+            (if (byDir) "$folder/${f.parentFile?.parentFile?.name}/${f.name}" else "$folder/${f.name}") to f
+        }
+    }
 
     private fun recent(dir: File): List<File> {
         val since = System.currentTimeMillis() - RECENT_DAYS * 86_400_000L

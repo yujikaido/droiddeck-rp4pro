@@ -11,6 +11,10 @@ import org.w3c.dom.Element
  * a key added to values/ without them fails here instead of showing English to those players.
  * Strings marked translatable="false" are left out. The placeholders (%1$s, %2$d, %%) must match too,
  * since a missing or extra one throws when the string is formatted.
+ *
+ * Restored from the v0.5.4.x line (fork d8d5eeabc). There is no list of known gaps any more: the 65 keys that
+ * arrived without all four translations (DroidDeck 0.6.9's and v0.5.5's own) have them, and nothing may be added
+ * to values/ without them.
  */
 class TranslationCoverageTest {
     private val res = File("src/main/res")
@@ -30,7 +34,7 @@ class TranslationCoverageTest {
         return out
     }
 
-    private fun placeholders(text: String) = PLACEHOLDER.findAll(text).map { it.value }.toSortedSet()
+    private fun placeholders(text: String) = PLACEHOLDER.findAll(text).map { it.value }.toList().sorted()
 
     @Test fun everyTranslatableStringIsInChineseAndKorean() {
         val base = load("values").filterValues { it.translatable }

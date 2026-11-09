@@ -74,13 +74,11 @@ internal class ComponentsMenu(private val activity: android.app.Activity, privat
         if (compChecking) return
         compChecking = true
         Thread({
-            com.droiddeck.launcher.core.DownloadProblem.forget()
             val cat = runCatching { ComponentsManager.catalog(activity, force) }.getOrNull()
-            val unreachable = com.droiddeck.launcher.core.DownloadProblem.explain(activity, activity.getString(R.string.comp_nightlies_unreachable))
             ui.post {
                 compChecking = false
                 if (cat != null && cat.items.isNotEmpty()) { compCatalog = cat.items; compCatalogAt = cat.fetchedAt }
-                else if (force) android.widget.Toast.makeText(activity, unreachable, android.widget.Toast.LENGTH_LONG).show()
+                else if (force) android.widget.Toast.makeText(activity, activity.getString(R.string.comp_nightlies_unreachable), android.widget.Toast.LENGTH_LONG).show()
             }
         }, "components-catalog").start()
     }

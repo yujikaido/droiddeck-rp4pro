@@ -1,6 +1,7 @@
 import importlib.machinery
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -147,6 +148,18 @@ class ShortcutsTest(unittest.TestCase):
         self.assertEqual({'1': 'Favorites', '0': shortcuts.TAG}, entry['tags'])
         self.assertEqual({'0': shortcuts.TAG}, shortcuts.merge(shortcuts.shortcut(self.game()), dict(shortcuts.shortcut(self.game()), tags={}), None, 0)[0]['tags'])
 
+    def test_a_copy_the_running_client_added_of_an_added_game_is_dropped(self):
+        self.run_writer(self.game())
+        path = self.config / 'shortcuts.vdf'
+        data = shortcuts.parse(path.read_bytes())['shortcuts']
+        live = dict(shortcuts.shortcut(self.game(appid=0x91234567)), tags={})
+        own = dict(shortcuts.shortcut(self.game(exe='Other.exe', appid=0x92345678)), tags={})
+        renamed = dict(shortcuts.shortcut(self.game(appid=0x93456789, name='My copy')), tags={})
+        data.update({'7': live, '8': own, '9': renamed})
+        path.write_bytes(shortcuts.write({'shortcuts': data}))
+        entries = self.run_writer(self.game())
+        self.assertEqual({APPID, 0x92345678, 0x93456789}, set(entries))
+
     def test_a_damaged_record_is_started_over(self):
         self.run_writer(self.game())
         (self.config / shortcuts.RECORD).write_text('{not json')
@@ -190,6 +203,87 @@ class ShortcutsTest(unittest.TestCase):
         steam = self.record()['games'][str(APPID)]['steam']
         self.assertEqual('-vulkan', steam['LaunchOptions'])
         self.assertEqual('Mine', steam['AppName'])
+
+    def users(self, *blocks):
+        body = ''.join('\t"%d"\n\t{\n%s\t}\n' % (76561197960265728 + acct, ''.join('\t\t"%s"\t\t"%s"\n' % kv for kv in keys.items()))
+                       for acct, keys in blocks)
+        (self.steam / 'config').mkdir(exist_ok=True)
+        (self.steam / 'config/loginusers.vdf').write_text('"users"\n{\n%s}\n' % body)
+        (self.steam / 'userdata/456/config').mkdir(parents=True, exist_ok=True)
+
+    def test_the_account_marked_most_recent_is_used(self):
+        self.users((123, dict(MostRecent='1', AutoLogin='0', timestamp='100')), (456, dict(MostRecent='0', AutoLogin='1', timestamp='200')))
+        self.assertEqual(str(self.steam / 'userdata/123'), shortcuts.account_dir(str(self.steam)))
+
+    def test_without_most_recent_the_account_that_signs_in_is_used(self):
+        self.users((123, dict(AutoLogin='1', timestamp='100')), (456, dict(AutoLogin='0', timestamp='200')))
+        self.assertEqual(str(self.steam / 'userdata/123'), shortcuts.account_dir(str(self.steam)))
+        self.assertIn(APPID, self.run_writer(self.game()))
+
+    def test_without_either_mark_the_account_used_last_is_used(self):
+        self.users((456, dict(AutoLogin='0', timestamp='100')), (123, dict(AutoLogin='0', timestamp='200')))
+        self.assertEqual(str(self.steam / 'userdata/123'), shortcuts.account_dir(str(self.steam)))
+
+    def test_two_accounts_without_any_mark_write_nothing(self):
+        self.users((123, dict(AccountName='a')), (456, dict(AccountName='b')))
+        self.assertIsNone(shortcuts.account_dir(str(self.steam)))
+    # Lenovo tablet, 2026-10-29, anonymised: two accounts signed in on two days, neither
+    # marked MostRecent, keys as Steam writes them; "no signed-in account yet" at both runs.
+    def login_users(self, *accounts):
+        body = ''.join('\t"%d"\n\t{\n%s\t}\n' % (76561197960265728 + acct, ''.join('\t\t"%s"\t\t"%s"\n' % kv for kv in keys.items()))
+                       for acct, keys in accounts)
+        (self.steam / 'config').mkdir(exist_ok=True)
+        (self.steam / 'config/loginusers.vdf').write_text('"users"\n{\n%s}\n' % body)
+
+    def account(self, acct, localconfig_age=None):
+        config = self.steam / ('userdata/%d/config' % acct)
+        config.mkdir(parents=True, exist_ok=True)
+        if localconfig_age is not None:
+            path = config / 'localconfig.vdf'
+            path.write_text('"UserLocalConfigStore"\n{\n}\n')
+            stamp = 1793230000 - localconfig_age
+            os.utime(path, (stamp, stamp))
+
+    def keys(self, name, recent='0', auto='0', stamp='0'):
+        return {'AccountName': name, 'PersonaName': name, 'RememberPassword': '1', 'WantsOfflineMode': '0',
+                'SkipOfflineModeWarning': '0', 'AllowAutoLogin': auto, 'MostRecent': recent, 'Timestamp': stamp}
+
+    def test_two_accounts_without_most_recent_the_newest_timestamp_is_used(self):
+        self.account(9993761)
+        self.account(9990668)
+        self.login_users((9993761, self.keys('first', stamp='1793150000')), (9990668, self.keys('second', stamp='1793237926')))
+        self.assertEqual(str(self.steam / 'userdata/9990668'), shortcuts.account_dir(str(self.steam)))
+        self.config = self.steam / 'userdata/9990668/config'
+        self.assertIn(APPID, self.run_writer(self.game()))
+
+    def test_the_account_marked_most_recent_wins(self):
+        self.login_users((9993761, self.keys('first', recent='1', stamp='100')), (9990668, self.keys('second', auto='1', stamp='200')))
+        self.assertEqual(str(self.steam / 'userdata/9993761'), shortcuts.account_dir(str(self.steam)))
+
+    def test_without_most_recent_the_account_that_signs_in_by_itself_wins(self):
+        self.login_users((9993761, self.keys('first', auto='1', stamp='100')), (9990668, self.keys('second', stamp='200')))
+        self.assertEqual(str(self.steam / 'userdata/9993761'), shortcuts.account_dir(str(self.steam)))
+
+    def test_lower_case_keys_count_too(self):
+        self.login_users((9993761, {'mostrecent': '1'}), (9990668, {'timestamp': '200'}))
+        self.assertEqual(str(self.steam / 'userdata/9993761'), shortcuts.account_dir(str(self.steam)))
+
+    def test_no_marks_the_userdata_folder_written_last_is_used(self):
+        self.account(9993761, localconfig_age=86400)
+        self.account(9990668, localconfig_age=60)
+        self.login_users((9993761, {'AccountName': 'first'}), (9990668, {'AccountName': 'second'}))
+        self.assertEqual(str(self.steam / 'userdata/9990668'), shortcuts.account_dir(str(self.steam)))
+        (self.steam / 'config/loginusers.vdf').unlink()
+        self.assertEqual(str(self.steam / 'userdata/9990668'), shortcuts.account_dir(str(self.steam)))
+
+    def test_two_folders_and_nothing_else_write_nothing(self):
+        self.account(9993761)
+        self.account(9990668)
+        self.assertIsNone(shortcuts.account_dir(str(self.steam)))
+        self.listing.write_text(json.dumps([self.game()]))
+        out = subprocess.run(['python3', str(BIN / 'droiddeck-steam-shortcuts'), str(self.steam), str(self.listing)],
+                             check=True, capture_output=True, text=True).stdout
+        self.assertIn('no signed-in account yet', out)
 
     def test_an_older_record_without_launch_options_still_takes_the_apps(self):
         self.run_writer(self.game())

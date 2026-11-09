@@ -11,17 +11,6 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
-/**
- * Clocks and thermal state through a Mali bridge session, into the session folder
- * (vkbridge-clocks.log), for telling the bridge's overhead apart from the phone holding the chip
- * back: Samsung's SSRM lowers the CPU policies' scaling_max_freq when the device warms, so a
- * policy whose max is below its cpuinfo_max_freq is being clamped (upstream issue #64).
- *
- * Every [PERIOD_MS]: each CPU policy as cur/max(hardware max) MHz, the GPU clock from the first
- * Mali/MediaTek source the app may read, and Android's thermal status and headroom. Which GPU
- * sources were readable is logged once at the start - SELinux refuses apps most of them, each
- * vendor differently, and this is how the next run finds out which.
- */
 class ClockLogComponent(private val logFile: File) : SessionPart() {
     @Volatile private var running = false
     private var thread: Thread? = null
@@ -41,7 +30,6 @@ class ClockLogComponent(private val logFile: File) : SessionPart() {
         val policies = File("/sys/devices/system/cpu/cpufreq").listFiles { f -> f.name.startsWith("policy") }
             ?.sortedBy { it.name.removePrefix("policy").toIntOrNull() ?: 0 } ?: emptyList()
         val gpuCandidates = gpuSources()
-        // The /proc status files hold several numbers: listed for whether they read, not taken as the clock.
         val gpu = gpuCandidates.firstOrNull { !it.startsWith("/proc/") && firstNumber(it) != null }
         val power = app().getSystemService(Context.POWER_SERVICE) as? PowerManager
         val time = SimpleDateFormat("HH:mm:ss", Locale.US)
@@ -92,7 +80,6 @@ class ClockLogComponent(private val logFile: File) : SessionPart() {
         private const val PERIOD_MS = 2000L
         private const val MAX_BYTES = 4L shl 20
 
-        /** Mali (Exynos, Tensor, MediaTek) and MediaTek GED clock files, plus any GPU devfreq node. */
         private fun gpuSources(): List<String> {
             val list = mutableListOf(
                 "/sys/kernel/ged/hal/current_freqency", "/sys/kernel/ged/hal/current_frequency",
@@ -111,7 +98,6 @@ class ClockLogComponent(private val logFile: File) : SessionPart() {
         private fun firstNumber(path: String): Long? =
             runCatching { Regex("\\d+").find(File(path).readText())?.value?.toLong() }.getOrNull()
 
-        /** Hz, kHz or MHz to MHz; "?" when unread. */
         private fun mhz(raw: Long?): String = when {
             raw == null -> "?"
             raw > 10_000_000 -> (raw / 1_000_000).toString()

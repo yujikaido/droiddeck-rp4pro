@@ -23,7 +23,7 @@
     DEALINGS IN THE SOFTWARE.
   </copyright>
 
-  <interface name="banner_ahb_v1" version="2">
+  <interface name="banner_ahb_v1" version="3">
     <description summary="Android gralloc buffers behind dma-buf wl_buffers">
       Zero-copy window layers on Android. A Vulkan swapchain image that the
       client allocated as an Android AHardwareBuffer (gralloc) is still shared
@@ -61,6 +61,13 @@
       compositor exports it as the layer's acquire fence, and the compositor
       imports the display's release fence into the dma-buf before it sends
       wl_buffer.release, so the client's next acquire waits on it.
+
+      Version 3 adds offer and withdraw, for buffers that reach the compositor
+      through another program: a nested compositor (gamescope) passes a
+      game's dma-bufs on as wl_buffers of its own and knows nothing about
+      gralloc, so the game's driver offers each AHardwareBuffer on a
+      connection of its own, and the compositor pairs it with whichever
+      dma-buf wl_buffer turns out to be the same buffer.
     </description>
 
     <request name="destroy" type="destructor">
@@ -101,5 +108,35 @@
       </description>
       <arg name="enabled" type="uint" summary="1 = gralloc swapchain images wanted, 0 = not"/>
     </event>
+
+    <request name="offer" since="3">
+      <description summary="offer an AHardwareBuffer whose dma-buf may arrive through another client">
+        Hands the compositor an AHardwareBuffer (read from socket as for
+        attach) without a wl_buffer. When any client later creates a
+        zwp_linux_dmabuf_v1 wl_buffer whose one plane is this buffer's
+        dma-buf - checked by the compositor against the AHardwareBuffer's own
+        handle, not taken from the client - at offset 0 with this width,
+        height and stride (pixels), a linear layout and a pixel format of the
+        same bytes, the AHardwareBuffer is associated with that wl_buffer as
+        if attach had been sent for it. id names the offer for withdraw; it
+        must not name another of this object's live offers. The compositor
+        keeps its reference until withdraw or until this object is
+        destroyed; wl_buffers already paired keep theirs.
+      </description>
+      <arg name="socket" type="fd" summary="socket the AHardwareBuffer handle was written to"/>
+      <arg name="id" type="uint" summary="the client's name for this offer"/>
+      <arg name="width" type="uint" summary="buffer width in pixels"/>
+      <arg name="height" type="uint" summary="buffer height in pixels"/>
+      <arg name="stride" type="uint" summary="gralloc row stride in pixels"/>
+    </request>
+
+    <request name="withdraw" since="3">
+      <description summary="drop an offer">
+        The buffer offered as id will not be presented again (its swapchain
+        is gone). Unknown ids are ignored.
+      </description>
+      <arg name="id" type="uint" summary="the offer's name"/>
+    </request>
+
   </interface>
 </protocol>

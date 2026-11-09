@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DroidDeck <droiddeck@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 00:00:00 +0000
+Subject: [PATCH] event: learn the syscall order from a void syscall's SIGSYS
+ when PRoot's own filter is off
+
+With PROOT_NO_SECCOMP no seccomp event tells PRoot that the kernel runs the
+system's filter after the ptrace stop (Linux 4.8 and newer), so Android's app
+policy saw the void number PRoot writes there, raised SIGSYS, and PRoot answered
+it with ENOSYS over the result it gives the call (getcwd, chdir, brk, a refused
+path).
+---
+diff --git a/src/tracee/event.c b/src/tracee/event.c
+--- a/src/tracee/event.c
++++ b/src/tracee/event.c
+@@ -517,6 +517,9 @@ int handle_tracee_event(Tracee *tracee, int tracee_status)
+ 						tracee->skip_next_seccomp_signal = (
+ 								seccomp_after_ptrace_enter &&
+ 								get_sysnum(tracee, CURRENT) == PR_void);
++						tracee->voided_at_ptrace_stop = (
++								get_sysnum(tracee, CURRENT) == PR_void &&
++								get_sysnum(tracee, ORIGINAL) != PR_void);
+ 					}
+ 
+ 					/* Redeliver signal suppressed during
+@@ -671,6 +674,18 @@ int handle_tracee_event(Tracee *tracee, int tracee_status)
+ 					translate_syscall(tracee);
+ 				}
+ 
++				/* A system filter (Android's app policy) saw the void
++				 * number PRoot wrote at the ptrace stop, so it runs after
++				 * that stop (Linux 4.8 and newer).  Without PRoot's own
++				 * filter (PROOT_NO_SECCOMP) no seccomp event ever told the
++				 * order, and the void call's SIGSYS replaced the result
++				 * PRoot gives it (getcwd, a refused path) with ENOSYS.  */
++				if (!seccomp_after_ptrace_enter && tracee->voided_at_ptrace_stop
++				    && siginfo.si_syscall == (int) SYSCALL_AVOIDER) {
++					seccomp_after_ptrace_enter = true;
++					VERBOSE(tracee, 1, "new syscall order (seccomp after ptrace) seen on a void syscall's SIGSYS");
++				}
++
+ 				if (tracee->skip_next_seccomp_signal || (seccomp_after_ptrace_enter && siginfo.si_syscall == SYSCALL_AVOIDER)) {
+ 					VERBOSE(tracee, 4, "suppressed SIGSYS after void syscall");
+ 					tracee->skip_next_seccomp_signal = false;
+diff --git a/src/tracee/tracee.h b/src/tracee/tracee.h
+--- a/src/tracee/tracee.h
++++ b/src/tracee/tracee.h
+@@ -180,6 +180,10 @@ typedef struct tracee {
+ 	 * without affecting state of any registers.  */
+ 	bool skip_next_seccomp_signal;
+ 
++	/* PRoot itself turned the current syscall into the void one at its
++	 * ptrace stop (the syscall number the tracee gave was not void).  */
++	bool voided_at_ptrace_stop;
++
+ 	/* Context used to collect all the temporary dynamic memory
+ 	 * allocations.  */
+ 	TALLOC_CTX *ctx;
