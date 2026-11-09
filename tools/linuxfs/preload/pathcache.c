@@ -42,7 +42,8 @@ static int enabled(void) {
   if (cached >= 0) return cached;
   off = getenv("BL_NO_PATH_CACHE");
   cached = strcmp(program_invocation_short_name, "steam") == 0 &&
-           strstr(program_invocation_name, "steamrtarm64") != NULL &&
+           (strstr(program_invocation_name, "steamrtarm64") != NULL ||
+            strstr(program_invocation_name, "steamrt64") != NULL) &&
            !(off != NULL && off[0] == '1');
   return cached;
 }
@@ -138,17 +139,31 @@ static int (*next_faccessat(void))(int, const char *, int, int) {
 }
 
 __attribute__((visibility("hidden"))) int bl_binfmt_runnable(const char *path, int mode);
+__attribute__((visibility("hidden"))) int bl_writable_access(int dirfd, const char *path, int mode, int flags);
+
+static int writable_as_owner(int (*real)(int, const char *, int, int), int dirfd, const char *path, int mode, int flags) {
+  if (!bl_writable_access(dirfd, path, mode, flags)) return -1;
+  if ((mode & ~W_OK) == 0 || real(dirfd, path, mode & ~W_OK, flags) == 0) return 0;
+  return -1;
+}
 
 static int check_cwd(const char *path, int mode, int flags) {
   int (*real)(int, const char *, int, int) = next_faccessat();
   int result;
+  int err;
 
   if (real == NULL) {
     errno = ENOSYS;
     return -1;
   }
   result = real(AT_FDCWD, path, mode, flags);
-  return result != 0 && errno == EACCES && bl_binfmt_runnable(path, mode) ? 0 : result;
+  if (result == 0) return 0;
+  err = errno;
+  if (err == EACCES && bl_binfmt_runnable(path, mode)) return 0;
+  errno = err;
+  if (writable_as_owner(real, AT_FDCWD, path, mode, flags) == 0) return 0;
+  errno = err;
+  return result;
 }
 
 int access(const char *path, int mode) {
@@ -165,6 +180,7 @@ int eaccess(const char *path, int mode) {
 
 int faccessat(int dirfd, const char *path, int mode, int flags) {
   int (*real)(int, const char *, int, int);
+  int err;
 
   if (dirfd == AT_FDCWD) {
     return cached_access(path, mode, flags, check_cwd);
@@ -174,5 +190,9 @@ int faccessat(int dirfd, const char *path, int mode, int flags) {
     errno = ENOSYS;
     return -1;
   }
-  return real(dirfd, path, mode, flags);
+  if (real(dirfd, path, mode, flags) == 0) return 0;
+  err = errno;
+  if (writable_as_owner(real, dirfd, path, mode, flags) == 0) return 0;
+  errno = err;
+  return -1;
 }

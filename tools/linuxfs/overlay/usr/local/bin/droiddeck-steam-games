@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -13,11 +14,13 @@ import urllib.parse
 import urllib.request
 
 STATE = ".droiddeck-games.json"
+TRIED = ".droiddeck-import-tried.json"
 WINNATIVE = ".winnative-steam/steamapps"
 LIBRARY = "/mnt/droiddeck-sd"
 LEGACY_LIBRARY = "/mnt/bannerlator-sd"
 PARKED = ".droiddeck-parked"
 BASE_ID = 76561197960265728
+SPACEWAR = 480
 
 
 def read_json(path, default):
@@ -62,6 +65,12 @@ def source_stamp(game):
         return None
 
 
+def store_game(game):
+    """Games a store client installed belong to that store: the Steam copy of the same title is
+    another license with its own files, and an import would let Steam update over the store's."""
+    return bool(game.get("store"))
+
+
 def manifest_ids(steamapps, name):
     matches = []
     for manifest in Path(steamapps).glob("appmanifest_*.acf"):
@@ -78,14 +87,14 @@ def identify(game):
     folder = Path(game["folder"])
     steamapps = folder.parent.parent
     for library in ([steamapps] if folder.parent.name == "common" and steamapps.name == "steamapps" else []) + [folder.parent / WINNATIVE]:
-        matches = manifest_ids(library, folder.name)
+        matches = [appid for appid in manifest_ids(library, folder.name) if appid != SPACEWAR]
         if matches:
             return matches[0] if len(matches) == 1 else None
     ids = set()
     for parent in {folder, Path(game["exe"]).parent}:
         try:
             appid = int((parent / "steam_appid.txt").read_text().strip())
-            if 0 < appid < 0x80000000:
+            if 0 < appid < 0x80000000 and appid != SPACEWAR:
                 ids.add(appid)
         except (OSError, ValueError):
             pass
@@ -99,7 +108,7 @@ def identify(game):
             ids = {int(item["id"]) for item in items
                    if key(item.get("name", "")) == key(game["name"]) and key(game["name"])}
             if ids:
-                return next(iter(ids)) if len(ids) == 1 else None
+                return next(iter(ids)) if len(ids) == 1 and SPACEWAR not in ids else None
         return None
     except (OSError, ValueError, KeyError):
         return None
@@ -113,7 +122,7 @@ def method(obj, slot, result, *args):
 
 
 def probe(steam_root, ids):
-    library = C.CDLL(str(Path(steam_root) / "steamrtarm64/steamclient.so"))
+    library = C.CDLL(os.environ.get("BL_STEAMCLIENT") or str(Path(steam_root) / "steamrtarm64/steamclient.so"))
     library.CreateInterface.argtypes = [C.c_char_p, C.c_void_p]
     library.CreateInterface.restype = C.c_void_p
     client = library.CreateInterface(b"SteamClient020", None)
@@ -167,25 +176,60 @@ def request_restart(steam_root):
     """The client reads manifests and shortcuts only at start, so an import needs one restart;
     the session's loop runs the importer between the exit and the next start."""
     Path(os.environ.get("HOME", "/root"), ".bl-restart-once").touch()
-    subprocess.run([str(Path(steam_root) / "steamrtarm64/steam"), "-shutdown"],
+    command = shlex.split(os.environ.get("BL_STEAM_SHUTDOWN", "")) or [str(Path(steam_root) / "steamrtarm64/steam"), "-shutdown"]
+    subprocess.run(command,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
 
 
+def ask_restart(names, timeout=600, clock=None, sleep=None):
+    """The app asks whether to restart the client now; anything but "now" leaves the import to the next start."""
+    clock, sleep = clock or time.monotonic, sleep or time.sleep
+    folder = Path(os.environ.get("HOME", "/root"), ".cache/droiddeck")
+    ask, answer = folder / "steam-import.json", folder / "steam-import.answer"
+    token = str(time.time_ns())
+    answer.unlink(missing_ok=True)
+    save_json(ask, {"token": token, "games": names})
+    try:
+        deadline = clock() + timeout
+        while clock() < deadline:
+            reply = read_json(answer, None)
+            if isinstance(reply, dict) and reply.get("token") == token:
+                return reply.get("choice") == "now"
+            sleep(1)
+        return False
+    finally:
+        ask.unlink(missing_ok=True)
+        answer.unlink(missing_ok=True)
+
+
 def unimported(steam_root, snapshot, candidates):
-    routes = read_json(Path(steam_root) / "userdata" / snapshot["account"] / "config/.droiddeck-routes.json", {})
+    config = Path(steam_root) / "userdata" / snapshot["account"] / "config"
+    routes = read_json(config / ".droiddeck-routes.json", {})
     routed = set(routes.values()) if isinstance(routes, dict) else set()
-    return sorted({appid for appid in candidates.values() if snapshot["owned"].get(str(appid)) is True} - routed)
+    tried = read_json(config / TRIED, [])
+    tried = {appid for appid in tried if isinstance(appid, int)} if isinstance(tried, list) else set()
+    owned = {appid for appid in candidates.values() if snapshot["owned"].get(str(appid)) is True}
+    if tried - routed != tried:
+        save_json(config / TRIED, sorted(tried - routed))
+    return sorted(owned - routed - tried)
+
+
+def remember_tried(steam_root, account, appids):
+    config = Path(steam_root) / "userdata" / account / "config"
+    tried = read_json(config / TRIED, [])
+    tried = {appid for appid in tried if isinstance(appid, int)} if isinstance(tried, list) else set()
+    save_json(config / TRIED, sorted(tried | set(appids)))
 
 
 def watch(steam_root, listing):
-    games = read_json(listing, [])
+    games = [game for game in read_json(listing, []) if not store_game(game) and not game.get("native")]
     if os.environ.get("BL_STEAM_OFFLINE") == "1" or not games:
         return
     candidates, sources = {}, {}
     next_lookup = 0
     last_status = None
     probed, next_probe, failures = None, 0, 0
-    pending, requested = [], []
+    pending, requested, account = [], [], None
     while True:
         now = time.monotonic()
         for game in games:
@@ -207,9 +251,10 @@ def watch(steam_root, listing):
         elif candidates and (key != probed or now >= next_probe):
             probed, next_probe = key, now + 300
             try:
+                probe_env = dict(os.environ, HOME=os.environ["BL_STEAM_IPC_HOME"]) if os.environ.get("BL_STEAM_IPC_HOME") else None
                 result = subprocess.run([sys.executable, __file__, "probe", steam_root,
                                          *map(str, sorted(set(candidates.values())))],
-                                        capture_output=True, text=True, timeout=15)
+                                        capture_output=True, text=True, timeout=15, env=probe_env)
                 if result.returncode != 0:
                     status = "ownership probe failed: " + (result.stderr.strip()[-300:] or str(result.returncode))
                     failures += 1
@@ -224,6 +269,7 @@ def watch(steam_root, listing):
                     snapshot["sources"] = sources
                     save_json(Path(steam_root) / "userdata" / snapshot["account"] / "config" / STATE, snapshot)
                     pending = unimported(steam_root, snapshot, candidates)
+                    account = snapshot["account"]
                     status = "matched %d/%d games; %d owned" % (len(candidates), len(games), sum(snapshot["owned"].values()))
             except (OSError, ValueError, KeyError, StopIteration, subprocess.TimeoutExpired) as error:
                 status = "ownership check unavailable: " + str(error)
@@ -233,9 +279,14 @@ def watch(steam_root, listing):
             status = last_status
         if pending and pending != requested and not game_running() and downloads_idle(steam_root):
             requested = pending
-            print("droiddeck-steam-games: restarting the client once to import %s" % pending, flush=True)
+            names = sorted({game["name"] for game in games if candidates.get(game["folder"]) in pending})
             try:
-                request_restart(steam_root)
+                remember_tried(steam_root, account, pending)
+                if ask_restart(names) and not game_running() and downloads_idle(steam_root):
+                    print("droiddeck-steam-games: restarting the client once to import %s" % pending, flush=True)
+                    request_restart(steam_root)
+                else:
+                    print("droiddeck-steam-games: %s will be imported the next time the client starts" % pending, flush=True)
             except (OSError, subprocess.TimeoutExpired) as error:
                 print("droiddeck-steam-games: restart unavailable: %s" % error, flush=True)
         if status != last_status:
@@ -282,7 +333,7 @@ def libraries(steam_root):
     except OSError:
         text = ""
     paths = [path.replace("\\\\", "\\") for path in re.findall(r'"path"\s+"((?:[^"\\]|\\.)*)"', text)]
-    return list(dict.fromkeys([Path(steam_root), Path(LIBRARY)] + [Path(path) for path in paths]))
+    return list(dict.fromkeys([Path(steam_root)] + [Path(path) for path in paths]))
 
 
 def ours(manifest, appid):
@@ -300,6 +351,16 @@ def unpark(steamapps):
             manifest.unlink(missing_ok=True)
         elif (steamapps / "common" / f"DroidDeck-{appid}").is_dir():
             os.replace(manifest, live)
+
+
+def seeded(steamapps, game, appid):
+    target = steamapps / "common" / f"DroidDeck-{appid}"
+    manifest = steamapps / f"appmanifest_{appid}.acf"
+    try:
+        return (target.is_symlink() and target.is_dir() and manifest.is_file() and ours(manifest, appid)
+                and os.readlink(target) in (game.get("folder", ""), legacy_path(game.get("folder", ""))))
+    except OSError:
+        return False
 
 
 def park(steamapps):
@@ -363,6 +424,22 @@ def seed_install(steam_root, game, appid):
     return True
 
 
+def release(steam_root, game, stale, reason):
+    """Undoes the imports of the game's folder as the Steam apps [stale] picks. Only our symlink and
+    manifest go; the folder stays where it is."""
+    steamapps = Path(steam_root) / "steamapps"
+    sources = {game.get("folder", ""), legacy_path(game.get("folder", ""))}
+    for target in sorted((steamapps / "common").glob("DroidDeck-*")):
+        appid = target.name.removeprefix("DroidDeck-")
+        if not (appid.isdigit() and target.is_symlink() and os.readlink(target) in sources and stale(int(appid))):
+            continue
+        for manifest in (steamapps / f"appmanifest_{appid}.acf", steamapps / PARKED / f"appmanifest_{appid}.acf"):
+            if manifest.is_file() and ours(manifest, appid):
+                manifest.unlink()
+        target.unlink()
+        print(f"droiddeck-steam-games: {game.get('name', appid)} {reason}; it is no longer Steam app {appid}")
+
+
 def route(steam_root, acct, games):
     snapshot = read_json(Path(acct) / "config" / STATE, {})
     if not isinstance(snapshot, dict):
@@ -379,20 +456,39 @@ def route(steam_root, acct, games):
     except OSError as error:
         print(f"droiddeck-steam-games: set-aside installs not restored ({error})")
     for game in games:
+        if store_game(game):
+            try:
+                release(steam_root, game, lambda old: True, f"came from {game['store']}")
+            except OSError as error:
+                print(f"droiddeck-steam-games: store import not undone ({error})")
+            shortcuts.append(game)
+            continue
+        if game.get("native"):
+            shortcuts.append(game)
+            continue
         folder = game.get("folder", "")
         appid = candidates.get(folder, candidates.get(legacy_path(folder)))
         stamp = source_stamp(game)
         recorded = sources.get(folder, sources.get(legacy_path(folder)))
-        confirmed = (isinstance(appid, int) and 0 < appid < 0x80000000
-                     and owned.get(str(appid)) is True and stamp is not None
-                     and recorded in (stamp, [stamp[0], legacy_path(stamp[1])] + stamp[2:]))
+        current = stamp is not None and recorded in (stamp, [stamp[0], legacy_path(stamp[1])] + stamp[2:])
+        named = isinstance(appid, int) and 0 < appid < 0x80000000 and appid != SPACEWAR
+        try:
+            release(steam_root, game, lambda old: old == SPACEWAR or (current and named and old != appid),
+                    "names another Steam app now")
+        except OSError as error:
+            print(f"droiddeck-steam-games: earlier import not undone ({error})")
+        confirmed = named and current and owned.get(str(appid)) is True
         if confirmed:
             try:
                 if seed_install(steam_root, game, appid):
                     routes[str(game["appid"])] = appid
                     continue
+                print(f"droiddeck-steam-games: {game.get('name', appid)} stays a shortcut this session: it could not be linked as Steam app {appid}")
             except OSError as error:
                 print(f"droiddeck-steam-games: import unavailable ({error})")
+        elif named and seeded(steamapps, game, appid):
+            routes[str(game["appid"])] = appid
+            continue
         shortcuts.append(game)
     try:
         park(steamapps)

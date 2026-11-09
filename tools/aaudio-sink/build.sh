@@ -23,7 +23,8 @@ if [[ ! -d "$TOOLCHAIN" && "$NDK_HOST" == linux-aarch64 && -d "$NDK/toolchains/l
   TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
 fi
 CC="$TOOLCHAIN/aarch64-linux-android${API}-clang"
-if [[ ! -x "$CC" ]]; then
+CC28="$TOOLCHAIN/aarch64-linux-android28-clang"
+if [[ ! -x "$CC" || ! -x "$CC28" ]]; then
   echo "Android NDK toolchain not found at $TOOLCHAIN" >&2
   exit 1
 fi
@@ -33,13 +34,19 @@ mkdir -p "$INC/pulse"
 sed -e 's/@PA_MAJOR@/13/g' -e 's/@PA_MINOR@/0/g' -e 's/@PA_API_VERSION@/12/g' -e 's/@PA_PROTOCOL_VERSION@/33/g' \
     "$PA_SRC/src/pulse/version.h.in" > "$INC/pulse/version.h"
 cp "$HERE/config.h" "$HERE/ltdl.h" "$INC/"
+# pa_assert and friends put __FILE__ into the module, which named the build machine's folders (the PulseAudio source
+# under TMPDIR, this checkout under the builder's home). Map them to fixed names; nothing at run time reads these strings.
+PREFIX_MAPS=(-ffile-prefix-map="$PA_SRC"=/build/pulseaudio-13.0 -ffile-prefix-map="$REPO"=/build/droiddeck -ffile-prefix-map="$INC"=/build/include)
 build_one() {
-  local src=$1 OUT=$2 extra=$3
-  "$CC" -O2 -shared -fPIC -Wall -Wno-unused-parameter -Wno-error=int-conversion -Wno-visibility -DHAVE_CONFIG_H \
+  local src=$1 OUT=$2 extra=$3 cc=${4:-$CC}
+  "$cc" -O2 -shared -fPIC -Wall -Wno-unused-parameter -Wno-error=int-conversion -Wno-visibility -DHAVE_CONFIG_H "${PREFIX_MAPS[@]}" \
       -I"$INC" -I"$PA_SRC/src" -I"$HERE" \
       -o "$OUT" "$HERE/$src" \
       -L"$LIBS" -l:libpulsecore-13.0.so -l:libpulsecommon-13.0.so -l:libpulse.so $extra
   "$TOOLCHAIN/llvm-strip" --strip-unneeded "$OUT"
+  for path in "$PA_SRC" "$REPO" "$INC" "${HOME:-/nonexistent}" "${TMPDIR:-/tmp}/"; do
+    if grep -a -q -F "$path" "$OUT"; then echo "ERROR: $OUT names the build folder $path"; exit 1; fi
+  done
   for sym in pa__init pa__done pa__get_author pa__get_description pa__get_usage pa__get_version pa__load_once; do
     "$TOOLCHAIN/llvm-nm" -D --defined-only "$OUT" | grep -q " $sym$" || { echo "ERROR: $OUT does not export $sym"; exit 1; }
   done
@@ -54,3 +61,4 @@ build_one() {
   ls -l "$OUT"
 }
 build_one module-aaudio-sink.c "$OUTDIR/module-aaudio-sink.so" -laaudio
+build_one ../directaudio/sink/module-directaudio-native-sink.c "$OUTDIR/module-directaudio-native-sink.so" -laaudio "$CC28"

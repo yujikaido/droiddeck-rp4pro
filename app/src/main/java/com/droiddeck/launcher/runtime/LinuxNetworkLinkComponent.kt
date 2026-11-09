@@ -104,7 +104,6 @@ class LinuxNetworkLinkComponent(
                 synchronized(lock) { writeNetworkState(currentProperties, currentCapabilities) }
             }
         }
-        wifiReceiver = receiver
         appContext.registerReceiver(receiver, IntentFilter().apply {
             addAction(WifiManager.SCAN_RESULTS_AVAILABLE_ACTION)
             addAction(WifiManager.RSSI_CHANGED_ACTION)
@@ -112,6 +111,7 @@ class LinuxNetworkLinkComponent(
             addAction(WifiManager.NETWORK_STATE_CHANGED_ACTION)
             addAction(LocationManager.MODE_CHANGED_ACTION)
         })
+        wifiReceiver = receiver
         scanRequestStamp = File(rootDir, "etc/droiddeck-wifi-scan-request").lastModified()
         scanHandler.post(scanRequests)
         requestWifiScan()
@@ -119,7 +119,13 @@ class LinuxNetworkLinkComponent(
 
     override fun stop() {
         scanHandler.removeCallbacks(scanRequests)
-        wifiReceiver?.let { appContext.unregisterReceiver(it) }
+        wifiReceiver?.let { receiver ->
+            try {
+                appContext.unregisterReceiver(receiver)
+            } catch (e: IllegalArgumentException) {
+                Log.w(TAG, "Wi-Fi receiver was already gone", e)
+            }
+        }
         wifiReceiver = null
         val registered = synchronized(lock) { callback.also { callback = null } } ?: return
         try {
@@ -245,12 +251,44 @@ class LinuxNetworkLinkComponent(
         }
     }
 
+    /**
+     * DNS servers of every connected Wi-Fi or Ethernet network (and their default gateways, apart), for
+     * when the active network lists none that work: on networks where the public resolvers are blocked
+     * or slow, Steam's downloads then still resolve. Nothing while a VPN is the active network, so a
+     * lookup never goes around the VPN.
+     */
+    private fun localDnsServers(): Pair<List<String>, List<String>> {
+        val active = connectivity.activeNetwork?.let { connectivity.getNetworkCapabilities(it) }
+        if (active?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true) return Pair(emptyList(), emptyList())
+        val servers = LinkedHashSet<String>()
+        val gateways = LinkedHashSet<String>()
+        @Suppress("DEPRECATION")
+        for (network in connectivity.allNetworks) {
+            val capabilities = connectivity.getNetworkCapabilities(network) ?: continue
+            if (!capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) continue
+            if (!capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) &&
+                !capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) continue
+            val link = connectivity.getLinkProperties(network) ?: continue
+            for (address in link.dnsServers) {
+                if (address.isLinkLocalAddress || address.isLoopbackAddress || address.isAnyLocalAddress) continue
+                address.hostAddress?.substringBefore('%')?.let { servers.add(it) }
+            }
+            link.routes.firstOrNull {
+                it.isDefaultRoute && (it.gateway as? Inet4Address)?.let { g -> !g.isLoopbackAddress && !g.isAnyLocalAddress } == true
+            }?.gateway?.hostAddress?.substringBefore('%')?.let { gateways.add(it) }
+        }
+        return Pair(ipv4First(servers), ipv4First(gateways))
+    }
+
     private fun writeResolver(properties: LinkProperties?) {
         val own = properties?.dnsServers.orEmpty()
             .filter { !it.isLinkLocalAddress && !it.isLoopbackAddress && !it.isAnyLocalAddress }
             .sortedBy { if (it is Inet4Address) 0 else 1 }
             .mapNotNull { it.hostAddress?.substringBefore('%') }
-        val servers = (own + listOf("8.8.8.8", "1.1.1.1", "2001:4860:4860::8888")).distinct().take(6)
+        val (discovered, gateways) = runCatching { localDnsServers() }
+            .onFailure { Log.w(TAG, "Could not list the other networks' DNS servers", it) }
+            .getOrDefault(Pair(emptyList(), emptyList()))
+        val servers = resolverOrder(own, discovered, gateways)
         val text = buildString {
             append("# Written by the app from the device's active network; edits are overwritten.\n")
             for (server in servers) append("nameserver $server\n")
@@ -295,15 +333,30 @@ class LinuxNetworkLinkComponent(
         }
     }
 
-    private fun seededMac(): String {
-        val id = Settings.Secure.getString(appContext.contentResolver, Settings.Secure.ANDROID_ID) ?: "bannerlator"
-        val bytes = java.security.MessageDigest.getInstance("SHA-1").digest(id.toByteArray())
-        val b0 = (bytes[0].toInt() and 0xfc) or 0x02
-        return listOf(b0, bytes[1].toInt(), bytes[2].toInt(), bytes[3].toInt(), bytes[4].toInt(), bytes[5].toInt())
-            .joinToString(":") { "%02x".format(it and 0xff) }
-    }
+    private fun seededMac(): String =
+        seededMac { Settings.Secure.getString(appContext.contentResolver, Settings.Secure.ANDROID_ID) }
 
     companion object {
+        internal val PUBLIC_DNS = listOf("8.8.8.8", "1.1.1.1", "2001:4860:4860::8888")
+
+        internal fun ipv4First(servers: Collection<String>): List<String> = servers.sortedBy { if (it.contains(':')) 1 else 0 }
+
+        /**
+         * resolv.conf order: the active network's own servers, then those of the other connected Wi-Fi or
+         * Ethernet networks, then the public ones, then default gateways (many routers answer DNS);
+         * at most six, no repeats.
+         */
+        internal fun resolverOrder(own: List<String>, discovered: List<String>, gateways: List<String>): List<String> =
+            (own + discovered + PUBLIC_DNS + gateways).distinct().take(6)
+
+        internal fun seededMac(readId: () -> String?): String {
+            val id = runCatching(readId).getOrNull() ?: "bannerlator"
+            val bytes = java.security.MessageDigest.getInstance("SHA-1").digest(id.toByteArray())
+            val b0 = (bytes[0].toInt() and 0xfc) or 0x02
+            return listOf(b0, bytes[1].toInt(), bytes[2].toInt(), bytes[3].toInt(), bytes[4].toInt(), bytes[5].toInt())
+                .joinToString(":") { "%02x".format(it and 0xff) }
+        }
+
         private const val TAG = "LinuxNetworkLink"
         private const val LINK_FILE = "etc/droiddeck-net"
         private const val LINK_INDEX = 2

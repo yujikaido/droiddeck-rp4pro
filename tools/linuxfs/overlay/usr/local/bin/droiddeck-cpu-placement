@@ -1,0 +1,324 @@
+#!/usr/bin/python3
+"""Which cores a game gets and which ones Steam's own processes get, from the phone's CPU topology.
+
+On a phone whose fast cores are held well under their top clock by heat (Dimensity 8300:
+A715s at 2.0-2.1 of 3.2-3.35 GHz for whole sessions), more speed has to come from spending fewer
+cycles where the game runs. Two things took them: Windows saw all eight cores, so a game's job system
+(RE Engine) gave half its workers to the A510s and waited on them, and Steam, its web helper, gamescope
+and Xwayland ran on the same cores as the game. So, on a chip that has a cluster of small in-order
+cores (A55, A510, A520):
+
+  - the game gets the other cores (droiddeck-game-env asks `game_cores`), so Windows sees those only;
+  - while a game has focus, the Steam client, steamwebhelper, gamescope, Xwayland and PipeWire run on
+    the small cores (`hold`); once Steam's UI has focus again every thread gets its own mask back, so
+    the Steam UI is as fast as before (a fixed client pin made it slow: c7bcd8278).
+
+Small cores are told apart by capacity per MHz, not by clock: the A720s of a Dimensity 9300 top out at
+2.0 GHz, below the A510s of a Dimensity 8300 (2.2), and are still out-of-order cores worth giving a
+game. The kernel's cpu_capacity is the core's speed at its top clock (1024 = the fastest core), so
+capacity / top clock is its speed per MHz: in-order cores sit at 0.3-0.57 of the fastest core's
+(vendor trees differ), A720/A725-class cores at 0.75 and more (Dimensity 9400: 502 at 2.4 GHz
+against 1024 at 3.73). A core under SMALL_PER_MHZ is small. No capacity, or the same capacity
+everywhere: no small cluster, nothing changes.
+
+The player's choice wins: the app sends BL_AUTO_CORES=0 when Game cores or Override Steam's core choice
+were set, droiddeck-env can set it too; per-game cores (DROIDDECK_GAME_CORES) and a game's own
+WINE_CPU_TOPOLOGY keep the game out of it. BL_AUTO_CORES=game or =stack keeps one half only.
+
+Usage: droiddeck-cpu-placement little|game|slow  prints a core list (empty: none)
+       droiddeck-cpu-placement hold <agent focus.json>  holds the Steam processes while a game has focus"""
+import json
+import os
+import signal
+import sys
+import time
+from pathlib import Path
+
+CPU_ROOT = "/sys/devices/system/cpu"
+SMALL_PER_MHZ = 0.6
+MIN_GAME_CORES = 4
+STEAM_CLIENT = 769
+POLL = 2.0
+RESCAN = 10.0
+
+
+def log(message):
+    print("droiddeck-cpu-placement: " + message, flush=True)
+
+
+def fmt(cores):
+    """A core list in taskset's form: "0-3,7"."""
+    parts = []
+    for core in sorted(cores):
+        if parts and parts[-1][1] == core - 1:
+            parts[-1][1] = core
+        else:
+            parts.append([core, core])
+    return ",".join(str(a) if a == b else "%d-%d" % (a, b) for a, b in parts)
+
+
+def read_int(path):
+    try:
+        with open(path) as stream:
+            return int(stream.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def online(root=CPU_ROOT):
+    """The online cores, from <root>/online (else every cpuN directory with a cpufreq top clock)."""
+    try:
+        with open(os.path.join(root, "online")) as stream:
+            text = stream.read().strip()
+        cores = set()
+        for part in text.split(","):
+            first, _, last = part.partition("-")
+            cores.update(range(int(first), int(last or first) + 1))
+        if cores:
+            return cores
+    except (OSError, ValueError):
+        pass
+    found = set()
+    try:
+        for name in os.listdir(root):
+            if name.startswith("cpu") and name[3:].isdigit():
+                found.add(int(name[3:]))
+    except OSError:
+        pass
+    return found
+
+
+class Topology:
+    """Every core's top clock (kHz) and capacity (None when the kernel gives none)."""
+
+    def __init__(self, root=CPU_ROOT, cores=None):
+        cores = sorted(cores if cores is not None else online(root))
+        self.freq = {c: read_int("%s/cpu%d/cpufreq/cpuinfo_max_freq" % (root, c)) for c in cores}
+        self.capacity = {c: read_int("%s/cpu%d/cpu_capacity" % (root, c)) for c in cores}
+        self.cores = [c for c in cores if self.freq[c]]
+
+    def clusters(self):
+        """Groups of cores with the same top clock and capacity, slowest first."""
+        groups = {}
+        for c in self.cores:
+            groups.setdefault((self.capacity[c] or 0, self.freq[c]), set()).add(c)
+        return [groups[key] for key in sorted(groups)]
+
+    def little(self):
+        """The small in-order cores, or an empty set: needs every core's capacity, two kinds of core and
+        at least two cores that are not small."""
+        if len(self.cores) < 3 or any(not self.capacity[c] for c in self.cores):
+            return set()
+        per_mhz = {c: self.capacity[c] / self.freq[c] for c in self.cores}
+        fastest = max(self.cores, key=lambda c: (self.capacity[c], self.freq[c]))
+        small = {c for c in self.cores if per_mhz[c] < SMALL_PER_MHZ * per_mhz[fastest]}
+        return small if len(self.cores) - len(small) >= 2 else set()
+
+    def game(self):
+        """The game's cores: every core but the small ones, when that leaves MIN_GAME_CORES; else none
+        (a 2+6 chip would put the whole game on two cores)."""
+        small = self.little()
+        rest = set(self.cores) - small
+        return rest if small and len(rest) >= MIN_GAME_CORES else set()
+
+    def slow(self):
+        """Where background work goes: the small cores, else the slowest cluster when there are two or
+        more kinds of core; empty on a chip with one kind."""
+        small = self.little()
+        if small:
+            return small
+        clusters = self.clusters()
+        return clusters[0] if len(clusters) > 1 else set()
+
+
+def mode(env=os.environ):
+    """'game', 'stack', both or neither, from BL_AUTO_CORES (1 = both, the default)."""
+    value = env.get("BL_AUTO_CORES", "1").strip().lower()
+    return {"0": set(), "off": set(), "game": {"game"}, "stack": {"stack"}}.get(value, {"game", "stack"})
+
+
+# Steam's own processes and what shows the game; the FEX-run ones by FEX's first argument.
+def program(proc, pid):
+    try:
+        with open(proc / str(pid) / "cmdline", "rb") as stream:
+            args = stream.read(8192).split(b"\0")
+    except OSError:
+        return None
+    first = args[0].decode("utf-8", "replace")
+    if first.rsplit("/", 1)[-1] in ("FEX", "FEXInterpreter") and len(args) > 1:
+        first = args[1].decode("utf-8", "replace")
+    return first
+
+
+def in_stack(name):
+    if not name:
+        return False
+    base = name.rsplit("/", 1)[-1]
+    if base in ("steamwebhelper", "gamescope", "Xwayland", "pipewire", "pipewire-pulse", "wireplumber"):
+        return True
+    return name.endswith(("/steamrtarm64/steam", "/steamrt64/steam"))
+
+
+def tasks(proc, pid):
+    try:
+        return [int(t) for t in os.listdir(proc / str(pid) / "task") if t.isdigit()]
+    except OSError:
+        return []
+
+
+class Affinity:
+    """The kernel calls, apart so a test can stand in for them."""
+
+    def get(self, tid):
+        return os.sched_getaffinity(tid)
+
+    def set(self, tid, cores):
+        os.sched_setaffinity(tid, cores)
+
+
+class StackHolder:
+    """Every thread of Steam's processes onto `cores`, each one's own mask kept to give back."""
+
+    def __init__(self, cores, proc=Path("/proc"), affinity=None, own=None):
+        self.cores = set(cores)
+        self.proc = proc
+        self.affinity = affinity or Affinity()
+        self.own = own if own is not None else os.getpid()
+        self.held = {}
+
+    def processes(self):
+        try:
+            names = os.listdir(self.proc)
+        except OSError:
+            return
+        for name in names:
+            if name.isdigit() and int(name) != self.own and in_stack(program(self.proc, name)):
+                yield int(name)
+
+    def hold(self):
+        for pid in self.processes():
+            before = self.held.setdefault(pid, {})
+            for tid in tasks(self.proc, pid):
+                try:
+                    now = self.affinity.get(tid)
+                    if now != self.cores:
+                        self.affinity.set(tid, self.cores)
+                except OSError:
+                    continue
+                if tid not in before:
+                    # A thread started during the hold inherited the hold; it gets what its process had.
+                    before[tid] = now if now != self.cores else before.get(pid)
+        for pid in [pid for pid in self.held if not (self.proc / str(pid)).exists()]:
+            del self.held[pid]
+
+    def release(self):
+        for pid, before in self.held.items():
+            default = before.get(pid) or next((m for m in before.values() if m), None)
+            for tid in tasks(self.proc, pid):
+                cores = before.get(tid) or default
+                if not cores:
+                    continue
+                try:
+                    self.affinity.set(tid, cores)
+                except OSError:
+                    pass
+        self.held.clear()
+
+
+def focused_app(path):
+    try:
+        return json.loads(Path(path).read_text()).get("focusedApp")
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+class Governor:
+    """Holds the stack while a game (any focused app but Steam's own UI) has focus."""
+
+    def __init__(self, focus_path, holder, clock=time.monotonic):
+        self.focus_path = Path(focus_path)
+        self.holder = holder
+        self.clock = clock
+        self.seen = None
+        self.app = None
+        self.scanned = None
+        self.reported = None
+
+    def read_focus(self):
+        try:
+            stamp = self.focus_path.stat().st_mtime_ns
+        except OSError:
+            return False
+        if stamp == self.seen:
+            return False
+        self.seen = stamp
+        self.app = focused_app(self.focus_path)
+        return True
+
+    def tick(self):
+        changed = self.read_focus()
+        game = self.app not in (None, 0, STEAM_CLIENT)
+        if not game:
+            if self.holder.held:
+                self.holder.release()
+                self.report("released: Steam's UI or nothing has focus, Steam's processes on every core again")
+            return
+        now = self.clock()
+        if changed or self.scanned is None or now - self.scanned >= RESCAN:
+            self.scanned = now
+            self.holder.hold()
+            if self.holder.held:
+                self.report("game %s in front: %d Steam/gamescope/Xwayland processes on the small cores %s"
+                            % (self.app, len(self.holder.held), fmt(self.holder.cores)))
+
+    def report(self, message):
+        if message != self.reported:
+            self.reported = message
+            log(message)
+
+    def stop(self, *_):
+        self.holder.release()
+        sys.exit(0)
+
+
+def describe(topology, modes):
+    """One line for session.log: what the chip is and what this session does with it."""
+    kinds = ", ".join("%s %.2f GHz%s" % (fmt(c), topology.freq[min(c)] / 1e6,
+                                          " capacity %d" % topology.capacity[min(c)] if topology.capacity[min(c)] else "")
+                      for c in topology.clusters())
+    small = topology.little()
+    if not small:
+        return "cores %s: no small cores, games and Steam keep every core" % kinds
+    if not modes:
+        return "cores %s: small cores %s, automatic placement off (BL_AUTO_CORES=0)" % (kinds, fmt(small))
+    game = topology.game()
+    parts = []
+    if "game" in modes:
+        parts.append("games on %s" % fmt(game) if game else "games keep every core (fewer than %d other cores)" % MIN_GAME_CORES)
+    if "stack" in modes:
+        parts.append("Steam, gamescope, Xwayland and PipeWire on %s while a game has focus" % fmt(small))
+    return "cores %s: small cores %s; %s" % (kinds, fmt(small), "; ".join(parts))
+
+
+def main(argv):
+    if argv[:1] in (["little"], ["game"], ["slow"]):
+        print(fmt(getattr(Topology(), argv[0])()))
+        return 0
+    if len(argv) == 2 and argv[0] == "hold":
+        topology = Topology()
+        cores = topology.little()
+        log(describe(topology, mode()))
+        if not cores or "stack" not in mode():
+            return 0
+        governor = Governor(argv[1], StackHolder(cores))
+        for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            signal.signal(sig, governor.stop)
+        while True:
+            governor.tick()
+            time.sleep(POLL)
+    print(__doc__.rsplit("Usage: ", 1)[1], file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

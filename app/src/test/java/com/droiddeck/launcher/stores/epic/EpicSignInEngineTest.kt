@@ -15,7 +15,10 @@ import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 import org.robolectric.shadows.ShadowToast
 
-/** Without the native store engine, Epic's sign-in says why and opens nothing. */
+/**
+ * Without the native store engine (a build made without the Rust step), Epic's sign-in used to open
+ * the login page and close it at once with no word. It now says why and opens nothing.
+ */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [33])
 class EpicSignInEngineTest {

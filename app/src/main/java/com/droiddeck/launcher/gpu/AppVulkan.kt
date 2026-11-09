@@ -6,18 +6,6 @@ import com.droiddeck.launcher.core.DeviceSupport
 import com.droiddeck.launcher.core.FileUtils
 import java.io.File
 
-/**
- * The Vulkan that games see through the Mali bridge: the version, shaderInt64 and the push-constant
- * room, which is what decides the newest DXVK that can start on it (ComponentsManager.bridgeDxvk).
- *
- * Read from <bridge cache dir>/apps-vulkan, which a bridge server with Vulkan promotion writes after
- * its self-test, as left by the last session; else from the phone's own driver (VulkanInfo), which is
- * what a bridge without promotion offers. The file's version counts only with promotion=on (the
- * server offers it above the driver's); otherwise, and in files without the field (servers from
- * before it, which wrote the promoted version even where it was not trusted), its driver_api does.
- * A file whose driver_api is not the driver's own version is stale (a driver update, a server
- * rolled back) and left out. null for missing values: a rule must not guess from them.
- */
 data class AppVulkan(
     val major: Int,
     val minor: Int,
@@ -35,7 +23,6 @@ data class AppVulkan(
         private const val TAG = "AppVulkan"
         const val BRIDGE_FILE = "apps-vulkan"
 
-        /** null when this session does not draw through the bridge, or nothing could be read. */
         fun detect(context: Context): AppVulkan? {
             if (!DeviceSupport.vkBridge(context)) return null
             val native = VulkanInfo.query()
@@ -46,11 +33,6 @@ data class AppVulkan(
             return found
         }
 
-        /**
-         * The bridge's file: key=value lines (device, api, driver_api, promotion on/off, shader_int64
-         * 0/1, max_push_constants). Ignored when it names another GPU than the driver's (a restored
-         * backup, a moved phone), or another driver version than the driver's own.
-         */
         internal fun fromBridgeFile(text: String, driverDevice: String?, driverApi: String? = null): AppVulkan? {
             val map = keyValues(text)
             val device = map["device"]
@@ -64,7 +46,6 @@ data class AppVulkan(
                 if (promoted) "bridge, promoted" else "bridge")
         }
 
-        /** VulkanInfo's lines: api=1.1.177, shader_int64=yes|no, max_push_constants=128. */
         internal fun fromDriver(map: Map<String, String>): AppVulkan? {
             val (major, minor) = version(map["api"]) ?: return null
             return AppVulkan(major, minor, bool(map["shader_int64"]), map["max_push_constants"]?.toIntOrNull(), "driver")

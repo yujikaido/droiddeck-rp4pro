@@ -21,19 +21,6 @@ import java.util.concurrent.atomic.AtomicInteger
 object BwrapSpawner {
     private const val TAG = "BwrapSpawner"
     fun socket(context: Context): String = "${context.packageName}.bwrap"
-
-    /** Where droiddeck-bwrap reads [socket] when its caller cleared the environment (flatpak's ld.so cache step). */
-    const val SOCKET_FILE = "usr/local/share/droiddeck/bwrap-socket"
-
-    /** Writes this build's socket name into the rootfs, so every flavour's droiddeck-bwrap dials its own app. */
-    fun publishSocket(context: Context, root: File): Boolean {
-        val target = File(root, SOCKET_FILE)
-        val staged = File(target.parentFile, target.name + ".staged")
-        if (FileUtils.writeString(staged, socket(context) + "\n") && staged.renameTo(target)) return true
-        staged.delete()
-        Log.e(TAG, "could not write $SOCKET_FILE")
-        return false
-    }
     private val seq = AtomicInteger()
     @Volatile private var server: LocalServerSocket? = null
 
@@ -49,7 +36,7 @@ object BwrapSpawner {
             return
         }
         server = socket
-        FileUtils.delete(File(app.cacheDir, "bwrap"))
+        FileUtils.delete(File(LinuxRuntime.liveDir(app), "bwrap"))
         Thread({
             while (true) {
                 val client = try { socket.accept() } catch (e: IOException) { Log.e(TAG, "accept", e); break }
@@ -60,7 +47,7 @@ object BwrapSpawner {
 
     private fun serve(context: Context, client: LocalSocket) {
         val id = seq.incrementAndGet()
-        val dir = File(context.cacheDir, "bwrap/$id")
+        val dir = File(LinuxRuntime.liveDir(context), "bwrap/$id")
         client.use {
             val out = DataOutputStream(client.outputStream)
             try {
@@ -88,7 +75,10 @@ object BwrapSpawner {
         }
     }
 
-    class Plan(val root: File, val binds: List<Bind>, val cwd: String, val argv: List<String>, val env: Map<String, String>)
+    class Plan(
+        val root: File, val binds: List<Bind>, val cwd: String, val argv: List<String>, val env: Map<String, String>,
+        val envTool: String = "/usr/bin/env",
+    )
 
     data class Bind(val host: String, val guest: String) {
         val spec: String get() = if (host == guest) host else "$host:$guest"
@@ -192,25 +182,32 @@ object BwrapSpawner {
         val argv = request.getJSONArray("argv").let { a -> (0 until a.length()).map { a.getString(it) } }
         val env = LinkedHashMap<String, String>()
         request.optJSONObject("env")?.let { e -> e.keys().forEach { k -> env[k] = e.getString(k) } }
-        if (binds.any { it.guest == "/dev" }) gpu(rootfs, root, env)?.forEach { addBind(it) }
-        preload(session, rootfs, env).forEach { addBind(it) }
+        val envTool = request.optString("envTool").takeIf { it.startsWith("/") }
+        if (envTool == null && binds.any { it.guest == "/dev" }) gpu(rootfs, root, env)?.forEach { addBind(it) }
+        val libc = listOf("/usr/lib/aarch64-linux-gnu/libc.so.6", "/lib/aarch64-linux-gnu/libc.so.6").map { hostPath(binds, root.path, it) }
+        if (envTool == null && preloadFits(rootfs, libc.firstOrNull { File(it).isFile } ?: libc.first())) preload(session, rootfs, env).forEach { addBind(it) }
+        zypakShims(binds, root, dir).forEach { addBind(it) }
         browserSandboxes(env)
-        return Plan(root, binds, request.optString("cwd", "/").ifEmpty { "/" }, argv, env)
+        return Plan(root, binds, request.optString("cwd", "/").ifEmpty { "/" }, argv, env, envTool ?: "/usr/bin/env")
     }
 
     private const val GPU_DIR = "/run/droiddeck-gpu"
 
+    private val LIB_DIRS = listOf("usr/lib/aarch64-linux-gnu", "usr/lib")
+    private val GPU_LIBS = listOf("libdisplay-info.so.3", "libdisplay-info.so.2", "libSPIRV-Tools.so", "libSPIRV-Tools-opt.so")
+
+    private fun runtimeLib(rootfs: String, name: String): File? =
+        LIB_DIRS.map { File(rootfs, "$it/$name") }.firstOrNull { it.exists() }
+
     private fun gpu(rootfs: String, root: File, env: MutableMap<String, String>): List<Bind>? {
         env["VKBRIDGE_SOCKET"]?.let { sock -> if (File(sock).exists()) return bridgeGpu(rootfs, root, env, sock) }
-        val lib = File(rootfs, "usr/lib")
-        val driver = File(lib, "libvulkan_freedreno.so")
-        if (!driver.isFile || !File("/dev/kgsl-3d0").exists()) return null
+        val driver = runtimeLib(rootfs, "libvulkan_freedreno.so")
+        if (driver == null || !File("/dev/kgsl-3d0").exists()) return null
         if (env.containsKey("VK_ICD_FILENAMES") || env.containsKey("VK_DRIVER_FILES")) return null
         if (env["BL_DESKTOP"] == "1" && env["GAMESCOPE_WAYLAND_DISPLAY"] == null) return null
-        val binds = ArrayList<Bind>()
-        for (name in listOf("libvulkan_freedreno.so", "libdisplay-info.so.3", "libSPIRV-Tools.so", "libSPIRV-Tools-opt.so")) {
-            val f = File(lib, name)
-            if (!f.exists()) { Log.w(TAG, "gpu: the runtime has no $name; apps draw on the CPU"); return null }
+        val binds = arrayListOf(Bind(driver.canonicalPath, "$GPU_DIR/libvulkan_freedreno.so"))
+        for (name in GPU_LIBS) {
+            val f = runtimeLib(rootfs, name) ?: continue
             binds.add(Bind(f.canonicalPath, "$GPU_DIR/$name"))
         }
         val icd = File(root.parentFile, "freedreno_icd.json")
@@ -226,13 +223,6 @@ object BwrapSpawner {
         return binds
     }
 
-    /**
-     * The GPU through the Mali bridge (external/MaliBridge), for a sandbox started from a bridge
-     * session: the bridge ICD (it needs nothing but libc) and the server's socket, at the paths
-     * the session uses. Unlike Turnip on KGSL it can also present to KWin's shared-memory
-     * windows, so desktop apps get it too. The session's own VK_DRIVER_FILES points at the
-     * runtime's copy of the manifest, which the sandbox cannot see; it is replaced here.
-     */
     private fun bridgeGpu(rootfs: String, root: File, env: MutableMap<String, String>, socket: String): List<Bind>? {
         val driver = File(rootfs, "usr/local/lib/vkbridge/libvulkan_droidbridge.so")
         if (!driver.isFile) { Log.w(TAG, "gpu: vkbridge session but no bridge ICD in the runtime"); return null }
@@ -241,7 +231,10 @@ object BwrapSpawner {
         val sockDir = File(socket).parent ?: return null
         binds.add(Bind(sockDir, sockDir))
         val icd = File(root.parentFile, "vkbridge_icd.json")
-        icd.writeText("{\"file_format_version\": \"1.0.0\", \"ICD\": {\"library_path\": \"$GPU_DIR/libvulkan_droidbridge.so\", \"api_version\": \"1.3.247\"}}\n")
+        val api = runCatching {
+            JSONObject(File(rootfs, "usr/local/share/vkbridge/droidbridge_icd.json").readText()).getJSONObject("ICD").getString("api_version")
+        }.getOrNull() ?: run { Log.w(TAG, "gpu: vkbridge session but the runtime's bridge manifest is unreadable"); return null }
+        icd.writeText("{\"file_format_version\": \"1.0.0\", \"ICD\": {\"library_path\": \"$GPU_DIR/libvulkan_droidbridge.so\", \"api_version\": \"$api\"}}\n")
         binds.add(Bind(icd.path, "$GPU_DIR/vkbridge_icd.json"))
         env["VK_DRIVER_FILES"] = "$GPU_DIR/vkbridge_icd.json"
         env["VK_ICD_FILENAMES"] = "$GPU_DIR/vkbridge_icd.json"
@@ -259,13 +252,50 @@ object BwrapSpawner {
         val binds = ArrayList<Bind>()
         val paths = libs.map { lib -> "$PRELOAD_DIR/${lib.substringAfterLast('/')}".also { binds.add(Bind(rootfs + lib, it)) } }
         env["LD_PRELOAD"] = (paths + listOfNotNull(env["LD_PRELOAD"]?.takeIf { it.isNotBlank() })).joinToString(":")
+        File(rootfs, NET_LINK).takeIf { it.isFile }?.let { binds.add(Bind(it.path, "/$NET_LINK")) }
         env["FAKE_EVDEV_DIR"]?.let { File(it).parent }?.let { dev ->
             binds.addAll(bindsFor(session, rootfs, dev, dev))
         }
         return binds
     }
 
+    private val GLIBC_RELEASE = Regex("release version 2\\.(\\d+)")
+    private val GLIBC_NEED = Regex("GLIBC_2\\.(\\d+)")
+    private val glibcMinors = java.util.concurrent.ConcurrentHashMap<String, Int>()
+
+    private fun glibcMinor(file: File, pattern: Regex, pick: (Sequence<Int>) -> Int?): Int? {
+        val key = "${file.path}:${file.length()}:${file.lastModified()}:${pattern.pattern}"
+        glibcMinors[key]?.let { return it }
+        val text = runCatching { String(file.readBytes(), Charsets.ISO_8859_1) }.getOrNull() ?: return null
+        return pick(pattern.findAll(text).map { it.groupValues[1].toInt() })?.also { glibcMinors[key] = it }
+    }
+
+    internal fun preloadFits(rootfs: String, sandboxLibc: String): Boolean {
+        val libc = File(sandboxLibc)
+        if (!libc.isFile) return true
+        val have = glibcMinor(libc, GLIBC_RELEASE) { it.firstOrNull() } ?: return true
+        val libs = FileUtils.readString(File(rootfs, "etc/ld.so.preload"))?.lines()
+            ?.map { it.trim() }?.filter { it.startsWith("/") } ?: return true
+        val need = libs.mapNotNull { File(rootfs + it).takeIf { f -> f.isFile }?.let { f -> glibcMinor(f, GLIBC_NEED) { m -> m.maxOrNull() } } }.maxOrNull() ?: return true
+        return have >= need
+    }
+
     private const val PRELOAD_DIR = "/run/droiddeck-preload"
+    private const val NET_LINK = "etc/droiddeck-net"
+
+    private const val ZYPAK_SHIM = "#!/bin/sh\nprogram=\$1\nshift\nexec \"\$program\" --no-sandbox \"\$@\"\n"
+
+    private fun zypakShims(binds: List<Bind>, root: File, dir: File): List<Bind> {
+        val wrappers = listOf("/app/bin/zypak-wrapper.sh", "/app/bin/zypak-wrapper").filter { guest ->
+            val host = File(hostPath(binds, root.path, guest))
+            host.isFile && !Files.isSymbolicLink(host.toPath())
+        }
+        if (wrappers.isEmpty()) return emptyList()
+        val shim = File(dir, "zypak-wrapper")
+        shim.writeText(ZYPAK_SHIM)
+        chmod(shim, 0x1ed)
+        return wrappers.map { Bind(shim.path, it) }
+    }
 
     private fun browserSandboxes(env: MutableMap<String, String>) {
         env.putIfAbsent("ZYPAK_ZYGOTE_STRATEGY_SPAWN", "0")
@@ -279,12 +309,12 @@ object BwrapSpawner {
     }
 
     private fun genericCpuinfo(context: Context): File? = try {
-        val out = File(context.cacheDir, "cpuinfo-generic")
+        val out = File(LinuxRuntime.liveDir(context), "cpuinfo-generic")
         val text = File("/proc/cpuinfo").readLines()
             .filterNot { it.startsWith("CPU implementer") || it.startsWith("CPU part") || it.startsWith("CPU variant") || it.startsWith("CPU revision") }
             .joinToString("\n", postfix = "\n")
         if (!out.isFile || out.readText() != text) {
-            val staged = File.createTempFile("cpuinfo", null, context.cacheDir)
+            val staged = File.createTempFile("cpuinfo", null, LinuxRuntime.liveDir(context))
             staged.writeText(text)
             if (!staged.renameTo(out)) staged.delete()
         }
@@ -322,7 +352,7 @@ object BwrapSpawner {
         val verbose = plan.env["DROIDDECK_PROOT_VERBOSE"]?.toIntOrNull()
         if (verbose != null) { cmd.add(1, "-v"); cmd.add(2, verbose.toString()) }
         plan.binds.forEach { cmd.add("-b"); cmd.add(it.spec) }
-        cmd.add("/usr/bin/env")
+        cmd.add(plan.envTool)
         cmd.add("-i")
         plan.env.forEach { (k, v) -> cmd.add("$k=$v") }
         cmd.addAll(plan.argv)
@@ -330,7 +360,7 @@ object BwrapSpawner {
         builder.environment().apply {
             clear()
             put("PROOT_LOADER", LinuxRuntime.prootLoader(context).path)
-            put("PROOT_TMP_DIR", context.cacheDir.path)
+            put("PROOT_TMP_DIR", LinuxRuntime.prootTempDir(context).path)
             if (SessionPrefs.prootNoSeccomp(context)) put("PROOT_NO_SECCOMP", "1")
             LinuxRuntime.prootLibraryPath(context).takeIf { it.isNotEmpty() }?.let { put("LD_LIBRARY_PATH", it) }
         }
@@ -344,7 +374,15 @@ object BwrapSpawner {
             catch (e: IOException) {   }
             if (process.isAlive) {
                 Log.i(TAG, "sandbox $id: its bwrap is gone; stopping it")
-                process.destroy()
+                if (pid > 0) {
+                    runCatching { android.system.Os.kill(pid, android.system.OsConstants.SIGQUIT) }
+                } else {
+                    process.destroy()
+                }
+                try {
+                    if (!process.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)) process.destroyForcibly()
+                } catch (_: InterruptedException) {
+                }
             }
         }, "bwrap-$id-watch").apply { isDaemon = true; start() }
         val buffer = ByteArray(16384)

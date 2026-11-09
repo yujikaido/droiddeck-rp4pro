@@ -2,10 +2,15 @@ package com.droiddeck.launcher.core
 
 import android.app.ActivityManager
 import android.content.Context
+import android.hardware.display.DisplayManager
 import android.os.Build
 import android.os.Environment
+import android.os.PerformanceHintManager
+import android.os.PowerManager
 import android.os.StatFs
+import android.provider.Settings
 import android.util.Log
+import android.view.Display
 import com.droiddeck.launcher.gpu.LinuxVulkanDriver
 import com.droiddeck.launcher.gpu.LinuxVulkanDriverManager
 import com.droiddeck.launcher.gpu.TurnipDriver
@@ -24,6 +29,11 @@ import java.util.Locale
 object DeviceReport {
     private const val TAG = "DeviceReport"
 
+    internal fun cpuFeaturesSummary(cpuInfo: String): String = cpuInfo.lineSequence()
+        .filter { it.substringBefore(':').trim() == "Features" }
+        .map { it.substringAfter(':').trim().split(Regex("\\s+")).filter(String::isNotEmpty).joinToString(" ") }
+        .filter(String::isNotEmpty).distinct().joinToString(" | ").ifEmpty { "not reported" }
+
     fun write(context: Context, target: File, mode: String) {
         try {
             target.writeText(build(context, mode))
@@ -31,6 +41,62 @@ object DeviceReport {
             Log.w(TAG, "could not write $target", e)
         }
     }
+
+    /** Name of an ApplicationExitInfo reason code, so a report says "LOW_MEMORY" instead of "3". */
+    internal fun exitReasonName(reason: Int): String = when (reason) {
+        0 -> "UNKNOWN"
+        1 -> "EXIT_SELF"
+        2 -> "SIGNALED"
+        3 -> "LOW_MEMORY"
+        4 -> "CRASH"
+        5 -> "CRASH_NATIVE"
+        6 -> "ANR"
+        7 -> "INITIALIZATION_FAILURE"
+        8 -> "PERMISSION_CHANGE"
+        9 -> "EXCESSIVE_RESOURCE_USAGE"
+        10 -> "USER_REQUESTED"
+        11 -> "USER_STOPPED"
+        12 -> "DEPENDENCY_DIED"
+        13 -> "OTHER"
+        14 -> "FREEZER"
+        15 -> "PACKAGE_STATE_CHANGE"
+        16 -> "PACKAGE_UPDATED"
+        else -> "REASON_$reason"
+    }
+
+    /** The "Linux driver" line when the player picked none. A bridge session never uses the runtime's Turnip. */
+    internal fun defaultLinuxDriverLabel(bridge: Boolean): String =
+        if (bridge) com.droiddeck.launcher.gpu.GpuInfo.BRIDGE_SESSION_LINE
+        else "runtime default (the Turnip built into the runtime)"
+
+    internal fun thermalStatusName(status: Int): String = when (status) {
+        0 -> "NONE"
+        1 -> "LIGHT"
+        2 -> "MODERATE"
+        3 -> "SEVERE"
+        4 -> "CRITICAL"
+        5 -> "EMERGENCY"
+        6 -> "SHUTDOWN"
+        else -> "STATUS_$status"
+    }
+
+    internal fun gameModeName(mode: Int): String = when (mode) {
+        0 -> "UNSUPPORTED"
+        1 -> "STANDARD"
+        2 -> "PERFORMANCE"
+        3 -> "BATTERY"
+        4 -> "CUSTOM"
+        else -> "MODE_$mode"
+    }
+
+    internal fun refreshModesSummary(rates: List<Float>): String =
+        rates.map { Math.round(it) }.distinct().sortedDescending().joinToString(", ") { "$it Hz" }
+
+    internal fun exitSummary(processName: String?, reason: Int, status: Int, description: String?): String =
+        buildString {
+            append(processName ?: "?").append("  ").append(exitReasonName(reason)).append("  status=").append(status)
+            if (!description.isNullOrBlank()) append("  ").append(description.trim())
+        }
 
     fun build(context: Context, mode: String): String {
         val b = StringBuilder()
@@ -68,19 +134,55 @@ object DeviceReport {
         k("Fingerprint", Build.FINGERPRINT)
         k("Kernel", System.getProperty("os.version"))
         k("ABIs", Build.SUPPORTED_ABIS.joinToString(", "))
+        k("Memory page size", runCatching { android.system.Os.sysconf(android.system.OsConstants._SC_PAGESIZE) }.getOrNull()?.let { "$it bytes" })
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            h("Recent process exits")
+            val exits = runCatching {
+                context.getSystemService(android.app.ActivityManager::class.java).getHistoricalProcessExitReasons(context.packageName, 0, 5)
+            }.getOrNull().orEmpty()
+            if (exits.isEmpty()) k("Exits", "none recorded") else {
+                val stamp = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
+                for (e in exits) {
+                    k(stamp.format(Date(e.timestamp)), exitSummary(e.processName, e.reason, e.status, e.description))
+                }
+            }
+        }
 
         h("CPU and memory")
         k("Cores", CpuCores.all.size)
+        k("CPU features", cpuFeaturesSummary(FileUtils.readString(File("/proc/cpuinfo")).orEmpty()))
         b.append("Core ceilings          ")
         b.append(CpuCores.all.joinToString(", ") { c ->
             "cpu$c " + (CpuCores.maxGhz(c)?.let { String.format(Locale.US, "%.2f GHz", it) } ?: "?")
         })
+        b.append('\n')
+        // What droiddeck-cpu-placement tells small cores by (capacity per MHz).
+        b.append("Core capacity          ")
+        b.append(CpuCores.all.joinToString(", ") { c -> "cpu$c " + (CpuCores.capacity(c)?.toString() ?: "?") })
         b.append('\n')
         runCatching {
             val mi = ActivityManager.MemoryInfo()
             (context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager).getMemoryInfo(mi)
             k("RAM total", FileUtils.sizeToString(mi.totalMem))
             k("RAM available", FileUtils.sizeToString(mi.availMem))
+        }
+        val pm = runCatching { context.getSystemService(Context.POWER_SERVICE) as? PowerManager }.getOrNull()
+        if (pm != null) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                k("Thermal status", runCatching { thermalStatusName(pm.currentThermalStatus) }.getOrNull())
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                k("Thermal headroom (10 s)", runCatching {
+                    pm.getThermalHeadroom(10).let { if (it.isNaN()) "not reported" else String.format(Locale.US, "%.2f", it) }
+                }.getOrNull())
+            }
+            k("Power saver", runCatching { pm.isPowerSaveMode }.getOrNull())
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val rate = runCatching { context.getSystemService(PerformanceHintManager::class.java)?.preferredUpdateRateNanos }.getOrNull()
+            k("ADPF hint sessions", if (rate == null || rate <= 0) "not supported" else "supported (preferred update ${rate / 1000} us)")
+            k("Game Mode", runCatching { context.getSystemService(android.app.GameManager::class.java)?.gameMode }.getOrNull()?.let { gameModeName(it) })
         }
         runCatching {
             val fs = StatFs(context.filesDir.path)
@@ -99,6 +201,13 @@ object DeviceReport {
         h("Display")
         k("Session output", SessionState.outputSize?.let { "${it.first}x${it.second}" })
         k("Session refresh", String.format(Locale.US, "%.2f Hz", SessionState.refreshHz))
+        runCatching {
+            val display = context.getSystemService(DisplayManager::class.java).getDisplay(Display.DEFAULT_DISPLAY)
+            k("Panel refresh now", String.format(Locale.US, "%.2f Hz", display.refreshRate))
+            k("Panel refresh modes", refreshModesSummary(display.supportedModes.map { it.refreshRate }))
+        }
+        k("peak_refresh_rate", runCatching { Settings.System.getString(context.contentResolver, "peak_refresh_rate") }.getOrNull() ?: "not set")
+        k("refresh_rate_mode", runCatching { Settings.Secure.getString(context.contentResolver, "refresh_rate_mode") }.getOrNull() ?: "not set")
         val panelSize = com.droiddeck.launcher.session.SessionDisplay.panelSize(context)
         for ((label, mode) in listOf("Resolution (Steam)" to SessionService.MODE_STEAM, "Resolution (Desktop)" to SessionService.MODE_DESKTOP)) {
             val choice = SessionPrefs.resolutionChoice(context, mode, panelSize)
@@ -109,10 +218,18 @@ object DeviceReport {
 
         h("Drivers")
         val gpu = com.droiddeck.launcher.gpu.GpuInfo.detect()
-        k("GPU", "${gpu.name} · ${gpu.family.label} · ${gpu.supportText(SessionPrefs.vkBridge(context))}" + if (gpu.oneUi8Gen2) " · One UI 8 Gen 2" else "")
+        k("GPU", "${gpu.displayName(context)} · ${gpu.family.label} · ${gpu.supportText(DeviceSupport.vkBridge(context), DeviceSupport.mali())}" + if (gpu.oneUi8Gen2) " · One UI 8 Gen 2" else "")
+        if (DeviceSupport.bridgeTurnedOn(context)) k("Mali bridge", DeviceSupport.BRIDGE_TURNED_ON_LINE)
+        if (gpu.model == 740) {
+            val hint = com.droiddeck.launcher.gpu.TpUbwcHint
+            k("TP UBWC hint", hint.forThisDevice(context) ?: "driver default")
+            k("TP UBWC mode", hint.activeMode ?: SessionPrefs.TP_UBWC_AUTO)
+            if (hint.restartRequired(context)) k("TP UBWC pending", "${SessionPrefs.tpUbwcMode(context)} (restart required)")
+        }
         k("Driver mode", SessionPrefs.gpuDriverMode(context) +
             (com.droiddeck.launcher.gpu.DriverPairs.recommendedKey(gpu, com.droiddeck.launcher.gpu.DriverPairs.from(
-                com.droiddeck.launcher.gpu.TurnipReleases.cached(context)))?.let { " (recommended pair: $it)" } ?: ""))
+                com.droiddeck.launcher.gpu.TurnipReleases.cached(context)), com.droiddeck.launcher.gpu.TurnipReleases.autoPicks(context),
+                com.droiddeck.launcher.gpu.AutoDriverTrial.bad(context))?.let { " (recommended pair: $it)" } ?: ""))
         val turnip = TurnipDriver(context)
         val androidChoice = SessionPrefs.androidDriver(context)
         k("Display driver (chosen)", if (androidChoice.isEmpty()) "Auto -> ${turnip.autoId()}" else androidChoice)
@@ -121,7 +238,7 @@ object DeviceReport {
         val lm = LinuxVulkanDriverManager(context)
         run {
             val id = SessionPrefs.linuxDriver(context)
-            val label = if (id.isEmpty()) "runtime default (the Turnip built into the runtime)"
+            val label = if (id.isEmpty()) defaultLinuxDriverLabel(DeviceSupport.vkBridge(context))
             else "${lm.getDriverName(id)} ${lm.getDriverVersion(id)}".trim() +
                 lm.getMinGlibc(id).let { if (it.isEmpty()) "" else " (glibc $it+)" } +
                 if (lm.isInstalled(id)) "" else "  [MISSING - falls back to the runtime's own]"
@@ -133,6 +250,9 @@ object DeviceReport {
         k("Installed version", LinuxRuntimeInstaller.installedVersion(context))
         k("Runtime ready", LinuxRuntime.isInstalled(context))
         k("Desktop installed", DesktopCatalog.desktopInstalled(context))
+        k("Interrupted installs", DesktopCatalog.interrupted(context).joinToString { "${it.id} ${it.version}" }.ifEmpty { "none" })
+        val broken = runCatching { com.droiddeck.launcher.runtime.RuntimeHealth.brokenLibraryLinks(context) }.getOrDefault(emptyList())
+        k("Broken library links", if (broken.isEmpty()) "none" else "${broken.size}: ${broken.take(8).joinToString()}")
         k("Runtime root", LinuxRuntime.rootDir(context).path)
 
         h("Settings in effect")
@@ -152,11 +272,17 @@ object DeviceReport {
         EsyncPacks.status(LinuxRuntime.rootDir(context)).let { k("droiddeck-esync packs", "${it.installed} installed, ${it.wanted} wanted") }
         k("Linux x86 (FEX)", if (com.droiddeck.launcher.runtime.LinuxFex.ready(context)) "ready" else "not set up")
         k("gamescope realtime", SessionPrefs.gamescopeRealtime(context))
+        k("zRAM: compress Steam during games", SessionPrefs.zramClient(context))
+        k("RAM cap", SessionPrefs.ramCapMb(context).let { if (it > 0) "$it MB" else "off" })
+        k("VRAM cap", SessionPrefs.vramCapMb(context).let { if (it > 0) "$it MB" else "driver default" })
         k("proot without seccomp", SessionPrefs.prootNoSeccomp(context))
         k("proot fast path", SessionPrefs.prootFastPath(context))
+        k("proot binary", LinuxRuntime.prootSource(context) + " " + LinuxRuntime.prootBinary(context).path)
+        k("proot fast path (eligible)", com.droiddeck.launcher.runtime.ProotFastPath.enabled(context))
         k("Guest host name", SessionPrefs.guestHostname(context))
         k("DirectAudio for games", SessionPrefs.directAudio(context))
         k("Stretch 16:9 to panel", SessionPrefs.stretch16x9(context))
+        k("Return to launcher after a game", SessionPrefs.returnAfterGame(context))
         k("Microphone", SessionPrefs.micEnabled(context))
         k("On-screen controls", SessionPrefs.oscMode(context))
         k("Touch mode", SessionPrefs.touchMode(context))

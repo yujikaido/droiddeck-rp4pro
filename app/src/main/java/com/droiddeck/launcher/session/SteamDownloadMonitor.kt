@@ -1,6 +1,7 @@
 package com.droiddeck.launcher.session
 
 import java.io.File
+import java.io.FileInputStream
 import java.io.RandomAccessFile
 
 internal class SteamDownloadMonitor {
@@ -12,6 +13,7 @@ internal class SteamDownloadMonitor {
     private var previous = emptyMap<String, ManifestState>()
     private var lastProgressAt = 0L
     private var contentLogOffset = 0L
+    private var contentLog: File? = null
     private val activeContentUpdates = mutableSetOf<String>()
     // Steps that only work the disk (reserving space, committing, verifying, moving a game) log nothing until they
     // end, for many minutes on an SD card: they count from the line that started them, not from the latest line.
@@ -26,8 +28,9 @@ internal class SteamDownloadMonitor {
     private var installing = false
     private var installingSince = 0L
 
-    fun poll(runtimeRoot: File, now: Long = System.currentTimeMillis(), receivedBytes: Long = -1L): Boolean {
-        val current = manifests(runtimeRoot).associate { it.path to read(it) }
+    fun poll(runtimeRoot: File, now: Long = System.currentTimeMillis(), receivedBytes: Long = -1L, client: String? = null,
+             mounts: Map<String, File> = emptyMap()): Boolean {
+        val current = manifests(runtimeRoot, mounts).associate { it.path to read(it) }
         val progressed = current.any { (path, state) ->
             state.incomplete && state.bytesDownloaded > (previous[path]?.bytesDownloaded ?: state.bytesDownloaded)
         }
@@ -39,7 +42,7 @@ internal class SteamDownloadMonitor {
             lastContentActivityAt = now
             lastNetworkAt = now
         }
-        return manifestActive || readContentActivity(runtimeRoot, now)
+        return manifestActive || readContentActivity(runtimeRoot, now, client)
     }
 
     private fun receiving(receivedBytes: Long, now: Long): Boolean {
@@ -51,7 +54,11 @@ internal class SteamDownloadMonitor {
         return (receivedBytes - previousBytes) * 1000L / (now - previousAt) >= MIN_RECEIVE_BYTES_PER_SEC
     }
 
-    // The client's own first-run update counts as active while data arrives or the bootstrap log grows (only the log with network = false), and while the updater installs (up to CLIENT_INSTALL_MAX_MS). Call after poll().
+    // The client's own update after its install (tens of MB) is not an app download, so the manifests and
+    // content_log never show it. It counts as active while the app receives data or Steam's bootstrap log grows;
+    // with network = false only the log counts (after the first frame the data may be a game's). Call after poll.
+    // It also counts while the updater is installing what it downloaded (installingUpdate), for up to
+    // CLIENT_INSTALL_MAX_MS: that step neither receives data nor writes the log.
     fun clientUpdateActive(runtimeRoot: File, now: Long = System.currentTimeMillis(), network: Boolean = true): Boolean {
         val log = File(runtimeRoot, "root/.local/share/Steam/logs/bootstrap_log.txt")
         val length = if (log.isFile) log.length() else -1L
@@ -78,42 +85,46 @@ internal class SteamDownloadMonitor {
     }.getOrDefault("")
 
     fun reset() {
+        lastNetworkAt = 0L
+        bootstrapLogLength = UNREAD
+        lastBootstrapGrowthAt = 0L
         previous = emptyMap()
         lastProgressAt = 0L
         contentLogOffset = 0L
+        contentLog = null
         activeContentUpdates.clear()
         diskStepsSince.clear()
         lastContentActivityAt = 0L
         lastReceivedBytes = -1L
         lastReceivedAt = 0L
-        lastNetworkAt = 0L
-        bootstrapLogLength = UNREAD
-        lastBootstrapGrowthAt = 0L
         installCheckedLength = UNREAD
         installing = false
         installingSince = 0L
     }
 
-    private fun readContentActivity(runtimeRoot: File, now: Long): Boolean {
-        val log = File(runtimeRoot, "root/.local/share/Steam/logs/content_log.txt")
+    private fun readContentActivity(runtimeRoot: File, now: Long, client: String?): Boolean {
+        val homes = client?.let { listOf(if (it == "x86_64") STEAM_HOMES[1] else STEAM_HOMES[0]) } ?: STEAM_HOMES
+        val log = homes.map { File(runtimeRoot, "$it/logs/content_log.txt") }.maxByOrNull { it.lastModified() }!!
         if (!log.isFile) return false
-        if (log.length() < contentLogOffset) {
+        if (log != contentLog || log.length() < contentLogOffset) {
+            contentLog = log
             contentLogOffset = 0L
             activeContentUpdates.clear()
             lastContentActivityAt = 0L
         }
         runCatching {
-            RandomAccessFile(log, "r").use { input ->
-                input.seek(contentLogOffset)
+            FileInputStream(log).use { input ->
+                input.channel.position(contentLogOffset)
+                val reader = input.bufferedReader(Charsets.ISO_8859_1)
                 while (true) {
-                    val line = input.readLine() ?: break
+                    val line = reader.readLine() ?: break
                     when {
                         "Client version:" in line -> {
                             activeContentUpdates.clear()
                             diskStepsSince.clear()
                             lastContentActivityAt = 0L
                         }
-                        CONTENT_UPDATE.find(line)?.let { match ->
+                        " update changed : " in line && CONTENT_UPDATE.find(line)?.let { match ->
                             val appId = match.groupValues[1]
                             val updateType = match.groupValues[2]
                             val state = match.groupValues[3]
@@ -141,14 +152,15 @@ internal class SteamDownloadMonitor {
                             }
                             true
                         } == true -> Unit
-                        CURRENT_RATE.find(line)?.groupValues?.get(1)?.toDoubleOrNull()?.let { it > 0.0 } == true ->
+                        "Current download rate: " in line &&
+                            CURRENT_RATE.find(line)?.groupValues?.get(1)?.toDoubleOrNull()?.let { it > 0.0 } == true ->
                             lastContentActivityAt = now
                         "Downloading " in line && " chunks for depot " in line ->
                             lastContentActivityAt = now
                     }
                     if (activeContentUpdates.isNotEmpty()) lastContentActivityAt = now
                 }
-                contentLogOffset = input.filePointer
+                contentLogOffset = input.channel.position()
             }
         }
         return activeContentUpdates.isNotEmpty() && lastContentActivityAt > 0L &&
@@ -156,13 +168,16 @@ internal class SteamDownloadMonitor {
             diskStepsSince.values.any { now - it <= DISK_STEP_MAX_MS }
     }
 
-    private fun manifests(runtimeRoot: File): List<File> {
-        val steamRoots = linkedSetOf(File(runtimeRoot, "root/.local/share/Steam"))
-        val primary = steamRoots.first()
-        val libraryFolders = File(primary, "steamapps/libraryfolders.vdf")
-        runCatching {
-            PATH.findAll(libraryFolders.readText()).forEach { match ->
-                steamRoots += File(runtimeRoot, match.groupValues[1].removePrefix("/"))
+    private fun manifests(runtimeRoot: File, mounts: Map<String, File>): List<File> {
+        val steamRoots = linkedSetOf<File>()
+        for (home in STEAM_HOMES) {
+            val primary = File(runtimeRoot, home)
+            steamRoots += primary
+            val libraryFolders = File(primary, "steamapps/libraryfolders.vdf")
+            runCatching {
+                PATH.findAll(libraryFolders.readText()).forEach { match ->
+                    steamRoots += hostPath(runtimeRoot, match.groupValues[1], mounts)
+                }
             }
         }
         return steamRoots.flatMap { root ->
@@ -170,6 +185,15 @@ internal class SteamDownloadMonitor {
                 file.isFile && file.name.startsWith("appmanifest_") && file.name.endsWith(".acf")
             }.orEmpty().toList()
         }
+    }
+
+    private fun hostPath(runtimeRoot: File, guest: String, mounts: Map<String, File>): File {
+        val path = guest.trimEnd('/')
+        for ((mount, host) in mounts) {
+            if (path == mount) return host
+            if (path.startsWith("$mount/")) return File(host, path.removePrefix("$mount/"))
+        }
+        return File(runtimeRoot, path.removePrefix("/"))
     }
 
     private fun read(file: File): ManifestState {
@@ -184,30 +208,42 @@ internal class SteamDownloadMonitor {
         Regex("\"$key\"\\s+\"([^\"]*)\"").find(text)?.groupValues?.get(1)
 
     companion object {
-        /** Whether the session notification says Steam is downloading its update: the start still counts as an
-         * update, data or the bootstrap log is still coming, and the update's own download progress was seen in
-         * the session log (LoadingState.steamUpdateDownloading). Without the last, every start said so for ~100 s. */
+        /** Whether the notification says Steam is downloading its update: still counted as one, data or the
+         * bootstrap log still coming, and the update's own progress seen in the session log. */
         fun clientUpdateShown(updating: Boolean, active: Boolean, progressSeen: Boolean) = updating && active && progressSeen
 
-        /** Whether the updater, in its latest start in this bootstrap log text, is installing a client update and has not yet shut down to start it. */
+        const val CLIENT_UPDATE_GRACE_MS = 90_000L
+        const val CLIENT_INSTALL_MAX_MS = 15L * 60L * 1000L
+        const val BOOTSTRAP_TAIL_BYTES = 128L * 1024L
+        const val UNREAD = Long.MIN_VALUE
+        /** Whether the updater, in its latest start in this bootstrap log text, has begun unpacking and installing
+         * a client update and not yet shut down to start it. Both lines are untranslated, so this holds in any
+         * Steam language. The install writes nothing until it ends (7 s on one phone; far longer when the
+         * phone is slow or the updater window is held up), so without this a background session was paused with it
+         * half done once the log had been quiet for CLIENT_UPDATE_GRACE_MS. */
         fun installingUpdate(text: String): Boolean {
             val session = text.substring(maxOf(0, text.lastIndexOf("] Startup - ")))
             val unpack = session.lastIndexOf("uninstalled manifest found")
             return unpack >= 0 && session.indexOf("] Shutdown", unpack) < 0
         }
 
-        const val MANIFEST_PROGRESS_GRACE_MS = 8_000L
-        const val CONTENT_ACTIVITY_GRACE_MS = 90_000L
+        fun clientInstallPending(runtimeRoot: File): Boolean {
+            val home = File(runtimeRoot, "root")
+            val steam = File(home, ".local/share/Steam")
+            val stamped = File(steam, "package/droiddeck-installed").isFile ||
+                File(steam, "package/bannerlator-installed").isFile
+            return !(stamped && File(steam, "steamrtarm64/steam").isFile) || File(home, ".bl-steam-repair").exists()
+        }
+
+        private const val MANIFEST_PROGRESS_GRACE_MS = 8_000L
+        private const val CONTENT_ACTIVITY_GRACE_MS = 90_000L
         const val DISK_STEP_MAX_MS = 3L * 60L * 60L * 1000L
         val DISK_STEPS = listOf("Preallocating", "Committing", "Verifying", "Validating")
-        const val CLIENT_UPDATE_GRACE_MS = 90_000L
-        const val CLIENT_INSTALL_MAX_MS = 15L * 60L * 1000L
-        const val BOOTSTRAP_TAIL_BYTES = 128L * 1024L
-        const val UNREAD = Long.MIN_VALUE
-        const val MIN_RECEIVE_BYTES_PER_SEC = 64L * 1024L
-        val PATH = Regex("\"path\"\\s+\"([^\"]+)\"")
-        val CONTENT_UPDATE = Regex("""AppID (\d+) (App|Workshop|Shader) update changed : (.*)""")
-        val CURRENT_RATE = Regex("""Current download rate: ([\d.]+) Mbps""")
-        val APP_STATE = Regex("""AppID (\d+) state changed : (.*)""")
+        private val APP_STATE = Regex("""AppID (\d+) state changed : (.*)""")
+        private const val MIN_RECEIVE_BYTES_PER_SEC = 64L * 1024L
+        private val PATH = Regex("\"path\"\\s+\"([^\"]+)\"")
+        private val STEAM_HOMES = listOf("root/.local/share/Steam", "root/.droiddeck-x64/.local/share/Steam")
+        private val CONTENT_UPDATE = Regex("""AppID (\d+) (App|Workshop|Shader) update changed : (.*)""")
+        private val CURRENT_RATE = Regex("""Current download rate: ([\d.]+) Mbps""")
     }
 }

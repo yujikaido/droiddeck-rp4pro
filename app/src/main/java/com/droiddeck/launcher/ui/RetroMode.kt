@@ -226,7 +226,7 @@ internal fun RetroMode(s: FrontEndState, a: FrontEndActions, onExit: () -> Unit)
             Box(Modifier.fillMaxSize().focusProperties { enter = { if (detail != null) FocusRequester.Cancel else FocusRequester.Default } }.focusGroup()) {
                 Layer(gallery) { key -> RetroGallery(s, a, key, onSelect, Modifier.fillMaxSize(), active = detail == null, refocus = refocus) }
             }
-            Layer(detail) { key -> Content(s, key, a, Modifier.fillMaxSize(), onSelect, {}, {}, {}) }
+            Layer(detail) { key -> Content(s, key, a, Modifier.fillMaxSize(), onSelect, {}, {}, {}, {}) }
         }
     }
 }

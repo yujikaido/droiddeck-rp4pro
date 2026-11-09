@@ -1,3 +1,4 @@
 # The MaliBridge release tag this tree is published as (BuildConfig.MALI_RELEASE).
 # The in-app updater of the .mali build compares it with the newest release; raise it with each release.
-v0.5.4.2
+# The .mali versionName and versionCode follow it (v0.5.5.1 -> 0.5.5.1, 5051).
+v0.5.5.3

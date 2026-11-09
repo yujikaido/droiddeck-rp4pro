@@ -4,6 +4,7 @@
 #include <android/log.h>
 #include <wayland-server.h>
 #include "vk_present.h"
+#include "firstframe.h"
 
 #define COMPOSITOR_INTERNAL __attribute__((visibility("hidden")))
 
@@ -39,6 +40,8 @@ struct dmabuf_buffer {
     int import_failed;
     int refs;
     void *ahb_state;
+    unsigned release_sent : 1; /* released and not committed since (compositor.c buffer_release_send) */
+    struct dmabuf_cpu cpu; /* the CPU's copy where the driver refuses the import (firstframe.c) */
 };
 
 struct client_info {

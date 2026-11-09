@@ -6,6 +6,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <fcntl.h>
 #include <time.h>
 #include <stdarg.h>
@@ -15,6 +16,7 @@
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #include <android/log.h>
+#include <android/hardware_buffer.h>
 #include <wayland-server.h>
 
 #include "xdg-shell-server-protocol.h"
@@ -68,6 +70,36 @@ void droiddeck_log(const char *tag, const char *fmt, ...) {
     pthread_mutex_unlock(&g_log_lock);
 }
 
+static char g_log_path[256];
+
+/* Opens PATH with the log's header; NULL when it cannot be written. */
+static FILE *session_log_file(const char *path, const char *continued_from) {
+    char stamp[32];
+    time_t now = time(NULL);
+    struct tm tm;
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        WLOGE("can't open session log %s: %s", path, strerror(errno));
+        return NULL;
+    }
+    setvbuf(f, NULL, _IOLBF, 0);
+    localtime_r(&now, &tm);
+    strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", &tm);
+    fprintf(f,
+            "DroidDeck Wayland session\n"
+            "=========================\n"
+            "Started   %s\n"
+            "Display   Wayland: programs draw through the DroidDeck compositor.\n"
+            "          gamescope and the desktop start their own Xwayland for X11 programs.\n"
+            "Log       %s\n",
+            stamp, path);
+    if (continued_from)
+        fprintf(f, "          The compositor kept running from an earlier session; its log until now: %s\n", continued_from);
+    fprintf(f, "\nTime          Area      Event\n"
+               "------------  --------  -----------------------------------------------------\n");
+    return f;
+}
+
 static void open_session_log(void) {
     char path[256], stamp[32];
     time_t now = time(NULL);
@@ -85,28 +117,39 @@ static void open_session_log(void) {
             WLOGE("can't create %s: %s", SESSION_LOG_DIR, strerror(errno));
         snprintf(path, sizeof(path), "%s/wayland-%s.log", SESSION_LOG_DIR, stamp);
     }
-    if (!(f = fopen(path, "w"))) {
-        WLOGE("can't open session log %s: %s", path, strerror(errno));
-        return;
-    }
-    setvbuf(f, NULL, _IOLBF, 0);
-    strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", &tm);
-    fprintf(f,
-            "DroidDeck Wayland session\n"
-            "=========================\n"
-            "Started   %s\n"
-            "Display   Wayland: programs draw through the DroidDeck compositor.\n"
-            "          gamescope and the desktop start their own Xwayland for X11 programs.\n"
-            "Log       %s\n\n"
-            "Time          Area      Event\n"
-            "------------  --------  -----------------------------------------------------\n",
-            stamp, path);
+    if (!(f = session_log_file(path, NULL))) return;
     pthread_mutex_lock(&g_log_lock);
     for (int i = 0; i < g_prelog_n; i++) { fputs(g_prelog[i], f); free(g_prelog[i]); g_prelog[i] = NULL; }
     g_prelog_n = 0;
     g_log = f;
+    snprintf(g_log_path, sizeof(g_log_path), "%s", path);
     pthread_mutex_unlock(&g_log_lock);
     WLOGI("session log: %s", path);
+}
+
+/* A new session while the compositor keeps running in the same app process (it is started once per
+ * process): the log moves to that session's directory instead of growing in the first session's.
+ * Before the compositor has started this does nothing; it opens BL_WAYLAND_LOG itself then. */
+void droiddeck_session_log_follow(const char *path) {
+    if (!path || !*path) return;
+    pthread_mutex_lock(&g_log_lock);
+    const int open_now = g_log != NULL && strcmp(path, g_log_path) != 0;
+    char was[256];
+    snprintf(was, sizeof(was), "%s", g_log_path);
+    pthread_mutex_unlock(&g_log_lock);
+    if (!open_now) return;
+    FILE *f = session_log_file(path, was);
+    if (!f) return;
+    pthread_mutex_lock(&g_log_lock);
+    FILE *old = g_log;
+    g_log = f;
+    snprintf(g_log_path, sizeof(g_log_path), "%s", path);
+    pthread_mutex_unlock(&g_log_lock);
+    if (old) {
+        fprintf(old, "(the log continues in %s for the next session)\n", path);
+        fclose(old);
+    }
+    WLOGI("session log: %s (was %s)", path, was);
 }
 
 static int log_budget(void) {
@@ -146,6 +189,7 @@ static const char *client_name(struct wl_client *client) {
 static void on_client_destroyed(struct wl_listener *l, void *data) {
     struct client_info *ci = wl_container_of(l, ci, destroy), **pp;
     droiddeck_log("program", "disconnected: %s (pid %d)", ci->name, (int)ci->pid);
+    ff_client(ci->name, 0);
     droiddeck_color_client_gone(ci->client);
     for (pp = &g_clients; *pp; pp = &(*pp)->next)
         if (*pp == ci) { *pp = ci->next; break; }
@@ -179,10 +223,14 @@ static void on_client_created(struct wl_listener *l, void *data) {
     ci->next = g_clients;
     g_clients = ci;
     droiddeck_log("program", "connected over Wayland: %s (pid %d)", ci->name, (int)ci->pid);
+    ff_client(ci->name, 1);
 }
 
 
 enum surface_role { ROLE_NONE, ROLE_TOPLEVEL, ROLE_SUBSURFACE, ROLE_DESKTOP, ROLE_CURSOR };
+
+#define DAMAGE_RECTS 8
+struct damage_list { int32_t r[DAMAGE_RECTS][4]; int n; };
 
 struct surface {
     struct wl_resource *resource;
@@ -202,9 +250,11 @@ struct surface {
     struct wl_resource *dmabuf;
     struct dmabuf_buffer *dmabuf_buf;
     struct wl_listener dmabuf_destroy;
+    const void *last_dmabuf;
     int buf_w, buf_h, has_content;
     int buf_alpha;
     int opaque[4], pending_opaque[4], pending_opaque_set;
+    struct damage_list damage_buf, pending_damage_buf, damage_local, pending_damage_local;
     int src_set, dst_set;
     float src[4];
     int dst[2];
@@ -217,6 +267,8 @@ struct surface {
     enum surface_role role;
     struct wl_resource *idle_buffer;
     struct wl_listener idle_buffer_destroy;
+    uint32_t *idle_px;
+    int idle_w, idle_h;
     struct wl_resource *xdg_surface, *xdg_toplevel;
     struct wl_resource *viewport;
 
@@ -253,6 +305,26 @@ static struct wl_event_source *g_render_idle, *g_frame_timer;
 
 
 static int g_dirty;
+static int64_t g_dirty_since_ns;
+volatile int g_render_on_commit; /* SessionPrefs.renderOnCommit, off unless asked for */
+static int64_t g_rendered_tick_ns;
+static int g_tick_held;
+static int64_t g_hold_missed_ns;
+#define HOLD_RETRY_NS 1000000000LL
+#define PACE_BUFFERS 32
+static struct {
+    unsigned ticks, ticks_late_2ms, renders, commit_renders, null_attaches, reattaches, presented, replaced, undrawn, distinct;
+    int64_t tick_late_ns, tick_late_max_ns, wait_ns, wait_max_ns;
+    const void *buffers[PACE_BUFFERS];
+    uint64_t game_frames_seen;
+} g_pace;
+
+static void pace_note_buffer(const void *buffer) {
+    for (unsigned i = 0; i < g_pace.distinct && i < PACE_BUFFERS; i++)
+        if (g_pace.buffers[i] == buffer) return;
+    if (g_pace.distinct < PACE_BUFFERS) g_pace.buffers[g_pace.distinct] = buffer;
+    g_pace.distinct++;
+}
 static int64_t g_last_vsync_ns;
 static int64_t g_tick_vsync_ns;
 static int64_t g_refresh_ns = 16666667;
@@ -260,6 +332,8 @@ static struct wl_event_source *g_fallback_timer;
 static int g_fallback_armed;
 
 volatile int g_fps_limit;
+/* fps limit -1 (phone output, not mirrored): replaced buffers go back to the client at once instead of once per refresh. */
+volatile int g_release_unpaced;
 
 volatile int g_hide_shell;
 
@@ -271,7 +345,9 @@ volatile int g_ubwc = 1;
 
 volatile int g_no_render_node;
 
-volatile int g_output_refresh_mhz;
+static atomic_int g_output_refresh_mhz = 60000;
+static atomic_int g_output_refresh_pending;
+static int g_output_announced_refresh_mhz = 60000;
 
 volatile int g_output_w, g_output_h;
 struct pending_release {
@@ -300,6 +376,7 @@ static struct {
 } g_perf;
 
 static void schedule_render(void);
+static void on_commit_idle(void *data);
 
 static int64_t now_ns(void) {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -314,6 +391,99 @@ static void perf_note_release(int64_t since_ns) {
     g_perf.release_ns += d;
     if (d > g_perf.release_max_ns) g_perf.release_max_ns = d;
     if (d >= 1000000LL) g_perf.releases_held++;
+}
+
+/* One wl_buffer.release per commit of a dma-buf, sent once no surface shows the buffer any more.
+ * gamescope's nested Wayland backend shows one buffer on two of its surfaces at times: the game's
+ * frame moves from its window to a subsurface above a black backing while a Steam notification is
+ * up, and back. Releasing when the first surface let go told gamescope a buffer still on screen was
+ * free (it may draw into it), and the second surface's release then hit a buffer it had not
+ * acquired: "Compositor released us but we were not acquired" (122 of 294 player sessions, some
+ * ending in "IWaitable hung up. Aborting."). Whether a buffer is shown is read from the live surface
+ * list each time, so no count can drift and leave a buffer unreleased. */
+static struct dmabuf_buffer *get_dmabuf(struct wl_resource *buffer);
+#define BUFFER_TRACE_EVENTS 240
+#define BUFFER_NOTES 40
+static int g_buffer_trace_left = BUFFER_TRACE_EVENTS, g_buffer_notes_left = BUFFER_NOTES, g_buffer_warns_left = BUFFER_NOTES;
+static struct buffer_stats { unsigned held, reshown, merged, doubles; } g_buffer_stats, g_buffer_stats_said;
+
+static uint32_t buffer_surface_id(const struct surface *s) {
+    return s && s->resource ? wl_resource_get_id(s->resource) : 0;
+}
+
+static void buffer_note(int *left, const char *fmt, ...) {
+    char msg[256];
+    va_list ap;
+    if (*left <= 0) return;
+    (*left)--;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+    droiddeck_log("buffer", "%s", msg);
+}
+
+/* The surface other than `except` that shows this buffer now, or NULL. */
+static struct surface *buffer_shown_on(struct wl_resource *buffer, const struct surface *except) {
+    struct surface *o;
+    if (!buffer) return NULL;
+    wl_list_for_each(o, &g_surfaces, link)
+        if (o != except && o->dmabuf == buffer) return o;
+    return NULL;
+}
+
+/* A commit of a dma-buf: the client counts it as ours again until we release it. */
+static void buffer_committed(struct surface *s, struct wl_resource *buffer) {
+    struct dmabuf_buffer *db = get_dmabuf(buffer);
+    if (!db) return;
+    db->release_sent = 0;
+    if (s->dmabuf != buffer && g_buffer_trace_left > 0) {
+        g_buffer_trace_left--;
+        droiddeck_log("buffer", "#%u committed on @%u", wl_resource_get_id(buffer), buffer_surface_id(s));
+    }
+}
+
+/* Sends the release unless this buffer was already released and not committed since. */
+static int buffer_release_send(struct wl_resource *buffer, const char *site) {
+    struct dmabuf_buffer *db = get_dmabuf(buffer);
+    if (db && db->release_sent) {
+        g_buffer_stats.doubles++;
+        if (g_buffer_warns_left > 0) WLOGE("DOUBLE release of wl_buffer #%u blocked (%s)", wl_resource_get_id(buffer), site);
+        buffer_note(&g_buffer_warns_left, "WARN DOUBLE release of #%u blocked (%s): released before and not committed since",
+                    wl_resource_get_id(buffer), site);
+        return 0;
+    }
+    if (db) db->release_sent = 1;
+    if (g_buffer_trace_left > 0) {
+        g_buffer_trace_left--;
+        droiddeck_log("buffer", "#%u released (%s)", wl_resource_get_id(buffer), site);
+    }
+    wl_buffer_send_release(buffer);
+    return 1;
+}
+
+static struct pending_release *pending_release_of(struct wl_resource *buffer) {
+    struct pending_release *pr;
+    wl_list_for_each(pr, &g_pending_releases, link)
+        if (pr->buffer == buffer) return pr;
+    return NULL;
+}
+
+static void pending_release_free(struct pending_release *pr);
+
+/* A release sent now: a paced one still queued for the same buffer would be a second release. */
+static int buffer_release_now(struct wl_resource *buffer, const char *site) {
+    struct pending_release *pr = pending_release_of(buffer);
+    if (pr) { g_buffer_stats.merged++; pending_release_free(pr); }
+    return buffer_release_send(buffer, site);
+}
+
+/* At most one line per stats period, only when something happened since the last one. */
+static void buffer_stats_log(void) {
+    if (!memcmp(&g_buffer_stats, &g_buffer_stats_said, sizeof(g_buffer_stats))) return;
+    g_buffer_stats_said = g_buffer_stats;
+    droiddeck_log("buffer", "so far: %u releases waited for a second surface, %u queued releases dropped (shown again), "
+               "%u merged, %u double releases blocked", g_buffer_stats.held, g_buffer_stats.reshown,
+               g_buffer_stats.merged, g_buffer_stats.doubles);
 }
 
 
@@ -353,9 +523,18 @@ static int on_release_timer(int fd, uint32_t mask, void *data) {
     if (read(fd, &expirations, sizeof(expirations)) < 0 && errno != EAGAIN) return 0;
     wl_list_for_each_safe(pr, tmp, &g_pending_releases, link) {
         if (pr->at_ns <= now) {
-            wl_buffer_send_release(pr->buffer);
-            perf_note_release(pr->since_ns);
+            struct wl_resource *buffer = pr->buffer;
+            const int64_t since_ns = pr->since_ns;
+            struct surface *again = buffer_shown_on(buffer, NULL);
             pending_release_free(pr);
+            if (again) {
+                /* Committed again since (to its surface or another): that surface releases it. */
+                g_buffer_stats.reshown++;
+                buffer_note(&g_buffer_notes_left, "#%u shown again on @%u before its paced release: that surface releases it later",
+                            wl_resource_get_id(buffer), buffer_surface_id(again));
+                continue;
+            }
+            if (buffer_release_send(buffer, "paced")) perf_note_release(since_ns);
         }
     }
     wl_display_flush_clients(g_display);
@@ -366,7 +545,17 @@ static int on_release_timer(int fd, uint32_t mask, void *data) {
 static void release_buffer(struct surface *s, struct wl_resource *buffer, int64_t since_ns) {
     const int limit = g_fps_limit;
     const int64_t interval = limit > 0 ? 1000000000LL / limit : g_refresh_ns;
-    if (interval <= 0 || g_release_timer_fd < 0) { wl_buffer_send_release(buffer); perf_note_release(since_ns); return; }
+    if (g_release_unpaced || interval <= 0 || g_release_timer_fd < 0) {
+        if (buffer_release_now(buffer, "unpaced")) perf_note_release(since_ns);
+        return;
+    }
+    if (pending_release_of(buffer)) {
+        /* Already queued from an earlier drop: one release covers both. */
+        g_buffer_stats.merged++;
+        buffer_note(&g_buffer_notes_left, "#%u already waits for its paced release: @%u's drop adds none",
+                    wl_resource_get_id(buffer), buffer_surface_id(s));
+        return;
+    }
     int64_t now = now_ns();
     int64_t at = s->next_release_ns + interval;
     int64_t latest = now + interval * (int64_t)(s->releases_pending + 1);
@@ -374,7 +563,11 @@ static void release_buffer(struct surface *s, struct wl_resource *buffer, int64_
     if (at > latest) at = latest;
     s->next_release_ns = at;
     struct pending_release *pr = calloc(1, sizeof(*pr));
-    if (!pr) { wl_buffer_send_release(buffer); perf_note_release(since_ns); return; }
+    if (!pr) {
+        WLOGE("release queue: out of memory, releasing wl_buffer #%u now", wl_resource_get_id(buffer));
+        if (buffer_release_now(buffer, "unpaced, out of memory")) perf_note_release(since_ns);
+        return;
+    }
     pr->buffer = buffer;
     pr->surface = s;
     pr->at_ns = at;
@@ -470,6 +663,7 @@ struct active_touch { struct surface *surface; int pointer_fallback; };
 static struct active_touch g_touch_points[MAX_TOUCH_POINTS];
 static void touch_cancel_surface(struct surface *surface);
 static struct surface *g_grab;
+static void publish_query_state(void);
 static struct surface *g_key_target;
 static struct surface *g_ime_click;
 static int g_input_pipe[2] = {-1, -1};
@@ -486,6 +680,7 @@ static void constraints_focus_entered(struct wl_resource *target, struct wl_clie
 void dmabuf_buffer_unref(struct dmabuf_buffer *b) {
     if (!b || --b->refs > 0) return;
     vkp_image_destroy(b->img);
+    dmabuf_cpu_release(&b->cpu);
     for (int i = 0; i < b->n_planes; i++)
         if (b->fd[i] >= 0) close(b->fd[i]);
     free(b);
@@ -563,6 +758,7 @@ static void map_toplevel(struct surface *s) {
     raise_kept_on_top();
     if (!g_desktop) g_key_target = s;
     apply_zorder();
+    publish_query_state();
 }
 
 static void unmap_toplevel(struct surface *s) {
@@ -582,9 +778,15 @@ static void unmap_toplevel(struct surface *s) {
 static void drop_dmabuf(struct surface *s, int paced) {
     if (s->dmabuf) {
         wl_list_remove(&s->dmabuf_destroy.link);
-        if (!ahb_swapchain_defer_release(s->dmabuf_buf, s->dmabuf, s, paced)) {
+        struct surface *other = buffer_shown_on(s->dmabuf, s);
+        if (other) {
+            /* Still on screen on another surface: the last one to let go releases it. */
+            g_buffer_stats.held++;
+            buffer_note(&g_buffer_notes_left, "#%u still shown on @%u after @%u let go: released when the last surface lets go",
+                        wl_resource_get_id(s->dmabuf), buffer_surface_id(other), buffer_surface_id(s));
+        } else if (!ahb_swapchain_defer_release(s->dmabuf_buf, s->dmabuf, s, paced)) {
             if (paced) release_buffer(s, s->dmabuf, now_ns());
-            else wl_buffer_send_release(s->dmabuf);
+            else buffer_release_now(s->dmabuf, "surface gone");
         }
         s->dmabuf = NULL;
     }
@@ -617,6 +819,68 @@ static void fire_frames(struct wl_list *frames) {
     }
 }
 
+static void scene_size(int *w, int *h);
+static int64_t damage_area(const struct damage_list *d, int bound_w, int bound_h);
+static struct surface *g_hud_surface, *g_hud_shm;
+static int64_t g_hud_shm_ns;
+static int64_t g_hud_last_ns, g_hud_alive_ns;
+static int g_hud_fresh;
+static int g_hud_new;
+#define HUD_TIMES 256
+static pthread_mutex_t g_hud_times_lock = PTHREAD_MUTEX_INITIALIZER;
+static float g_hud_times[HUD_TIMES];
+static int64_t g_hud_times_total, g_hud_shown_ns;
+
+static void hud_frame_shown(int64_t t) {
+    const int64_t previous = g_hud_shown_ns;
+    g_hud_shown_ns = t;
+    if (!previous || t <= previous) return;
+    pthread_mutex_lock(&g_hud_times_lock);
+    g_hud_times[g_hud_times_total % HUD_TIMES] = (float)((t - previous) / 1e6);
+    g_hud_times_total++;
+    pthread_mutex_unlock(&g_hud_times_lock);
+}
+
+static int tree_rank(const struct surface *s, const struct surface *want, int *rank, int depth) {
+    const struct surface *c;
+    if (depth > 8) return 0;
+    wl_list_for_each(c, &s->children, child_link)
+        if (c->below_parent && tree_rank(c, want, rank, depth + 1)) return 1;
+    if (s == want) return 1;
+    (*rank)++;
+    wl_list_for_each(c, &s->children, child_link)
+        if (!c->below_parent && tree_rank(c, want, rank, depth + 1)) return 1;
+    return 0;
+}
+
+static int render_rank(const struct surface *want) {
+    const struct surface *s;
+    int rank = 0;
+    if (g_desktop && tree_rank(g_desktop, want, &rank, 0)) return rank;
+    wl_list_for_each(s, &g_toplevels, toplevel_link)
+        if (tree_rank(s, want, &rank, 0)) return rank;
+    return -1;
+}
+
+static int below_surface(const struct surface *s, const struct surface *other) {
+    const int a = render_rank(s), b = render_rank(other);
+    return a >= 0 && b >= 0 && a < b;
+}
+
+int droiddeck_hud_frame_times(float *out, int len, int64_t *total) {
+    pthread_mutex_lock(&g_hud_times_lock);
+    *total = g_hud_times_total;
+    int64_t n = *total < len ? *total : len;
+    if (n > HUD_TIMES) n = HUD_TIMES;
+    for (int64_t i = 0; i < n; i++) out[i] = g_hud_times[(*total - n + i) % HUD_TIMES];
+    pthread_mutex_unlock(&g_hud_times_lock);
+    return (int)n;
+}
+static uint64_t g_game_frames;
+extern void droiddeck_on_game_surface(const char *window, const char *gpu);
+extern void droiddeck_on_game_frame(void);
+extern void droiddeck_on_game_program(int pid, const char *program);
+
 static void take_shm(struct surface *s, struct wl_shm_buffer *shm, struct wl_resource *buffer) {
     int32_t w = wl_shm_buffer_get_width(shm), h = wl_shm_buffer_get_height(shm);
     int32_t stride = wl_shm_buffer_get_stride(shm);
@@ -637,8 +901,36 @@ static void take_shm(struct surface *s, struct wl_shm_buffer *shm, struct wl_res
     s->buf_alpha = wl_shm_buffer_get_format(shm) == WL_SHM_FORMAT_ARGB8888;
     s->has_content = s->shm_img != NULL;
     g_stat_shm++;
+    ff_add(FF_SHM);
     struct client_info *ci = client_info_of(wl_resource_get_client(s->resource));
     if (ci && ci->asked_feedback) ci->shm_frames++;
+    int local_w, local_h;
+    surface_size(s, &local_w, &local_h);
+    const double region = s->src_set ? (double)s->src[2] * s->src[3] : (double)w * h;
+    const int64_t local_max = damage_area(&s->damage_local, local_w, local_h);
+    const int64_t local = local_w > 0 && local_h > 0
+        ? (int64_t)((double)local_max * region / ((double)local_w * local_h)) : local_max;
+    const int64_t buffer_max = damage_area(&s->damage_buf, w, h);
+    const int64_t area = (int64_t)w * h;
+    int64_t damaged = buffer_max > local ? buffer_max : local;
+    if (damaged > area) damaged = area;
+    const int64_t now = now_ns();
+    if (damaged * 16 >= area && (!g_hud_surface || now - g_hud_last_ns > 1000000000LL) &&
+        (s == g_hud_shm || !g_hud_shm || now - g_hud_shm_ns > 1000000000LL)) {
+        const struct surface *top = s;
+        int scene_w, scene_h, top_w, top_h, depth = 0;
+        while (top->parent && depth++ < 8) top = top->parent;
+        scene_size(&scene_w, &scene_h);
+        surface_size(top, &top_w, &top_h);
+        int64_t shown = (int64_t)local_w * local_h;
+        if ((int64_t)top_w * top_h > shown) shown = (int64_t)top_w * top_h;
+        if (top->role == ROLE_TOPLEVEL && top->mapped && shown * 2 >= (int64_t)scene_w * scene_h) {
+            g_hud_shm = s;
+            g_hud_shm_ns = now;
+            g_hud_new = 1;
+            droiddeck_on_game_frame();
+        }
+    }
 }
 
 static void take_pixel(struct surface *s, const uint8_t bgra[4], struct wl_resource *buffer) {
@@ -655,16 +947,12 @@ static void take_pixel(struct surface *s, const uint8_t bgra[4], struct wl_resou
     s->has_content = s->shm_img != NULL;
 }
 
-static struct surface *g_hud_surface;
-static int64_t g_hud_last_ns, g_hud_alive_ns;
-static int g_hud_fresh;
-extern void droiddeck_on_game_surface(const char *window, const char *gpu);
-extern void droiddeck_on_game_frame(void);
-extern void droiddeck_on_game_program(int pid, const char *program);
-
 static void take_dmabuf(struct surface *s, struct dmabuf_buffer *b, struct wl_resource *buffer) {
     const int repeat = s->dmabuf == buffer && s->dmabuf_buf == b;
     if (!repeat) {
+        if (!s->dmabuf && s->last_dmabuf == buffer) g_pace.reattaches++;
+        s->last_dmabuf = buffer;
+        pace_note_buffer(buffer);
         drop_dmabuf(s, 1);
         s->dmabuf = buffer;
         s->dmabuf_buf = b;
@@ -682,7 +970,28 @@ static void take_dmabuf(struct surface *s, struct dmabuf_buffer *b, struct wl_re
                   b->format, (unsigned long long)b->modifier);
         }
     }
-    if (s->shm_img) { vkp_image_destroy(s->shm_img); s->shm_img = NULL; }
+    /* Refused by the compositor's driver: a LINEAR 32-bit frame is copied by the CPU into the
+     * surface's shared-memory image (slower, but a picture; DroidDeck #1655: Mali-G615 r44p1
+     * refused every frame of gamescope's and the screen stayed on the loading screen). */
+    int cpu_copied = 0;
+    if (!b->img && !ahb_swapchain_has_ahb(b) &&
+        dmabuf_cpu_copyable(b->format, b->modifier, b->n_planes, b->width, b->height, b->stride[0])) {
+        const void *px = dmabuf_cpu_pixels(&b->cpu, b->fd[0], b->offset[0], b->stride[0], b->width, b->height);
+        if (px) {
+            if (s->shm_img && (vkp_image_width(s->shm_img) != b->width || vkp_image_height(s->shm_img) != b->height)) {
+                vkp_image_destroy(s->shm_img);
+                s->shm_img = NULL;
+            }
+            if (!s->shm_img) s->shm_img = vkp_image_create_shm(b->width, b->height);
+            if (s->shm_img) {
+                dmabuf_cpu_begin(b->fd[0]);
+                vkp_image_upload_shm(s->shm_img, px, (int)b->stride[0]);
+                dmabuf_cpu_end(b->fd[0]);
+                cpu_copied = 1;
+            }
+        }
+    }
+    if (!cpu_copied && s->shm_img) { vkp_image_destroy(s->shm_img); s->shm_img = NULL; }
     if (s->announced_vulkan && s->buf_w && s->buf_h &&
         (s->buf_w != b->width || s->buf_h != b->height)) {
         char name[160];
@@ -693,8 +1002,12 @@ static void take_dmabuf(struct surface *s, struct dmabuf_buffer *b, struct wl_re
     s->buf_w = b->width;
     s->buf_h = b->height;
     s->buf_alpha = (b->format & 0xff) == 'A';
-    s->has_content = b->img != NULL;
-    if (!repeat) g_stat_dmabuf++;
+    s->has_content = b->img != NULL || cpu_copied;
+    if (!repeat) {
+        g_stat_dmabuf++;
+        ff_add(FF_DMABUF);
+        if (!b->img && !ahb_swapchain_has_ahb(b)) ff_add(cpu_copied ? FF_CPU_COPIES : FF_IMPORT_FAILED);
+    }
     const int announced_now = !s->announced_vulkan;
     if (!s->announced_vulkan) {
         char name[160];
@@ -707,6 +1020,11 @@ static void take_dmabuf(struct surface *s, struct dmabuf_buffer *b, struct wl_re
                        vkp_modifier_name(b->modifier),
                        ahb_swapchain_has_ahb(b) ? "gralloc buffers: can go on the display layer without a copy"
                                                 : "dma-buf: copied into the screen swapchain");
+        else if (cpu_copied)
+            droiddeck_log("vulkan", "%s is presenting GPU frames through Wayland: %dx%d, format %c%c%c%c, linear "
+                       "(the compositor's driver refused the dma-buf: copied by the CPU)",
+                       name, b->width, b->height, b->format & 0xff, (b->format >> 8) & 0xff,
+                       (b->format >> 16) & 0xff, (b->format >> 24) & 0xff);
         else if (ahb_swapchain_has_ahb(b))
             droiddeck_log("vulkan", "%s is presenting GPU frames through Wayland: %dx%d on its own display layer only "
                        "(gralloc buffers the compositor cannot import for the copy path)",
@@ -715,9 +1033,10 @@ static void take_dmabuf(struct surface *s, struct dmabuf_buffer *b, struct wl_re
             droiddeck_log("error", "could not import GPU frames from %s (%dx%d, modifier %#llx)",
                        name, b->width, b->height, (unsigned long long)b->modifier);
     }
-    if (s != g_hud_surface && (b->img || ahb_swapchain_has_ahb(b)) &&
-        (!g_hud_surface || now_ns() - g_hud_alive_ns > 1000000000LL ||
-         (announced_now && (int64_t)b->width * b->height >= (int64_t)g_hud_surface->buf_w * g_hud_surface->buf_h))) {
+    if (s != g_hud_surface && (b->img || cpu_copied || ahb_swapchain_has_ahb(b)) &&
+        (!g_hud_surface || now_ns() - g_hud_alive_ns > 1000000000LL || (!repeat && below_surface(s, g_hud_surface)) ||
+         (announced_now && !below_surface(g_hud_surface, s) &&
+          (int64_t)b->width * b->height >= (int64_t)g_hud_surface->buf_w * g_hud_surface->buf_h))) {
         char name[160];
         describe(s, name, sizeof(name));
         g_hud_surface = s;
@@ -741,19 +1060,37 @@ static void take_dmabuf(struct surface *s, struct dmabuf_buffer *b, struct wl_re
     }
     if (s == g_hud_surface) {
         g_hud_alive_ns = now_ns();
-        if (!repeat) { g_hud_last_ns = g_hud_alive_ns; g_hud_fresh = 1; droiddeck_on_game_frame(); }
+        if (!repeat) { g_hud_last_ns = g_hud_alive_ns; g_hud_fresh = 1; g_hud_new = 1; g_game_frames++; droiddeck_on_game_frame(); }
     }
 }
+
+uint64_t droiddeck_game_frames(void) { return g_game_frames; }
 
 struct dmabuf_buffer *droiddeck_dmabuf_from_resource(struct wl_resource *buffer) { return get_dmabuf(buffer); }
 int droiddeck_dmabuf_fd(const struct dmabuf_buffer *b) { return b && b->n_planes > 0 ? b->fd[0] : -1; }
 void droiddeck_dmabuf_size(const struct dmabuf_buffer *b, int *w, int *h) { *w = b->width; *h = b->height; }
+void droiddeck_dmabuf_plane(const struct dmabuf_buffer *b, int *n_planes, uint32_t *offset, uint32_t *stride,
+                            uint32_t *format, uint64_t *modifier) {
+    *n_planes = b->n_planes;
+    *offset = b->n_planes > 0 ? b->offset[0] : 0;
+    *stride = b->n_planes > 0 ? b->stride[0] : 0;
+    *format = b->format;
+    *modifier = b->modifier;
+}
 void **droiddeck_dmabuf_ahb_slot(struct dmabuf_buffer *b) { return &b->ahb_state; }
 void droiddeck_dmabuf_ref(struct dmabuf_buffer *b) { b->refs++; }
 void droiddeck_dmabuf_unref(struct dmabuf_buffer *b) { dmabuf_buffer_unref(b); }
 void droiddeck_release_buffer(struct surface *s, struct wl_resource *buffer, int paced, int64_t since_ns) {
+    struct surface *again = buffer_shown_on(buffer, NULL);
+    if (again) {
+        /* The display layer let go of a buffer a surface shows again: that surface releases it. */
+        g_buffer_stats.reshown++;
+        buffer_note(&g_buffer_notes_left, "#%u shown again on @%u before the display layer let go: that surface releases it later",
+                    wl_resource_get_id(buffer), buffer_surface_id(again));
+        return;
+    }
     if (paced && s) release_buffer(s, buffer, since_ns);
-    else { wl_buffer_send_release(buffer); perf_note_release(since_ns); }
+    else if (buffer_release_now(buffer, "layer")) perf_note_release(since_ns);
 }
 void droiddeck_surface_describe(const struct surface *s, char *out, size_t size) { describe(s, out, size); }
 const struct droiddeck_color *droiddeck_surface_color(const struct surface *s) {
@@ -776,8 +1113,45 @@ static void surface_attach(struct wl_client *c, struct wl_resource *r,
         wl_resource_add_destroy_listener(buffer, &s->pending_buffer_destroy);
     }
 }
+static int64_t rect_area(const int32_t *r, int bound_w, int bound_h) {
+    int64_t x0 = r[0], y0 = r[1], x1 = (int64_t)r[0] + r[2], y1 = (int64_t)r[1] + r[3];
+    if (bound_w > 0 && bound_h > 0) {
+        if (x0 < 0) x0 = 0;
+        if (y0 < 0) y0 = 0;
+        if (x1 > bound_w) x1 = bound_w;
+        if (y1 > bound_h) y1 = bound_h;
+    }
+    if (x1 <= x0 || y1 <= y0) return 0;
+    const int64_t w = x1 - x0, h = y1 - y0;
+    return (w < 65536 ? w : 65536) * (h < 65536 ? h : 65536);
+}
+static void note_damage(struct damage_list *d, int32_t x, int32_t y, int32_t w, int32_t h) {
+    if (w <= 0 || h <= 0) return;
+    const int32_t rect[4] = { x, y, w, h };
+    int slot = d->n;
+    if (slot == DAMAGE_RECTS) {
+        slot = 0;
+        for (int i = 1; i < DAMAGE_RECTS; i++)
+            if (rect_area(d->r[i], 0, 0) < rect_area(d->r[slot], 0, 0)) slot = i;
+        if (rect_area(rect, 0, 0) <= rect_area(d->r[slot], 0, 0)) return;
+    } else {
+        d->n++;
+    }
+    memcpy(d->r[slot], rect, sizeof(rect));
+}
+static int64_t damage_area(const struct damage_list *d, int bound_w, int bound_h) {
+    int64_t max = 0;
+    for (int i = 0; i < d->n; i++) {
+        const int64_t area = rect_area(d->r[i], bound_w, bound_h);
+        if (area > max) max = area;
+    }
+    return max;
+}
 static void surface_damage(struct wl_client *c, struct wl_resource *r,
-                           int32_t x, int32_t y, int32_t w, int32_t h) {}
+                           int32_t x, int32_t y, int32_t w, int32_t h) {
+    struct surface *s = wl_resource_get_user_data(r);
+    note_damage(&s->pending_damage_local, x, y, w, h);
+}
 static void frame_callback_destroy(struct wl_resource *r) {
     wl_list_remove(wl_resource_get_link(r));
 }
@@ -786,25 +1160,32 @@ static void feedback_resource_destroy(struct wl_resource *r) {
     wl_list_remove(wl_resource_get_link(r));
 }
 
-static void feedback_discard_all(struct wl_list *list) {
+static unsigned feedback_discard_all(struct wl_list *list) {
     struct wl_resource *fb, *tmp;
+    unsigned n = 0;
     wl_resource_for_each_safe(fb, tmp, list) {
         wp_presentation_feedback_send_discarded(fb);
         wl_resource_destroy(fb);
+        n++;
     }
+    return n;
 }
 
 static uint32_t nominal_refresh_ns(void) {
-    int mhz = g_output_refresh_mhz;
+    int mhz = atomic_load(&g_output_refresh_mhz);
     if (mhz <= 0) mhz = 60000;
     return (uint32_t)(1000000000000LL / (int64_t)mhz);
 }
 
 static int64_t presented_ns(int64_t render_ns) {
-    if (!g_tick_vsync_ns || render_ns - g_last_vsync_ns > (int64_t)nominal_refresh_ns() ||
-        render_ns < g_tick_vsync_ns)
+    int64_t tick = g_tick_vsync_ns;
+    int64_t refresh = (int64_t)nominal_refresh_ns();
+    if (!tick || render_ns - g_last_vsync_ns > refresh)
         return render_ns;
-    return g_tick_vsync_ns;
+    int64_t delta = render_ns - tick;
+    if (delta > refresh || -delta > refresh)
+        return render_ns;
+    return tick;
 }
 
 static void feedback_present_all(struct wl_list *list, int64_t t) {
@@ -816,6 +1197,7 @@ static void feedback_present_all(struct wl_list *list, int64_t t) {
                                                 nominal_refresh_ns(), 0, 0,
                                                 WP_PRESENTATION_FEEDBACK_KIND_VSYNC);
         wl_resource_destroy(fb);
+        g_pace.presented++;
     }
 }
 
@@ -894,8 +1276,30 @@ static void cursor_publish_buffer(struct surface *s, struct wl_resource *buffer)
     g_cursor_shown = s;
 }
 
+static void surface_forget_idle_px(struct surface *s) {
+    free(s->idle_px);
+    s->idle_px = NULL;
+    s->idle_w = s->idle_h = 0;
+}
+
 static void on_idle_buffer_destroyed(struct wl_listener *l, void *data) {
     struct surface *s = wl_container_of(l, s, idle_buffer_destroy);
+    struct wl_shm_buffer *shm = wl_shm_buffer_get(s->idle_buffer);
+    if (shm) {
+        int32_t w = wl_shm_buffer_get_width(shm), h = wl_shm_buffer_get_height(shm);
+        int32_t stride = wl_shm_buffer_get_stride(shm);
+        uint32_t *px = w > 0 && h > 0 && (int64_t)w * h <= CURSOR_MAX_PX && (int64_t)stride >= (int64_t)w * 4
+            ? realloc(s->idle_px, (size_t)w * h * 4) : NULL;
+        if (px) {
+            wl_shm_buffer_begin_access(shm);
+            const uint8_t *src = wl_shm_buffer_get_data(shm);
+            for (int y = 0; y < h; y++) memcpy(&px[(size_t)y * w], src + (size_t)y * stride, (size_t)w * 4);
+            wl_shm_buffer_end_access(shm);
+            s->idle_px = px;
+            s->idle_w = w;
+            s->idle_h = h;
+        }
+    }
     wl_list_remove(&s->idle_buffer_destroy.link);
     wl_list_init(&s->idle_buffer_destroy.link);
     s->idle_buffer = NULL;
@@ -922,6 +1326,7 @@ static struct wl_resource *surface_take_idle(struct surface *s) {
 }
 
 static void surface_drop_idle(struct surface *s) {
+    surface_forget_idle_px(s);
     struct wl_resource *buffer = surface_take_idle(s);
     if (buffer) wl_buffer_send_release(buffer);
 }
@@ -950,13 +1355,18 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
         s->pending_opaque_set = 0;
     }
 
+    s->damage_buf = s->pending_damage_buf;
+    s->damage_local = s->pending_damage_local;
+    s->pending_damage_buf.n = s->pending_damage_local.n = 0;
     if (s->pending_attach) {
         struct wl_resource *buffer = s->pending_buffer;
         struct dmabuf_buffer *db = get_dmabuf(buffer);
         struct wl_shm_buffer *shm = buffer && !db ? wl_shm_buffer_get(buffer) : NULL;
         uint8_t pixel[4];
 
-        feedback_discard_all(&s->feedback);
+        g_pace.replaced += feedback_discard_all(&s->feedback);
+        if (!buffer) g_pace.null_attaches++;
+        else if (!db) s->last_dmabuf = NULL;
 
         if (buffer) {
             wl_list_remove(&s->pending_buffer_destroy.link);
@@ -964,6 +1374,7 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
         }
         s->pending_buffer = NULL;
         s->pending_attach = 0;
+        if (db) buffer_committed(s, buffer);
 
         surface_drop_idle(s);
         if (s->role == ROLE_CURSOR) {
@@ -1014,7 +1425,10 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
 static void surface_set_buffer_transform(struct wl_client *c, struct wl_resource *r, int32_t t) {}
 static void surface_set_buffer_scale(struct wl_client *c, struct wl_resource *r, int32_t s) {}
 static void surface_damage_buffer(struct wl_client *c, struct wl_resource *r,
-                                  int32_t x, int32_t y, int32_t w, int32_t h) {}
+                                  int32_t x, int32_t y, int32_t w, int32_t h) {
+    struct surface *s = wl_resource_get_user_data(r);
+    note_damage(&s->pending_damage_buf, x, y, w, h);
+}
 static void surface_offset(struct wl_client *c, struct wl_resource *r, int32_t x, int32_t y) {}
 
 static const struct wl_surface_interface surface_impl = {
@@ -1050,12 +1464,14 @@ static void surface_resource_destroy(struct wl_resource *r) {
     if (g_cursor_surface == s) { g_cursor_surface = NULL; cursor_publish_hidden(); }
     if (g_cursor_shown == s) g_cursor_shown = NULL;
     surface_take_idle(s);
+    surface_forget_idle_px(s);
     if (g_grab == s) g_grab = NULL;
     if (g_key_target == s) g_key_target = NULL;
     if (g_ime_click == s) g_ime_click = NULL;
     droiddeck_text_input_surface_gone(r);
     if (g_desktop == s) { g_desktop = NULL; droiddeck_log("desktop", "the desktop closed"); }
     if (g_hud_surface == s) { g_hud_surface = NULL; droiddeck_on_game_surface(NULL, NULL); }
+    if (g_hud_shm == s) g_hud_shm = NULL;
     constraints_surface_gone(s);
 
     unmap_toplevel(s);
@@ -1508,10 +1924,10 @@ static const struct wl_output_interface output_impl = { .release = output_releas
 static struct wl_list g_outputs;
 static void output_resource_destroy(struct wl_resource *r) { wl_list_remove(wl_resource_get_link(r)); }
 
-static void output_send_mode(struct wl_resource *r) {
+static void output_send_mode(struct wl_resource *r, int mhz) {
     wl_output_send_mode(r, WL_OUTPUT_MODE_CURRENT | WL_OUTPUT_MODE_PREFERRED,
                         g_output_w > 0 ? g_output_w : 1920, g_output_h > 0 ? g_output_h : 1080,
-                        g_output_refresh_mhz > 0 ? g_output_refresh_mhz : 60000);
+                        mhz);
 }
 
 static void bind_output(struct wl_client *c, void *data, uint32_t ver, uint32_t id) {
@@ -1521,7 +1937,7 @@ static void bind_output(struct wl_client *c, void *data, uint32_t ver, uint32_t 
     wl_list_insert(&g_outputs, wl_resource_get_link(r));
     wl_output_send_geometry(r, 0, 0, 340, 190, WL_OUTPUT_SUBPIXEL_UNKNOWN,
                             "DroidDeck", "Wayland", WL_OUTPUT_TRANSFORM_NORMAL);
-    output_send_mode(r);
+    output_send_mode(r, g_output_announced_refresh_mhz);
     if (ver >= WL_OUTPUT_NAME_SINCE_VERSION) {
         wl_output_send_name(r, "DroidDeck-1");
         wl_output_send_description(r, "DroidDeck display");
@@ -1660,6 +2076,97 @@ static struct surface *surface_for_image(const struct vkp_image *img) {
     wl_list_for_each(s, &g_surfaces, link)
         if (s->dmabuf_buf && s->dmabuf_buf->img == img) return s;
     return NULL;
+}
+
+/* The auto mode's candidate (see render_scene): the top draw, fullscreen, opaque, imported, with an
+ * AHardwareBuffer of its own; -1 otherwise. Says when the game moves on or off the layer. */
+static int auto_layer_candidate(const struct draw_list *dl, int scene_w, int scene_h) {
+    static int was = -1;
+    static unsigned said;
+    int li = layer_candidate(dl, scene_w, scene_h);
+    struct surface *s = li >= 0 ? surface_for_image(dl->d[li].img) : NULL;
+    const int has = s && s->dmabuf_buf && ahb_swapchain_has_ahb(s->dmabuf_buf);
+    const int ok = has && li == dl->n - 1;
+    if (has && ok != was && said < 40) {
+        said++;
+        if (ok) droiddeck_log("layer", "zero-copy: the game's own buffers go on the display layer");
+        else droiddeck_log("layer", "zero-copy: a window is above the game: the scene is composed and copied until it goes");
+    }
+    if (has) was = ok;
+    return ok ? li : -1;
+}
+
+/* Why the auto mode put a scene on the copy path (counted per 10 s, the perf line's zero-copy note),
+ * and each distinct scene shape described once in the log, to find what keeps a game off its layer. */
+enum { ZC_ON, ZC_EMPTY, ZC_TOP_BLEND, ZC_TOP_NOT_DMABUF, ZC_TOP_NOT_FULL, ZC_NOT_OFFERED, ZC_UNDER, ZC_N };
+static const char *const zc_why_name[ZC_N] = {
+    "on the layer", "nothing drawn", "top draw blended", "top draw not a dma-buf", "top draw not fullscreen",
+    "fullscreen buffer not the game's own", "game under other draws",
+};
+static unsigned g_zc_why[ZC_N];
+
+static struct surface *surface_for_draw(const struct vkp_image *img) {
+    struct surface *s;
+    wl_list_for_each(s, &g_surfaces, link)
+        if (s->shm_img == img || (s->dmabuf_buf && s->dmabuf_buf->img == img)) return s;
+    return NULL;
+}
+
+static int zc_classify(const struct draw_list *dl, int scene_w, int scene_h) {
+    if (dl->n <= 0) return ZC_EMPTY;
+    int li = layer_candidate(dl, scene_w, scene_h);
+    if (li < 0) {
+        const struct vkp_draw *d = &dl->d[dl->n - 1];
+        if (!vkp_image_is_dmabuf(d->img)) return ZC_TOP_NOT_DMABUF;
+        if (d->blend) return ZC_TOP_BLEND;
+        return ZC_TOP_NOT_FULL;
+    }
+    struct surface *s = surface_for_image(dl->d[li].img);
+    if (!s || !s->dmabuf_buf || !ahb_swapchain_has_ahb(s->dmabuf_buf)) return ZC_NOT_OFFERED;
+    return li == dl->n - 1 ? ZC_ON : ZC_UNDER;
+}
+
+static void zc_scene_note(const struct draw_list *dl, int scene_w, int scene_h) {
+    static uint64_t seen[48];
+    static int n_seen;
+    const int why = zc_classify(dl, scene_w, scene_h);
+    g_zc_why[why]++;
+    uint64_t sig = 1469598103934665603ull ^ (uint64_t)why;
+    for (int i = 0; i < dl->n; i++) {
+        const struct vkp_draw *d = &dl->d[i];
+        struct surface *s = surface_for_draw(d->img);
+        const int offered = s && s->dmabuf_buf && ahb_swapchain_has_ahb(s->dmabuf_buf);
+        const uint64_t v[] = {(uintptr_t)s, (uint64_t)vkp_image_is_dmabuf(d->img), (uint64_t)offered,
+                              (uint64_t)(uint32_t)d->dx, (uint64_t)(uint32_t)d->dy, (uint64_t)(uint32_t)d->dw,
+                              (uint64_t)(uint32_t)d->dh, (uint64_t)d->blend,
+                              s ? (uint64_t)(uint32_t)s->buf_w << 32 | (uint32_t)s->buf_h : 0};
+        for (size_t k = 0; k < sizeof(v) / sizeof(v[0]); k++) sig = (sig ^ v[k]) * 1099511628211ull;
+    }
+    for (int i = 0; i < n_seen; i++) if (seen[i] == sig) return;
+    if (n_seen >= (int)(sizeof(seen) / sizeof(seen[0]))) return;
+    seen[n_seen++] = sig;
+    droiddeck_log("layer", "zero-copy scene %d (%s): %d draws on %dx%d", n_seen, zc_why_name[why], dl->n, scene_w, scene_h);
+    for (int i = 0; i < dl->n && i < 12; i++) {
+        const struct vkp_draw *d = &dl->d[i];
+        struct surface *s = surface_for_draw(d->img);
+        char kind[64] = "unknown";
+        if (s && s->dmabuf_buf && s->dmabuf_buf->img == d->img) {
+            const uint32_t f = s->dmabuf_buf->format;
+            snprintf(kind, sizeof(kind), "dma-buf %c%c%c%c%s", (char)(f & 0xff), (char)(f >> 8 & 0xff),
+                     (char)(f >> 16 & 0xff), (char)(f >> 24 & 0xff),
+                     ahb_swapchain_has_ahb(s->dmabuf_buf) ? " offered" : "");
+        } else if (s) {
+            snprintf(kind, sizeof(kind), "%s", s->buf_w == 1 && s->buf_h == 1 ? "single pixel" : "shm");
+        }
+        int depth = 0;
+        for (struct surface *p = s ? s->parent : NULL; p && depth < 9; p = p->parent) depth++;
+        droiddeck_log("layer", "zero-copy scene %d #%d: %s %s depth %d, %s %dx%d%s%s, src %.0f,%.0f %.0fx%.0f -> %d,%d %dx%d%s",
+                      n_seen, i, s ? client_name(wl_resource_get_client(s->resource)) : "?",
+                      !s ? "?" : s->role == ROLE_TOPLEVEL ? "toplevel" : s->role == ROLE_SUBSURFACE ? "subsurface" : "other",
+                      depth, kind, s ? s->buf_w : 0, s ? s->buf_h : 0, s && s->buf_alpha ? " alpha" : "",
+                      s && s->buf_alpha && s->opaque[2] > 0 ? " opaque-region" : "",
+                      d->sx, d->sy, d->sw, d->sh, d->dx, d->dy, d->dw, d->dh, d->blend ? " blended" : "");
+    }
 }
 
 static struct surface *ahb_layer_only_candidate(int scene_w, int scene_h) {
@@ -1810,14 +2317,152 @@ static void hdr_count_copied(const struct draw_list *dl, const char *reason) {
     }
 }
 
+/*
+ * Stream mode (the Xbox Cloud Gaming native player, in its own process): no Wayland clients, the scene is one
+ * picture handed over as AHardwareBuffers (ImageReader images of the decoded video). Each buffer is imported once
+ * and kept while the reader cycles through its few buffers; the newest frame is the scene, so the screen effects
+ * and frame generation apply to it as to a game.
+ */
+#define STREAM_SLOTS 6
+static pthread_mutex_t g_stream_lock = PTHREAD_MUTEX_INITIALIZER;
+static atomic_int g_stream_on;
+static AHardwareBuffer *g_stream_pending;
+static struct { AHardwareBuffer *ahb; struct vkp_image *img; uint64_t used; } g_stream_slots[STREAM_SLOTS];
+static struct vkp_image *g_stream_img;
+static uint64_t g_stream_seq;
+static atomic_uint g_stream_frames;
+
+static void stream_forget_all(void) {
+    vkp_wait_idle();
+    for (int i = 0; i < STREAM_SLOTS; i++) {
+        if (g_stream_slots[i].img) vkp_image_destroy(g_stream_slots[i].img);
+        if (g_stream_slots[i].ahb) AHardwareBuffer_release(g_stream_slots[i].ahb);
+        g_stream_slots[i].img = NULL; g_stream_slots[i].ahb = NULL; g_stream_slots[i].used = 0;
+    }
+    g_stream_img = NULL;
+}
+
+/* Compositor thread: the newest handed-over buffer becomes the scene picture. */
+static void stream_take(void) {
+    pthread_mutex_lock(&g_stream_lock);
+    AHardwareBuffer *ahb = g_stream_pending;
+    g_stream_pending = NULL;
+    pthread_mutex_unlock(&g_stream_lock);
+    if (!ahb) return;
+    if (!atomic_load(&g_stream_on)) { AHardwareBuffer_release(ahb); return; }
+    int slot = -1, oldest = 0;
+    for (int i = 0; i < STREAM_SLOTS; i++) {
+        if (g_stream_slots[i].ahb == ahb) { slot = i; break; }
+        if (g_stream_slots[i].used < g_stream_slots[oldest].used) oldest = i;
+    }
+    if (slot >= 0) {
+        AHardwareBuffer_release(ahb); /* the slot keeps its own reference */
+    } else {
+        struct vkp_image *img = vkp_image_from_ahb(ahb);
+        if (!img) {
+            static int said;
+            if (!said) { said = 1; droiddeck_log("stream", "a decoded frame could not be imported: nothing to show"); }
+            AHardwareBuffer_release(ahb);
+            return;
+        }
+        droiddeck_log("stream", "decoded frame buffer imported (%dx%d)", vkp_image_width(img), vkp_image_height(img));
+        slot = oldest;
+        if (g_stream_slots[slot].img) {
+            vkp_wait_idle(); /* the GPU may still read the picture being replaced */
+            if (g_stream_img == g_stream_slots[slot].img) g_stream_img = NULL;
+            vkp_image_destroy(g_stream_slots[slot].img);
+        }
+        if (g_stream_slots[slot].ahb) AHardwareBuffer_release(g_stream_slots[slot].ahb);
+        g_stream_slots[slot].ahb = ahb;
+        g_stream_slots[slot].img = img;
+    }
+    g_stream_slots[slot].used = ++g_stream_seq;
+    g_stream_img = g_stream_slots[slot].img;
+    atomic_fetch_add(&g_stream_frames, 1);
+    schedule_render();
+}
+
+static void render_stream(void) {
+    g_dirty = 0;
+    struct vkp_image *img = g_stream_img;
+    if (!img) return;
+    int w = vkp_image_width(img), h = vkp_image_height(img);
+    if (w != g_scene_w || h != g_scene_h) {
+        droiddeck_log("stream", "picture %dx%d", w, h);
+        g_scene_w = w;
+        g_scene_h = h;
+    }
+    struct vkp_draw d = {.img = img, .sx = 0, .sy = 0, .sw = (float)w, .sh = (float)h, .dx = 0, .dy = 0, .dw = w, .dh = h, .blend = 0};
+    vkp_apply_window_request();
+    sc_layer_hide();
+    int r = vkp_render(w, h, &d, 1);
+    if (r == 0) {
+        g_stat_frames++;
+        ff_add(FF_FRAMES);
+        static int first;
+        if (!first) { first = 1; droiddeck_log("stream", "first stream frame presented"); }
+    } else {
+        static int failed;
+        if (failed++ % 600 == 0) droiddeck_log("stream", "presenting a stream frame failed (%d, %d times)", r, failed);
+    }
+}
+
+void droiddeck_stream_set(int on) {
+    atomic_store(&g_stream_on, on ? 1 : 0);
+    if (g_input_pipe[1] < 0) return;
+    struct input_msg m = { 21, on ? 1 : 0, 0, 0, 0 };
+    ssize_t n = write(g_input_pipe[1], &m, sizeof(m));
+    (void)n;
+}
+
+/* Any thread: hands over one decoded frame (acquires its own reference). */
+void droiddeck_stream_frame(AHardwareBuffer *ahb) {
+    if (!ahb || !atomic_load(&g_stream_on) || g_input_pipe[1] < 0) return;
+    AHardwareBuffer_acquire(ahb);
+    pthread_mutex_lock(&g_stream_lock);
+    AHardwareBuffer *dropped = g_stream_pending;
+    g_stream_pending = ahb;
+    pthread_mutex_unlock(&g_stream_lock);
+    if (dropped) { AHardwareBuffer_release(dropped); return; } /* a wake-up is already queued */
+    struct input_msg m = { 20, 0, 0, 0, 0 };
+    ssize_t n = write(g_input_pipe[1], &m, sizeof(m));
+    (void)n;
+}
+
+unsigned droiddeck_stream_frames(void) { return atomic_load(&g_stream_frames); }
+
+static int64_t g_scene_due_ns;
+
+static int scene_held_for_limit(int64_t now, int64_t due, int limit, int unpaced) {
+    if (limit <= 0 || unpaced || due <= 0) return 0;
+    return now < due - 1000000LL;
+}
+
+static int64_t scene_next_due(int64_t now, int64_t due, int limit) {
+    if (limit <= 0) return 0;
+    const int64_t interval = 1000000000LL / limit;
+    return due > 0 && now - due < interval ? due + interval : now + interval;
+}
+
 static void render_scene(void) {
+    g_scene_due_ns = scene_next_due(now_ns(), g_scene_due_ns, g_fps_limit);
+    if (atomic_load(&g_stream_on)) { g_dirty_since_ns = 0; render_stream(); return; }
     struct draw_list dl = {0};
     struct surface *s;
     int w, h;
     const int64_t t_scene = now_ns();
     int copy = 0;
 
+    if (g_dirty_since_ns) {
+        const int64_t wait = t_scene - g_dirty_since_ns;
+        g_pace.wait_ns += wait;
+        if (wait > g_pace.wait_max_ns) g_pace.wait_max_ns = wait;
+        g_pace.renders++;
+        g_dirty_since_ns = 0;
+    }
     g_dirty = 0;
+    g_rendered_tick_ns = g_tick_vsync_ns;
+    g_tick_held = 0;
     g_hud_fresh = 0;
     g_hdr_unimported = NULL;
     wl_list_for_each(s, &g_surfaces, link) s->drawn = 0;
@@ -1872,9 +2517,23 @@ static void render_scene(void) {
         else if (rendered && how == 2) droiddeck_color_frame_shown(hs.color, DROIDDECK_HDR_TONEMAPPED, 0);
         else if (rendered) hdr_copy = "the HDR composition pass is unavailable on this driver";
     }
-    if (hdr_route == 0 || hdr_route == 3) {
+    if (hdr_route == 0 && vkp_quest_layer_presentation() && !framegen && !cardboard &&
+        !ahb_layer_only_candidate(w, h)) {
+        /* The complete SDR scene stays on one display layer. Do not hide/re-show GAME
+         * on each desktop frame just because it is not a single fullscreen window. */
+        rendered = vkp_render(w, h, dl.d, dl.n) == 0;
+    } else if (hdr_route == 0 || hdr_route == 3) {
     const int pass_on = fx_on || framegen;
     int li = (g_zero_copy && !framegen && !cardboard) ? layer_candidate(&dl, w, h) : -1;
+    /* SDR sessions (the full switch off): a game frame that is its own gralloc buffer, the one
+     * fullscreen window with nothing above it and no effects or frame generation, goes on the display
+     * layer as it is; any other scene takes the copy path exactly as with zero-copy off. */
+    const int auto_li = li < 0 && ahb_swapchain_auto() && !pass_on && !cardboard ? auto_layer_candidate(&dl, w, h) : -1;
+    /* Off unless BL_ZC_SCENES is set: the per-scene dump is for finding what keeps a game off its layer. */
+    static int zc_scenes = -1;
+    if (zc_scenes < 0) zc_scenes = getenv("BL_ZC_SCENES") != NULL;
+    if (zc_scenes && li < 0 && ahb_swapchain_auto() && !pass_on && !cardboard) zc_scene_note(&dl, w, h);
+    if (auto_li >= 0) li = auto_li;
     int over = li >= 0 ? dl.n - 1 - li : 0;
     const int fx_blocks = (li >= 0 && fx_on && over > 0);
     if (fx_blocks) { li = -1; over = 0; }
@@ -1908,7 +2567,7 @@ static void render_scene(void) {
         int r = -1;
         if (!(fx_on && li >= 0) && ls && ls->dmabuf_buf && ahb_swapchain_has_ahb(ls->dmabuf_buf))
             r = ahb_swapchain_present(ls->dmabuf_buf, ls, w, h);
-        if (r != 0 && li >= 0)
+        if (r != 0 && li >= 0 && auto_li < 0)
             r = fx_on ? sc_layer_present_pass(&dl.d[li], 1, w, h)
                       : sc_layer_present(dl.d[li].img, w, h, ls ? droiddeck_surface_color(ls) : NULL);
         if (r == 0) {
@@ -1926,6 +2585,7 @@ static void render_scene(void) {
                 rendered = vkp_base_black(w, h) == 0;
             }
         } else {
+            if (auto_li >= 0) sc_layer_hide(); /* the copy below must not stay under an older layer frame */
             rendered = vkp_render(w, h, dl.d, dl.n) == 0;
             copy = 1;
             hdr_copy = "its display layer was unavailable this frame";
@@ -1946,9 +2606,14 @@ static void render_scene(void) {
     if (rendered) {
         int64_t t = presented_ns(t_scene);
         g_stat_frames++;
+        ff_add(FF_FRAMES);
+        if (g_hud_new) {
+            g_hud_new = 0;
+            hud_frame_shown(t);
+        }
         wl_list_for_each(s, &g_surfaces, link) {
             if (s->drawn) feedback_present_all(&s->feedback, t);
-            else feedback_discard_all(&s->feedback);
+            else g_pace.undrawn += feedback_discard_all(&s->feedback);
         }
         fire_all_frames();
     } else {
@@ -1969,14 +2634,31 @@ static void render_scene(void) {
 
 static int on_fallback_timer(void *data) {
     g_fallback_armed = 0;
-    if (g_dirty) render_scene();
+    if (!g_dirty) return 0;
+    if (scene_held_for_limit(now_ns(), g_scene_due_ns, g_fps_limit, g_release_unpaced)) schedule_render();
+    else render_scene();
     return 0;
 }
 
+/* A new frame is drawn when it arrives instead of at the next screen tick, at most once per refresh,
+   while frames go straight back to the game (no compositor limit), without streaming or frame generation. */
+static int commit_renders_on(void) {
+    return g_render_on_commit && g_release_unpaced && !atomic_load(&g_stream_on) && !vkp_framegen_active();
+}
+
+static int render_on_commit(void) {
+    return commit_renders_on() && !g_render_idle && g_rendered_tick_ns != g_tick_vsync_ns;
+}
+
 static void schedule_render(void) {
+    if (!g_dirty && !g_dirty_since_ns) g_dirty_since_ns = now_ns();
     g_dirty = 1;
     if (!g_display) return;
-    if (g_last_vsync_ns && now_ns() - g_last_vsync_ns < 100000000LL) return;
+    if (g_last_vsync_ns && now_ns() - g_last_vsync_ns < 100000000LL) {
+        if (render_on_commit())
+            g_render_idle = wl_event_loop_add_idle(wl_display_get_event_loop(g_display), on_commit_idle, NULL);
+        return;
+    }
     if (g_fallback_armed) return;
     if (!g_fallback_timer)
         g_fallback_timer = wl_event_loop_add_timer(wl_display_get_event_loop(g_display),
@@ -1986,35 +2668,61 @@ static void schedule_render(void) {
     wl_event_source_timer_update(g_fallback_timer, 8);
 }
 
-/* Whether this vsync's scene waits for the game's next frame: the game presented within the last
- * 100 ms and nothing new of its own has come since the last scene, so what changed is another
- * surface. gamescope sends a second plane with every frame of its performance overlay (mangoapp),
- * which presents at the game's rate even while hidden, at another moment than the game: shown as
- * they came, the screen got two scenes per game frame (99-120 a second for a 60 fps game). Held,
- * such a change goes to the screen with the game's next frame. With frame generation every scene
- * waits; without it a change of the compositor's own (the window, screen effects, Cardboard's head
- * pose: forced) does not, and a game that stops presenting for 100 ms lets everything through. */
+/* Whether this scene waits for the game's next frame: the game presented within the last 100 ms and
+ * nothing new of its own has come since the last scene, so what changed is another surface.
+ * gamescope sends a second plane with every frame of its performance overlay (mangoapp), which
+ * presents at the game's rate even while hidden, at another moment than the game: drawn as they
+ * came, the screen got two scenes per game frame (99-120 a second for a 60 fps game). Held, such a
+ * change goes to the screen with the game's next frame. With frame generation every scene waits;
+ * without it a change of the compositor's own (the window, screen effects, Cardboard's head pose:
+ * forced) does not, and a game that stops presenting for 100 ms lets everything through. */
 static int scene_waits_for_game(int64_t now, int forced) {
     if (!g_hud_surface || g_hud_fresh || now - g_hud_last_ns >= 100000000LL) return 0;
     return vkp_framegen_active() || !forced;
 }
 
+static void on_commit_idle(void *data) {
+    g_render_idle = NULL;
+    if (!g_dirty || !commit_renders_on() || g_rendered_tick_ns == g_tick_vsync_ns || scene_waits_for_game(now_ns(), 0)) return;
+    g_pace.commit_renders++;
+    render_scene();
+}
+
 static void on_vsync(int64_t frame_time_ns) {
     int64_t now = now_ns();
-    int forced = 0;
     g_perf.ticks++;
+    if (frame_time_ns > 0 && now >= frame_time_ns) {
+        const int64_t late = now - frame_time_ns;
+        g_pace.ticks++;
+        g_pace.tick_late_ns += late;
+        if (late > g_pace.tick_late_max_ns) g_pace.tick_late_max_ns = late;
+        if (late > 2000000LL) g_pace.ticks_late_2ms++;
+    }
     if (g_last_vsync_ns) {
         int64_t d = now - g_last_vsync_ns;
         if (d > 3000000LL && d < 40000000LL) g_refresh_ns = (g_refresh_ns * 7 + d) / 8;
     }
     g_last_vsync_ns = now;
     g_tick_vsync_ns = frame_time_ns;
-    if (vkp_apply_window_request()) forced = 1;
-    if (vkp_effects_sync()) forced = 1;
-    if (vkp_cardboard_pose_changed()) forced = 1;
-    if (forced) g_dirty = 1;
+    int tick_change = 0;
+    if (vkp_apply_window_request()) tick_change = 1;
+    if (vkp_effects_sync()) tick_change = 1;
+    if (vkp_cardboard_pose_changed()) tick_change = 1;
+    if (tick_change) g_dirty = 1;
+    /* A frame that arrived after this refresh was already drawn is left for the next arrival to draw;
+       drawing it here would block that arrival too and keep every frame waiting for the tick. A client
+       that draws again only after its frame callback sends no such arrival: once a held frame is still
+       waiting at the next tick, the tick draws every frame for a second before holding one again. */
+    if (g_tick_held && g_dirty) g_hold_missed_ns = now;
+    g_tick_held = 0;
+    if (!tick_change && commit_renders_on() && g_dirty_since_ns && now - g_dirty_since_ns < g_refresh_ns &&
+        now - g_hold_missed_ns >= HOLD_RETRY_NS) {
+        g_tick_held = 1;
+        return;
+    }
     if (!g_dirty) return;
-    if (!scene_waits_for_game(now, forced)) {
+    if (scene_held_for_limit(now, g_scene_due_ns, g_fps_limit, g_release_unpaced)) return;
+    if (!scene_waits_for_game(now, tick_change)) {
         render_scene();
     } else if (!vkp_framegen_active()) {
         /* Held for the game's frame: the programs still get their frame callbacks at the display's
@@ -2053,6 +2761,9 @@ static void pointer_set_cursor(struct wl_client *c, struct wl_resource *r, uint3
         wl_buffer_send_release(buffer);
     } else if (g_cursor_shown == s) {
         cursor_publish_shown();
+    } else if (s->idle_px) {
+        cursor_publish_pixels((const uint8_t *)s->idle_px, s->idle_w, s->idle_h, (size_t)s->idle_w * 4, hx, hy);
+        g_cursor_shown = s;
     }
 }
 static void pointer_release(struct wl_client *c, struct wl_resource *r) { wl_resource_destroy(r); }
@@ -2077,6 +2788,7 @@ static const struct wl_touch_interface touch_impl = { .release = touch_release }
 static void touch_res_destroy(struct wl_resource *r) {
     for (int i = 0; i < g_ntouches; i++)
         if (g_touches[i].touch == r) { g_touches[i] = g_touches[--g_ntouches]; break; }
+    publish_query_state();
 }
 
 static void seat_get_pointer(struct wl_client *c, struct wl_resource *r, uint32_t id) {
@@ -2114,6 +2826,7 @@ static void seat_get_touch(struct wl_client *c, struct wl_resource *r, uint32_t 
         g_touches[g_ntouches].focus = NULL;
         g_ntouches++;
     }
+    publish_query_state();
 }
 static void seat_release(struct wl_client *c, struct wl_resource *r) { wl_resource_destroy(r); }
 static const struct wl_seat_interface seat_impl = {
@@ -2216,6 +2929,7 @@ struct constraint {
     int pending_region_set;
     int hint_set, pending_hint_set;
     double hint_x, hint_y, pending_hint_x, pending_hint_y;
+    int gave_keys;
 };
 static struct wl_list g_constraints;
 static struct constraint *g_active_constraint;
@@ -2228,6 +2942,7 @@ struct relative_pointer {
 static struct wl_list g_relative_pointers;
 
 static double g_ptr_x, g_ptr_y;
+static int g_ptr_known;
 static double g_raw_x, g_raw_y;
 static int g_raw_valid;
 
@@ -2292,8 +3007,17 @@ static void constraint_end(struct constraint *k, int tell_client, const char *wh
         constraint_origin(k, &ox, &oy);
         g_ptr_x = ox + k->hint_x;
         g_ptr_y = oy + k->hint_y;
+        g_ptr_known = 1;
     }
     g_raw_valid = 0;
+    if (k->gave_keys) {
+        k->gave_keys = 0;
+        for (int i = 0; i < g_nkbs; i++) {
+            if (!k->surface || g_kbs[i].focus != k->surface->resource) continue;
+            wl_keyboard_send_leave(g_kbs[i].kb, wl_display_next_serial(g_display), g_kbs[i].focus);
+            g_kbs[i].focus = NULL;
+        }
+    }
     if (tell_client) constraint_send_state(k, 0);
     constraint_describe(k, name, sizeof(name));
     droiddeck_log("pointer", "%s: %s (%s), pointer at %d,%d", k->is_lock ? "unlocked" : "unconfined",
@@ -2312,6 +3036,12 @@ static void constraint_activate(struct constraint *k) {
     if (!k->is_lock) confine_clamp(k, &g_ptr_x, &g_ptr_y);
     constraint_origin(k, &ox, &oy);
     pointer_focus(k->surface->resource, wl_fixed_from_double(g_ptr_x - ox), wl_fixed_from_double(g_ptr_y - oy));
+    int focused = 0;
+    for (int i = 0; i < g_nkbs; i++) if (g_kbs[i].focus) focused = 1;
+    if (k->is_lock && !focused && keyboard_for(wl_resource_get_client(k->surface->resource))) {
+        keyboard_focus(k->surface->resource);
+        k->gave_keys = 1;
+    }
     constraint_send_state(k, 1);
     constraint_describe(k, name, sizeof(name));
     if (k->is_lock)
@@ -2374,6 +3104,7 @@ static void constraints_surface_commit(struct surface *s) {
                 constraint_origin(k, &ox, &oy);
                 g_ptr_x = ox + k->hint_x;
                 g_ptr_y = oy + k->hint_y;
+                g_ptr_known = 1;
                 if (log_budget())
                     droiddeck_log("pointer", "position hint: pointer moved to %d,%d", (int)g_ptr_x, (int)g_ptr_y);
             }
@@ -2568,6 +3299,7 @@ static void pointer_input(double x, double y, int relative, uint32_t button, int
         }
         if (k) confine_clamp(k, &x, &y);
         g_ptr_x = x; g_ptr_y = y;
+        g_ptr_known = 1;
         if (k) {
             target = k->surface;
         } else if (g_desktop) {
@@ -2578,6 +3310,7 @@ static void pointer_input(double x, double y, int relative, uint32_t button, int
             if (button && !pressed) g_grab = NULL;
         }
     }
+    publish_query_state();
     if (!target) return;
 
     struct wl_client *client = wl_resource_get_client(target->resource);
@@ -2589,9 +3322,13 @@ static void pointer_input(double x, double y, int relative, uint32_t button, int
     uint32_t t = now_ms();
 
     pointer_focus(target->resource, fx, fy);
-    if (!(k && k->is_lock))
+    // A button-only input must not replay a cached absolute position. A game
+    // may have warped its cursor since the last motion (before taking lock,
+    // or while releasing it), so that replay can become an unintended pan.
+    // Absolute touch events still carry their position, including on clicks.
+    int rel_consumed = send_relative_motion(client, dx, dy);
+    if (!(k && k->is_lock) && !(relative && rel_consumed) && (!relative || dx != 0 || dy != 0))
         for_each_pointer_of(client, sp) wl_pointer_send_motion(sp->ptr, t, fx, fy);
-    send_relative_motion(client, dx, dy);
     for_each_pointer_of(client, sp) {
         if (button)
             wl_pointer_send_button(sp->ptr, wl_display_next_serial(g_display), t, button,
@@ -2616,7 +3353,24 @@ static void pointer_delta(double dx, double dy) {
 }
 
 static void pointer_button(uint32_t button, int pressed) {
-    pointer_input(0, 0, 1, button, pressed);
+    if (pressed) {
+        pointer_input(0, 0, 1, button, pressed);
+        return;
+    }
+    // Releases also clean up interrupted gestures. Deliver them to the existing
+    // pointer focus without motion or hit-testing: native touch has independent
+    // coordinates, so replaying g_ptr_x/y here can warp the game cursor.
+    uint32_t t = now_ms();
+    for (int i = 0; i < g_nptrs; i++) {
+        struct seat_pointer *sp = &g_ptrs[i];
+        if (!sp->focus) continue;
+        wl_pointer_send_button(sp->ptr, wl_display_next_serial(g_display), t, button,
+                               WL_POINTER_BUTTON_STATE_RELEASED);
+        if (wl_resource_get_version(sp->ptr) >= WL_POINTER_FRAME_SINCE_VERSION)
+            wl_pointer_send_frame(sp->ptr);
+    }
+    g_grab = NULL;
+    wl_display_flush_clients(g_display);
 }
 
 static void deliver_pointer(const struct input_msg *m) {
@@ -2711,6 +3465,63 @@ static struct surface *touch_target_at(double x, double y) {
     if (target) return target;
     if (g_desktop) return g_desktop;
     return g_grab ? g_grab : g_key_target;
+}
+
+static pthread_mutex_t g_query_lock = PTHREAD_MUTEX_INITIALIZER;
+struct query_snapshot {
+    int has_position;
+    int input_x, input_y;
+    int focus_takes_touch;
+};
+static struct query_snapshot g_query = { 0, 0, 0, 1 };
+
+static void publish_query_state(void) {
+    struct surface *target = g_key_target ? g_key_target : (g_grab ? g_grab : toplevel_at(g_ptr_x, g_ptr_y));
+    int takes_touch = 1;
+    if (target) {
+        struct wl_client *client = wl_resource_get_client(target->resource);
+        struct seat_touch *st;
+        takes_touch = 0;
+        for_each_touch_of(client, st) takes_touch = 1;
+    }
+    int w = 0, h = 0, ow = 0, oh = 0, input_x = 0, input_y = 0, has_position = 0;
+    scene_size(&w, &h);
+    vkp_output_size(&ow, &oh);
+    if (g_ptr_known && w > 0 && h > 0) {
+        double ox, oy;
+        if (ow > 0 && oh > 0 && vkp_scene_to_output(g_ptr_x, g_ptr_y, &ox, &oy)) {
+            input_x = (int)(ox * INPUT_SPACE_W / ow);
+            input_y = (int)(oy * INPUT_SPACE_H / oh);
+        } else {
+            input_x = (int)(g_ptr_x * INPUT_SPACE_W / w);
+            input_y = (int)(g_ptr_y * INPUT_SPACE_H / h);
+        }
+        has_position = 1;
+    }
+    pthread_mutex_lock(&g_query_lock);
+    g_query.focus_takes_touch = takes_touch;
+    g_query.has_position = has_position;
+    g_query.input_x = input_x;
+    g_query.input_y = input_y;
+    pthread_mutex_unlock(&g_query_lock);
+}
+
+int droiddeck_focus_takes_touch(void) {
+    pthread_mutex_lock(&g_query_lock);
+    int takes_touch = g_query.focus_takes_touch;
+    pthread_mutex_unlock(&g_query_lock);
+    return takes_touch;
+}
+
+int droiddeck_cursor_input_pos(int *x, int *y) {
+    pthread_mutex_lock(&g_query_lock);
+    int has_position = g_query.has_position;
+    int input_x = g_query.input_x, input_y = g_query.input_y;
+    pthread_mutex_unlock(&g_query_lock);
+    if (!has_position) return 0;
+    *x = input_x;
+    *y = input_y;
+    return 1;
 }
 
 static void touch_down(int id, double x, double y) {
@@ -2812,6 +3623,7 @@ static void deliver_touch(const struct input_msg *m) {
     else if (m->p1 == 1) touch_motion(m->p2, x, y);
     else if (m->p1 == 2) touch_up(m->p2, x, y);
     else if (m->p1 == 3) touch_cancel_all();
+    publish_query_state();
 }
 
 static void key_event(uint32_t evdev, int pressed);
@@ -2820,10 +3632,19 @@ static void deliver_key(const struct input_msg *m) {
     key_event((uint32_t)m->p1, m->p2);
 }
 
-static void scroll_event(int steps) {
+static void send_axis(struct seat_pointer *sp, uint32_t t, uint32_t axis, int value120) {
+    if (!value120) return;
+    if (wl_resource_get_version(sp->ptr) >= WL_POINTER_AXIS_VALUE120_SINCE_VERSION)
+        wl_pointer_send_axis_value120(sp->ptr, axis, value120);
+    else if (wl_resource_get_version(sp->ptr) >= WL_POINTER_AXIS_DISCRETE_SINCE_VERSION && value120 % 120 == 0)
+        wl_pointer_send_axis_discrete(sp->ptr, axis, value120 / 120);
+    wl_pointer_send_axis(sp->ptr, t, axis, wl_fixed_from_double(value120 / 12.0));
+}
+
+static void axis_event(int vertical120, int horizontal120, int finger) {
     struct surface *target = g_active_constraint ? g_active_constraint->surface
                            : g_desktop ? g_desktop : (g_grab ? g_grab : toplevel_at(g_ptr_x, g_ptr_y));
-    if (!target || !steps) return;
+    if (!target || (!finger && !vertical120 && !horizontal120)) return;
     struct wl_client *client = wl_resource_get_client(target->resource);
     struct seat_pointer *sp;
     if (!pointer_for(client)) return;
@@ -2832,15 +3653,33 @@ static void scroll_event(int steps) {
     uint32_t t = now_ms();
     pointer_focus(target->resource, wl_fixed_from_double(g_ptr_x - tx), wl_fixed_from_double(g_ptr_y - ty));
     for_each_pointer_of(client, sp) {
-        if (wl_resource_get_version(sp->ptr) >= WL_POINTER_AXIS_VALUE120_SINCE_VERSION)
-            wl_pointer_send_axis_value120(sp->ptr, WL_POINTER_AXIS_VERTICAL_SCROLL, steps * 120);
-        else if (wl_resource_get_version(sp->ptr) >= WL_POINTER_AXIS_DISCRETE_SINCE_VERSION)
-            wl_pointer_send_axis_discrete(sp->ptr, WL_POINTER_AXIS_VERTICAL_SCROLL, steps);
-        wl_pointer_send_axis(sp->ptr, t, WL_POINTER_AXIS_VERTICAL_SCROLL, wl_fixed_from_int(steps * 10));
-        if (wl_resource_get_version(sp->ptr) >= WL_POINTER_FRAME_SINCE_VERSION)
+        int version = wl_resource_get_version(sp->ptr);
+        if (!finger) {
+            send_axis(sp, t, WL_POINTER_AXIS_VERTICAL_SCROLL, vertical120);
+            send_axis(sp, t, WL_POINTER_AXIS_HORIZONTAL_SCROLL, horizontal120);
+        } else {
+            if (version >= WL_POINTER_AXIS_SOURCE_SINCE_VERSION)
+                wl_pointer_send_axis_source(sp->ptr, WL_POINTER_AXIS_SOURCE_FINGER);
+            if (!vertical120 && !horizontal120) {
+                if (version >= WL_POINTER_AXIS_STOP_SINCE_VERSION) {
+                    wl_pointer_send_axis_stop(sp->ptr, t, WL_POINTER_AXIS_VERTICAL_SCROLL);
+                    wl_pointer_send_axis_stop(sp->ptr, t, WL_POINTER_AXIS_HORIZONTAL_SCROLL);
+                }
+            } else {
+                if (vertical120)
+                    wl_pointer_send_axis(sp->ptr, t, WL_POINTER_AXIS_VERTICAL_SCROLL, wl_fixed_from_double(vertical120 / 12.0));
+                if (horizontal120)
+                    wl_pointer_send_axis(sp->ptr, t, WL_POINTER_AXIS_HORIZONTAL_SCROLL, wl_fixed_from_double(horizontal120 / 12.0));
+            }
+        }
+        if (version >= WL_POINTER_FRAME_SINCE_VERSION)
             wl_pointer_send_frame(sp->ptr);
     }
     wl_display_flush_clients(g_display);
+}
+
+static void scroll_event(int steps) {
+    axis_event(steps * 120, 0, 0);
 }
 
 static int update_modifiers(uint32_t evdev, int pressed) {
@@ -2898,13 +3737,19 @@ static void key_event(uint32_t evdev, int pressed) {
     wl_display_flush_clients(g_display);
 }
 
-static void output_resized(void) {
-    struct surface *s;
+static void output_notify_mode(void) {
+    int mhz = atomic_load(&g_output_refresh_mhz);
     struct wl_resource *r;
     wl_resource_for_each(r, &g_outputs) {
-        output_send_mode(r);
+        output_send_mode(r, mhz);
         if (wl_resource_get_version(r) >= 2) wl_output_send_done(r);
     }
+    g_output_announced_refresh_mhz = mhz;
+}
+
+static void output_resized(void) {
+    struct surface *s;
+    output_notify_mode();
     wl_list_for_each(s, &g_surfaces, link)
         if (s->xdg_toplevel && s->toplevel_committed) send_toplevel_configure(s);
     droiddeck_log("display", "output resized to %dx%d", g_output_w, g_output_h);
@@ -2913,20 +3758,47 @@ static void output_resized(void) {
 
 static int on_input_readable(int fd, uint32_t mask, void *data) {
     struct input_msg m;
+    int vsync = 0;
+    int64_t vsync_ns = 0;
     while (read(fd, &m, sizeof(m)) == (ssize_t)sizeof(m)) {
         switch (m.type) {
         case 1: deliver_key(&m); break;
         case 2: pointer_event(m.p1, m.p2, 0, 0); break;
         case 3: pointer_button(m.p1, m.p2); break;
         case 4: scroll_event(m.p1); break;
-        case 5: on_vsync(((int64_t)m.p1 << 32) | (uint32_t)m.p2); break;
+        case 5: vsync = 1; vsync_ns = ((int64_t)m.p1 << 32) | (uint32_t)m.p2; break;
         case 6: pointer_delta(m.p1 / 256.0, m.p2 / 256.0); break;
         case 7: deliver_touch(&m); break;
         case 8: output_resized(); break;
+        case 9:
+            vk_present_set_scale_mode(m.p1, m.p2);
+            schedule_render();
+            break;
+        case 10: break;
+        case 11: axis_event(m.p1, m.p2, 0); break;
+        case 12: axis_event(m.p1, m.p2, 1); break;
+        case 20: stream_take(); break;
+        case 21: if (!m.p1) stream_forget_all(); schedule_render(); break;
         default: deliver_pointer(&m); break;
         }
     }
+    if (atomic_exchange(&g_output_refresh_pending, 0) &&
+            atomic_load(&g_output_refresh_mhz) != g_output_announced_refresh_mhz) {
+        output_notify_mode();
+        wl_display_flush_clients(g_display);
+    }
+    if (vsync) on_vsync(vsync_ns);
     return 0;
+}
+
+void droiddeck_wayland_set_scale_mode(int mode, int alignment) {
+    if (g_input_pipe[1] < 0) {
+        vk_present_set_scale_mode(mode, alignment);
+        return;
+    }
+    struct input_msg m = { 9, mode, alignment, 0, 0 };
+    ssize_t n = write(g_input_pipe[1], &m, sizeof(m));
+    (void)n;
 }
 
 void droiddeck_wayland_send_pointer(int action, int x, int y) {
@@ -2954,6 +3826,16 @@ void droiddeck_wayland_output_resized(void) {
     if (g_input_pipe[1] < 0) return;
     struct input_msg m = { 8, 0, 0, 0, 0 };
     ssize_t n = write(g_input_pipe[1], &m, sizeof(m));
+    (void)n;
+}
+
+void droiddeck_wayland_set_output_refresh_rate(int mhz) {
+    if (mhz <= 0) mhz = 60000;
+    if (atomic_exchange(&g_output_refresh_mhz, mhz) == mhz || g_input_pipe[1] < 0) return;
+    atomic_store(&g_output_refresh_pending, 1);
+    struct input_msg m = { 10, 0, 0, 0, 0 };
+    ssize_t n;
+    do { n = write(g_input_pipe[1], &m, sizeof(m)); } while (n < 0 && errno == EINTR);
     (void)n;
 }
 
@@ -3014,6 +3896,7 @@ static int on_stats_timer(void *data) {
         droiddeck_log("stats", "last 10 s: %u frames on screen (%.1f fps) | %u GPU frames from games | %u window redraws | %d windows open%s",
                    g_stat_frames + generated, (g_stat_frames + generated) / 10.0, g_stat_dmabuf, g_stat_shm, windows, extra);
     }
+    buffer_stats_log();
     {
         struct vkp_perf vp;
         vkp_perf_take(&vp);
@@ -3023,18 +3906,49 @@ static int on_stats_timer(void *data) {
             droiddeck_log("perf", "last 10 s: %u ticks, %u scenes, %u on screen (copy %u, zero-copy %u, layer copy %u), "
                        "%u held for the game's frame | "
                        "render_scene %.2f/%.2f ms | base %u black kept, %u presented | acquire %.2f/%.2f ms | "
-                       "present %.2f/%.2f ms (%u) | fence wait %.2f/%.2f ms (%u, %u GPU release waits) | "
+                       "present %.2f/%.2f ms (%u) | fence wait %.2f/%.2f ms (%u, %u GPU release waits, %u ended early) | "
                        "release %.2f/%.2f ms (%u, %u held) | %u pool drops",
                        g_perf.ticks, g_perf.scenes, g_stat_frames, g_perf.copy_scenes, zero_copy, layer_frames, g_perf.held,
                        PERF_MS(g_perf.scene_ns, g_perf.scenes), (double)g_perf.scene_max_ns / 1e6,
                        vp.base_kept, vp.base_presents,
                        PERF_MS(vp.acquire_ns, vp.acquires), (double)vp.acquire_max_ns / 1e6,
                        PERF_MS(vp.present_ns, vp.presents), (double)vp.present_max_ns / 1e6, vp.presents,
-                       PERF_MS(vp.wait_ns, vp.waits), (double)vp.wait_max_ns / 1e6, vp.waits, vp.gpu_release_waits,
+                       PERF_MS(vp.wait_ns, vp.waits), (double)vp.wait_max_ns / 1e6, vp.waits, vp.gpu_release_waits, vp.early_waits,
                        PERF_MS(g_perf.release_ns, g_perf.releases), (double)g_perf.release_max_ns / 1e6,
                        g_perf.releases, g_perf.releases_held, drops);
 #undef PERF_MS
         memset(&g_perf, 0, sizeof(g_perf));
+    }
+    {
+        unsigned total = 0;
+        for (int i = 0; i < ZC_N; i++) total += g_zc_why[i];
+        if (total) {
+            char why[400];
+            int off = snprintf(why, sizeof(why), "zero-copy last 10 s: %u of %u scenes %s", g_zc_why[ZC_ON], total,
+                               zc_why_name[ZC_ON]);
+            for (int i = 1; i < ZC_N && off < (int)sizeof(why) - 1; i++)
+                if (g_zc_why[i]) off += snprintf(why + off, sizeof(why) - (size_t)off, " | %u %s", g_zc_why[i], zc_why_name[i]);
+            droiddeck_log("layer", "%s", why);
+            memset(g_zc_why, 0, sizeof(g_zc_why));
+        }
+    }
+    const uint64_t game = g_game_frames - g_pace.game_frames_seen;
+    if (g_pace.ticks || g_pace.renders || game || g_pace.reattaches || g_pace.null_attaches || g_pace.distinct ||
+        g_pace.presented || g_pace.replaced || g_pace.undrawn) {
+        droiddeck_log("pacing", "last 10 s: tick reaches compositor %.2f/%.2f ms late (%u ticks, %u over 2 ms) | "
+                   "new frame waits %.2f/%.2f ms to be drawn (%u scenes, %u on arrival) | %llu game frames, %u re-attached after an "
+                   "empty attach, %u empty attaches, %u distinct buffers | feedback %u shown, %u replaced before drawing, "
+                   "%u not drawn",
+                   g_pace.ticks ? (double)g_pace.tick_late_ns / 1e6 / g_pace.ticks : 0.0, (double)g_pace.tick_late_max_ns / 1e6,
+                   g_pace.ticks, g_pace.ticks_late_2ms,
+                   g_pace.renders ? (double)g_pace.wait_ns / 1e6 / g_pace.renders : 0.0, (double)g_pace.wait_max_ns / 1e6,
+                   g_pace.renders, g_pace.commit_renders, (unsigned long long)game, g_pace.reattaches, g_pace.null_attaches, g_pace.distinct,
+                   g_pace.presented, g_pace.replaced, g_pace.undrawn);
+    }
+    {
+        const uint64_t seen = g_game_frames;
+        memset(&g_pace, 0, sizeof(g_pace));
+        g_pace.game_frames_seen = seen;
     }
     g_stat_frames = g_stat_dmabuf = g_stat_shm = 0;
     droiddeck_color_stats_tick();
@@ -3133,6 +4047,9 @@ int droiddeck_wayland_run(void) {
     open_session_log();
 
     if (vkp_ready() != 0) WLOGE("renderer unavailable; clients will connect but nothing is drawn");
+    /* Presentation compatibility is not HDR capability. Set the initial layer mode before
+     * clients bind, including when Desktop is the first session in this app process. */
+    if (vkp_quest_layer_presentation() && sc_layer_available()) g_zero_copy = 1;
 
     struct wl_display *display = wl_display_create();
     if (!display) {
@@ -3192,6 +4109,7 @@ int droiddeck_wayland_run(void) {
     if ((g_stats_timer = wl_event_loop_add_timer(wl_display_get_event_loop(display), on_stats_timer, NULL)))
         wl_event_source_timer_update(g_stats_timer, 10000);
 
+    g_output_announced_refresh_mhz = atomic_load(&g_output_refresh_mhz);
     wl_display_run(display);
 
     wl_display_destroy(display);

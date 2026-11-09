@@ -92,7 +92,6 @@ Java_com_droiddeck_launcher_gpu_VulkanInfo_nativeQuery(JNIEnv *env, jclass clazz
             vkGetPhysicalDeviceFeatures(device, &f);
             LINE("geometry_shader=%s\ntessellation_shader=%s\ntexture_bc=%s\n",
                  f.geometryShader ? "yes" : "no", f.tessellationShader ? "yes" : "no", f.textureCompressionBC ? "yes" : "no");
-            /* DXVK 2.7 and newer refuse a device without it (AppVulkan, ComponentsManager.bridgeDxvk) */
             LINE("shader_int64=%s\n", f.shaderInt64 ? "yes" : "no");
         }
         if (vkGetPhysicalDeviceMemoryProperties) {

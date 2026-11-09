@@ -92,9 +92,12 @@ class OnScreenControls(
     private val groups = controls.map { it.group }.distinct()
 
     private var buttonsOnly = false
+    val isButtonsOnly: Boolean get() = buttonsOnly
     private var quickHidden = false
     private var quickPressedBy = -1
     private var keyboardPressedBy = -1
+    private var forwardedPointerBits = 0
+    var onTouchMiss: ((MotionEvent) -> Unit)? = null
     private var settings = ControllerPrefs.read(context)
     private var snap = settings.snap
     private var safe = Rect()
@@ -521,6 +524,9 @@ class OnScreenControls(
                 val index = event.actionIndex
                 val x = event.getX(index)
                 val y = event.getY(index)
+                if (event.actionMasked == MotionEvent.ACTION_DOWN) forwardedPointerBits = 0
+                if (event.actionMasked == MotionEvent.ACTION_POINTER_DOWN && forwardMiss(event, x, y)) return true
+                if (forwardedPointerBits != 0) forwardPointers(event, forwardedPointerBits)
                 if (event.actionMasked == MotionEvent.ACTION_DOWN && keyboardContains(x, y)) {
                     keyboardPressedBy = event.getPointerId(index)
                     invalidate()
@@ -548,11 +554,13 @@ class OnScreenControls(
                 return true
             }
             MotionEvent.ACTION_MOVE -> {
+                if (forwardedPointerBits != 0) forwardPointers(event, forwardedPointerBits)
                 if (keyboardPressedBy != -1) return true
                 if (quickPressedBy != -1) return true
                 var changed = false
                 for (index in 0 until event.pointerCount) {
                     val pointer = event.getPointerId(index)
+                    if (forwardedPointerBits and (1 shl pointer) != 0) continue
                     val x = event.getX(index)
                     val y = event.getY(index)
                     val stick = controls.firstOrNull { it.stick >= 0 && it.pressedBy == pointer }
@@ -574,8 +582,14 @@ class OnScreenControls(
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP, MotionEvent.ACTION_CANCEL -> {
                 val pointer = event.getPointerId(event.actionIndex)
+                if (forwardedPointerBits != 0) forwardPointers(event, forwardedPointerBits)
                 if (event.actionMasked == MotionEvent.ACTION_CANCEL) {
+                    forwardedPointerBits = 0
                     releaseAll()
+                    return true
+                }
+                if (forwardedPointerBits and (1 shl pointer) != 0) {
+                    forwardedPointerBits = forwardedPointerBits and (1 shl pointer).inv()
                     return true
                 }
                 if (keyboardPressedBy == pointer) {
@@ -608,6 +622,23 @@ class OnScreenControls(
             }
         }
         return false
+    }
+
+    private fun forwardMiss(event: MotionEvent, x: Float, y: Float): Boolean {
+        if (onTouchMiss == null || keyboardPressedBy != -1 || quickPressedBy != -1) return false
+        if (!quickHidden && (controlAt(x, y) ?: adaptiveStickAt(x, y)) != null) return false
+        forwardedPointerBits = forwardedPointerBits or (1 shl event.getPointerId(event.actionIndex))
+        forwardPointers(event, forwardedPointerBits)
+        return true
+    }
+
+    private fun forwardPointers(event: MotionEvent, pointerIdBits: Int) {
+        val split = event.pointerSubset(pointerIdBits) ?: return
+        try {
+            onTouchMiss?.invoke(split)
+        } finally {
+            split.recycle()
+        }
     }
 
     private fun onEditTouch(event: MotionEvent): Boolean {
@@ -647,6 +678,11 @@ class OnScreenControls(
 
     private fun closestSnap(position: Float, targets: List<Float>): Float? =
         targets.minByOrNull { abs(position - it) }?.takeIf { abs(position - it) <= dp(SNAP_DP) }
+
+    /** Whether a finger going down at ([x], [y]) lands on something here, as [onTouchEvent] decides it. */
+    fun takesTouchAt(x: Float, y: Float): Boolean =
+        editing || keyboardContains(x, y) || (!buttonsOnly && quickContains(x, y)) ||
+            (!quickHidden && (controlAt(x, y) ?: adaptiveStickAt(x, y)) != null)
 
     private fun controlAt(x: Float, y: Float): Control? =
         controls.firstOrNull {

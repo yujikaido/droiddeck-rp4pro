@@ -24,7 +24,6 @@ object EpicBackend : StoreBackend, EpicLaunchSupport {
     }
 
     override fun signIn(context: Context) {
-        // A build without the store engine (libdroiddeckstores.so) cannot sign in: say so instead of opening a blank page.
         if (!EpicNative.ready()) {
             val line = context.getString(R.string.stores_engine_missing, store.label)
             StoresState.logLine(line)
@@ -41,6 +40,8 @@ object EpicBackend : StoreBackend, EpicLaunchSupport {
 
     override fun signOut(context: Context) {
         runCatching { EpicLibrary.forget(context) }
+        runCatching { EpicClient.signOut(context) }
+        EpicClient.forgetWebSignIn()
     }
 
     override fun syncLibrary(context: Context, force: Boolean) {
@@ -53,6 +54,8 @@ object EpicBackend : StoreBackend, EpicLaunchSupport {
                 if (!quiet) StoresState.status[store] = app.getString(R.string.stores_sync_library)
             }
             val result = EpicLibrary.sync(app, force) { line -> if (!quiet) StoresState.post { StoresState.status[store] = line } }
+            // Throttled means the cache is fresh, possibly written by another sync after this one read it.
+            val fresh = if (result == EpicLibrary.SyncResult.Throttled) EpicLibrary.cached(app).map { EpicLibrary.toCatalogItem(app, it) } else cached
             StoresState.post {
                 StoresState.status.remove(store)
                 when (result) {
@@ -62,7 +65,7 @@ object EpicBackend : StoreBackend, EpicLaunchSupport {
                     }
                     is EpicLibrary.SyncResult.Failed -> StoresState.problems[store] = result.message
                     EpicLibrary.SyncResult.NotLoggedIn -> StoresState.problems[store] = StoresState.notSignedInLine(store)
-                    EpicLibrary.SyncResult.Throttled -> if (!StoresState.library.containsKey(store)) StoresState.library[store] = cached
+                    EpicLibrary.SyncResult.Throttled -> if (fresh.isNotEmpty()) StoresState.library[store] = mergeItems(StoresState.library[store], fresh)
                     EpicLibrary.SyncResult.Busy -> {}
                 }
             }

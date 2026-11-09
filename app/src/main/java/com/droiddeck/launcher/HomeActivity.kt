@@ -7,7 +7,7 @@ import com.droiddeck.launcher.session.SessionService
 
 class HomeActivity : Activity() {
     companion object {
-        /** On the intent to MainActivity: it came from a Home press (MainActivity closes retro mode when it was already in front). */
+        /** On the intent to FrontEndActivity: it came from a Home press (FrontEndActivity closes retro mode when it was already in front). */
         const val EXTRA_HOME_PRESS = "com.droiddeck.launcher.HOME_PRESS"
     }
 
@@ -18,7 +18,7 @@ class HomeActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        requestedOrientation = com.droiddeck.launcher.session.SessionPrefs.orientation(this)
+        requestedOrientation = com.droiddeck.launcher.core.AppUiPrefs.orientation(this)
         routeHome()
     }
 
@@ -28,7 +28,7 @@ class HomeActivity : Activity() {
                 .setAction(SessionService.ACTION_HOME_GUIDE)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
         } else {
-            Intent(this, MainActivity::class.java).putExtra(EXTRA_HOME_PRESS, true)
+            Intent(this, FrontEndActivity::class.java).putExtra(EXTRA_HOME_PRESS, true)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
         }
         startActivity(destination)

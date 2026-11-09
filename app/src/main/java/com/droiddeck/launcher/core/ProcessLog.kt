@@ -7,7 +7,7 @@ import java.util.function.Consumer
 /**
  * A process's own output into a small file (the session's proot.log): proot and the guest's
  * env/init write there before the session script points everything at BL_LOG, and a proot that
- * dies in its first milliseconds leaves its reason nowhere else (Kirin 985, 20 ms, MaliBridge#10).
+ * dies in its first milliseconds leaves its reason nowhere else (Kirin 985, 20 ms).
  *
  * The first [headBytes] go straight to the file; past that the last [tailBytes] are held and
  * written after it at [close], with a count of the lines left out between them. [recent] keeps

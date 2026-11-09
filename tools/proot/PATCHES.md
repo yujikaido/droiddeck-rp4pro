@@ -39,8 +39,8 @@ Ported from WinNative (`main`, 53836ca9, "Fix/performance and vac"):
 - `0007-proc-self-thread-group.patch` - tracees track their thread group, `/proc/self` names it
   instead of the calling thread, and `/proc/thread-self` resolves to `/proc/<tgid>/task/<tid>`.
 - `0008-fchmodat2-openat2.patch` - `fchmodat2` paths are translated (honouring
-  `AT_SYMLINK_NOFOLLOW`), `openat2` answers `ENOSYS` so callers fall back to the translated
-  `openat`, and syscall numbers past the end of a table are rejected instead of read.
+  `AT_SYMLINK_NOFOLLOW`), and syscall numbers past the end of a table are rejected instead of read.
+  Its `openat2` answer is replaced by `0019`.
 - `0009-tracee-relatives-sweep.patch` - tracees count their children, so a terminating thread
   with no children or ptracees no longer walks every tracee; the per-stop memory collector is
   emptied instead of freed and reallocated.
@@ -55,6 +55,13 @@ Added for Flatpak:
   `linkat` fails with `EACCES` and Flatpak could not create its repo (`Creating repo: linkat:
   Permission denied`). `O_TMPFILE` answers `EOPNOTSUPP`, so libglnx writes a named temporary file
   and renames it, and a denied link answers `EPERM`, on which ostree's checkout copies instead.
+- `0017-android-execstack-denial.patch` - the same policy denies apps executable stacks, so the
+  `mprotect(PROT_READ | PROT_WRITE | PROT_EXEC | PROT_GROWSDOWN)` with which `ld.so` makes the main
+  stack executable for an object whose `PT_GNU_STACK` asks for it fails with `EACCES`, and the
+  program stops before `main` ("cannot enable executable stack as shared object requires:
+  Permission denied", `libQt5Gui.so.5` in ONLYOFFICE's Flatpak). The filter traces `mprotect` only
+  for that exact request, and a denied one answers success: the stack stays non-executable, as
+  Android keeps it anyway, and objects that only carry the flag load.
 Added by DroidDeck:
 
 - `0011-kompat-utsname-only.patch` - `--kernel-release` (the guest's `DroidDeck` hostname) loads
@@ -88,6 +95,12 @@ Added by DroidDeck:
   `mnt_id` from the pin's fdinfo. A later close/reuse of the tracee fd cannot redirect that read;
   a concurrent reuse for the same inode through a different bind mount is indistinguishable at
   the exit stop. It does not synthesize `STATX_MNT_ID_UNIQUE`.
+- `0016-robust-list-from-seccomp.patch` - Android's app policy refuses `set_robust_list` and
+  `get_robust_list`. proot still answers the first with `ENOSYS` but keeps the head each thread
+  offered (cleared on `execve`, none in a new task), and answers the second for the calling thread
+  with it. SteamVR's `vrclient.so` asks for the head through libc's `syscall()`, which
+  `libblsession.so`'s robust.c never sees: `libopenvr_api.so` opens it `RTLD_DEEPBIND`. Steam
+  aborted on "futex robust_list not initialized by pthreads" as soon as SteamVR was registered.
 
 Prototype (inert unless `PROOT_FASTPATH` is set; see `docs/development/proot-performance.md`):
 
@@ -100,3 +113,53 @@ Prototype (inert unless `PROOT_FASTPATH` is set; see `docs/development/proot-per
   first tracee starts at `-w`'s, so relative lookups inside the tracee resolve where proot would.
   SM8850 (adb shell): `stat` 25.3 -> 0.6 us, `open+close` 25.3 -> 0.9 us, ENOENT 22.9 -> 1.6 us,
   8 threads `stat`ing 89k -> 3.6M/s; equivalence suite (`bench/equiv.py`) byte-identical to proot.
+
+- `0019-openat2-emulation.patch` - `openat2` without `resolve` flags runs as a translated `openat`
+  with the same flag and mode checks as the kernel. Any `resolve` flag still answers `ENOSYS`,
+  because PRoot cannot confine symlinks or mounts, so callers keep their own confined fallback.
+- `0022-fake-root-statx-owners.patch` - with `0013` dropping the `statx` exit stop, fake root never
+  rewrote the owner `statx` returns, so files read as owned by the app's uid while the process was
+  root. Rust's `metadata` and GNU `stat` use `statx`, so uutils' `test -w` (Ubuntu's `/usr/bin/test`)
+  said root could not write to its own directories and apt's AppStream hook never built Discover's
+  catalog. fake_id0 keeps that exit stop when it fakes ids; identity-only mode is unchanged.
+- `0023-reused-pid-new-child.patch` - when a thread that is not its process's leader calls `execve`,
+  the kernel retires that thread's ID without reporting an exit, so PRoot keeps its entry. Once the
+  IDs wrap (32768 on many Android kernels) a new child can get that ID, and PRoot aborted on the
+  assertion that a new child has no state, ending the whole session. Chromium-based programs such as
+  Steam's client do this. PRoot now retires the stale entry and sets the new child up from scratch.
+- `0024-execveat-absolute-path.patch` - `execveat` with an absolute path and neither `AT_EMPTY_PATH`
+  nor `AT_SYMLINK_NOFOLLOW` runs as `execve`. The kernel ignores the directory descriptor for such a
+  path, and PRoot refused the call unless the descriptor was `AT_FDCWD`. FEX starts every child of an
+  emulated program with `execveat(fd, "/proc/self/exe")`, so x86 programs in a Flatpak sandbox, which
+  does not carry the session's preloads, could not start other programs.
+
+Old kernel fixes:
+
+- `0015-lost-fork-events.patch` - works around a problem reported on Xiaomi's msm 4.14 kernel:
+  the kernel sometimes reports a new process or thread but gives its ID as zero. Without that ID,
+  PRoot cannot finish setting it up, which can leave the session stuck. The patch searches `/proc`
+  for the child. If exactly one matches, PRoot uses its existing setup code. If several threads
+  match, it waits for the creating thread's `clone` call to return and uses the child ID returned
+  by the kernel instead. The original clone flags are preserved. When the kernel supplies a valid
+  ID in the notification, normal setup is unchanged. No timers or background polling are added.
+  Completely missing notifications and ambiguous matches for separate processes are not recovered.
+- `0025-no-seccomp-void-sigsys.patch` - with `PROOT_NO_SECCOMP` (Performance → "Run proot without
+  seccomp") PRoot never gets a seccomp event, so it never learns that Linux 4.8 and newer run the
+  system's filter after the ptrace stop. Android's app policy then saw the void number PRoot writes
+  at that stop for the calls it emulates or refuses (`getcwd`, `chdir`, `brk`, a path that does not
+  exist), raised SIGSYS, and PRoot answered the SIGSYS with `ENOSYS` over the call's real result:
+  `getcwd: cannot access parent directories: Function not implemented`, tar `Cannot open: Function
+  not implemented` for new files, uutils aborting on `/proc/self/exe` (a player log, Huawei P30 Pro,
+  4.14). A SIGSYS for the void number on a call PRoot voided itself now tells it the order, and the
+  call keeps its result. Kernels before 4.8 never raise that SIGSYS, a void number the program
+  passed itself still answers `ENOSYS`, and with PRoot's filter on the order was already known.
+  `bench/android10-filter-check.sh` builds the patched proot on an x86_64 host and checks both modes
+  under a filter shaped like Android 10's (it fails without this patch).
+
+Development diagnostics:
+
+- `0018-syscall-handler-profile.patch` - `PROOT_PROFILE=1` enables per-syscall entry/exit handler
+  counts, wall/CPU time, periodic cumulative JSON totals, and bounded slow-handler samples on
+  stderr. `profile.h` is copied into the source tree by `build.sh`. It adds no ptrace stops;
+  handler timing excludes tracee kernel time and scheduling before handler entry. See
+  `docs/development/proot-performance.md` for the capture and library-override workflow.

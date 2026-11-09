@@ -6,9 +6,11 @@ LIBRARIES=${DROIDDECK_LIBRARIES-/mnt/droiddeck /mnt/droiddeck-sd}
 redist="$steam_root/steamapps/common/Steamworks Shared/_CommonRedist"
 
 read_scripts() { xargs -0 -r awk -v want="${1:-redists}" '
-  FNR == 1 { depth = 0; pending = "" }
-  /^[[:space:]]*\{/ { depth++; name[depth] = pending; key[depth] = ""; vulkan[depth] = 0; pending = ""; next }
+  FNR == 1 { depth = 0; pending = ""; appid = "" }
+  /^[[:space:]]*\{/ { depth++; name[depth] = pending; key[depth] = ""; vulkan[depth] = 0; proc[depth] = 0; pending = ""; next }
   /^[[:space:]]*\}/ {
+    if (depth > 0 && key[depth] == "" && proc[depth] && appid != "" && name[depth] != "" && vulkan[depth] == (want == "vulkan"))
+      printf "HKEY_LOCAL_MACHINE\\\\Software\\\\Valve\\\\Steam\\\\Apps\\\\%s\t%s\n", appid, name[depth]
     if (depth > 0 && key[depth] != "" && name[depth] != "" && vulkan[depth] == (want == "vulkan"))
       printf "%s\t%s\n", key[depth], name[depth]
     if (depth > 0) depth--
@@ -16,11 +18,13 @@ read_scripts() { xargs -0 -r awk -v want="${1:-redists}" '
   }
   {
     n = split($0, part, "\"")
+    if (n >= 5 && tolower(part[2]) == "appid" && part[4] ~ /^[0-9]+$/) { appid = part[4]; next }
     if (n >= 5 && tolower(part[2]) == "hasrunkey") { key[depth] = part[4]; next }
     if (n >= 5 && tolower(part[2]) ~ /^process [0-9]+$/) {
+      proc[depth] = 1
       program = tolower(part[4])
       sub(/.*[\\\/]/, "", program)
-      if (program ~ /vulkan/) vulkan[depth] = 1
+      if (program ~ /vulkan|uplay|ubisoft|eaappinstaller|eadesktop|originthinsetup/) vulkan[depth] = 1
       next
     }
     if (n == 3) pending = part[2]
@@ -49,7 +53,6 @@ vcredist\\2022 x64 14.51.36247.0
 KNOWN
 )
 
-# The install scripts in the libraries' games, cached per game folder by a stamp of its manifest (LastPlayed left out).
 CACHE_VERSION="droiddeck-game-scripts 2"
 cache="$steam_root/.droiddeck-game-scripts"
 libraries="$steam_root"
@@ -83,7 +86,6 @@ manifests() {
 }
 cached_lines() { [ "$(head -n 1 "$cache" 2>/dev/null)" = "$CACHE_VERSION" ] && tail -n +2 "$cache"; }
 if [ -n "${DROIDDECK_SEED_PREFIX:-}" ]; then
-  # A launch's own pass: no folder is searched; the launch's scripts and the session's cache cover the rest.
   entries=$(cached_lines)
 else
   current=$(manifests)
@@ -125,6 +127,11 @@ vcrt() {
   done
 }
 
+declare -A game_step=()
+while IFS= read -r line; do
+  [[ $line == *$'\t'* ]] && game_step[$line]=1
+done <<<"$game_pairs"
+
 want=()
 declare -A wanted=()
 while IFS= read -r line; do
@@ -133,14 +140,14 @@ done <<<"$pairs"
 want+=("vcrt"$'\t'"$VCRT_MAJOR.$VCRT_MINOR.$VCRT_BUILD")
 
 printf -v now '%(%s)T' -1
-block_for() { printf '%s\n' "$@" | awk -F'\t' -v now="$now" '
+block_for() { printf '%s\n' "$@" | awk -F'\t' -v now="$now" -v hive="$hive" '
   {
     path = $1
-    sub(/^HKEY_LOCAL_MACHINE\\\\/, "", path)
+    sub(/^HKEY_(LOCAL_MACHINE|CURRENT_USER)\\\\/, "", path)
     if (path == $1)
       next
     printf "\n[%s] %d\n\"%s\"=dword:00000001\n", path, now, $2
-    if (substr(path, 1, 10) != "Software\\\\")
+    if (hive != "HKEY_LOCAL_MACHINE" || substr(path, 1, 10) != "Software\\\\")
       next
     printf "\n[%s] %d\n\"%s\"=dword:00000001\n", "Software\\\\Wow6432Node\\\\" substr(path, 11), now, $2
   }
@@ -152,16 +159,17 @@ block_for() { printf '%s\n' "$@" | awk -F'\t' -v now="$now" '
 unseed() {
   local reg=$1 out
   shift
-  out=$(mktemp "${reg%/*}/.system.reg.XXXXXX") || return 1
-  if printf '%s\n' "$@" | awk -F'\t' '
+  [ -w "$reg" ] || return 1
+  out=$(mktemp "${reg%/*}/.${reg##*/}.XXXXXX") || return 1
+  if printf '%s\n' "$@" | awk -F'\t' -v hive="$hive" '
     NR == FNR {
       path = $1
-      sub(/^HKEY_LOCAL_MACHINE\\\\/, "", path)
+      sub(/^HKEY_(LOCAL_MACHINE|CURRENT_USER)\\\\/, "", path)
       if (path == $1)
         next
       path = tolower(path)
       drop["[" path "]" SUBSEP tolower($2)] = 1
-      if (substr(path, 1, 10) == "software\\\\")
+      if (hive == "HKEY_LOCAL_MACHINE" && substr(path, 1, 10) == "software\\\\")
         drop["[software\\\\wow6432node\\\\" substr(path, 11) "]" SUBSEP tolower($2)] = 1
       next
     }
@@ -182,11 +190,11 @@ unseed() {
 
 # The ledger lines whose values the registry still holds, in both views where we wrote both. A Proton
 # update replaces its default_pfx system.reg but not our ledger beside it, and new prefixes copy both.
-present() { awk -F'\t' '
+present() { awk -F'\t' -v hive="$hive" '
   NR == FNR {
     path = $1
     if (path != "vcrt") {
-      sub(/^HKEY_LOCAL_MACHINE\\\\/, "", path)
+      sub(/^HKEY_(LOCAL_MACHINE|CURRENT_USER)\\\\/, "", path)
       if (path == $1)
         next
     }
@@ -200,7 +208,7 @@ present() { awk -F'\t' '
         key[n, ++need[n]] = "[software\\\\wow6432node\\\\" runtime "]" SUBSEP "installed"
       }
     } else {
-      both = substr(path, 1, 10) == "Software\\\\"
+      both = hive == "HKEY_LOCAL_MACHINE" && substr(path, 1, 10) == "Software\\\\"
       path = tolower(path)
       key[n, ++need[n]] = "[" path "]" SUBSEP tolower($2)
       if (both)
@@ -230,54 +238,101 @@ registries=("$steam_root"/steamapps/common/Proton*/files/share/default_pfx*/syst
             /root/Games/*/steamapps/common/Proton*/files/share/default_pfx*/system.reg
             "$steam_root"/compatibilitytools.d/*/files/share/default_pfx*/system.reg)
 if [ -n "${DROIDDECK_SEED_PREFIX:-}" ]; then
-  # A launch's own pass: its prefix, and the stock ones a new prefix is copied from.
   registries+=("${DROIDDECK_SEED_PREFIX%/}/pfx/system.reg")
 else
   registries+=("$steam_root"/steamapps/compatdata/*/pfx/system.reg
                /mnt/droiddeck-sd/steamapps/compatdata/*/pfx/system.reg
                /root/Games/*/steamapps/compatdata/*/pfx/system.reg)
 fi
+regs=()
 for reg in "${registries[@]}"; do
-  [ -f "$reg" ] || continue
-  seeded=${reg%/*}/.droiddeck-redists
-  legacy=${reg%/*}/.bannerlator-redists
+  [ -f "$reg" ] && regs+=("$reg")
+done
+declare -A regid=()
+if [ ${#regs[@]} -gt 0 ]; then
+  users=()
+  for reg in "${regs[@]}"; do users+=("${reg%/*}/user.reg"); done
+  while IFS=$'\t' read -r id name; do
+    regid[$name]=$id
+  done < <(stat -c $'%i %s %.9Y\t%n' -- "${regs[@]}" "${users[@]}" 2>/dev/null)
+fi
+
+for system in "${regs[@]}"; do
+  user=${system%/*}/user.reg
+  seeded=${system%/*}/.droiddeck-redists
+  checked=${system%/*}/.droiddeck-redists-checked
+  id="${regid[$system]:-}|${regid[$user]:-missing}"
+  prev=
+  [ -f "$checked" ] && read -r prev <"$checked"
+  legacy=${system%/*}/.bannerlator-redists
   if [ -f "$legacy" ] && [ ! -f "$seeded" ]; then
     mv -f "$legacy" "$seeded"
   fi
-  declare -A had=()
-  if [ -f "$seeded" ]; then
-    while IFS= read -r line; do [[ $line == *$'\t'* ]] && had[$line]=1; done <"$seeded"
-  fi
-  stale=() kept=()
-  for line in "${!had[@]}"; do
-    if [ -n "${vulkan[$line]:-}" ]; then stale+=("$line"); else kept+=("$line"); fi
-  done
-  if [ ${#stale[@]} -gt 0 ] && unseed "$reg" "${stale[@]}"; then
-    had=()
-    for line in "${kept[@]}"; do had[$line]=1; done
-    printf '%s\n' "${kept[@]}" >"$seeded"
-    echo "== took Vulkan runtime markers out of $reg"
-  fi
-  if [ ${#had[@]} -gt 0 ]; then
-    declare -A held=()
-    while IFS= read -r line; do [[ $line == *$'\t'* ]] && held[$line]=1; done < <(printf '%s\n' "${!had[@]}" | present "$reg")
-    if [ ${#held[@]} -lt ${#had[@]} ]; then
-      echo "== $((${#had[@]} - ${#held[@]})) recorded redist markers are gone from $reg"
-      had=()
-      for line in "${!held[@]}"; do had[$line]=1; done
-      printf '%s\n' "${!had[@]}" >"$seeded"
+  for reg in "$system" "$user"; do
+    hive=HKEY_LOCAL_MACHINE
+    [ "$reg" == "$user" ] && hive=HKEY_CURRENT_USER
+    declare -A had=()
+    other=()
+    if [ -f "$seeded" ]; then
+      while IFS= read -r line; do
+        [[ $line == *$'\t'* ]] || continue
+        if [[ $line == "$hive\\"* ]] || { [ "$reg" == "$system" ] && [[ $line == vcrt$'\t'* ]]; }; then
+          had[$line]=1
+        else
+          other+=("$line")
+        fi
+      done <"$seeded"
     fi
-    unset held
-  fi
-  missing=()
-  for line in "${want[@]}"; do [ -n "${had[$line]:-}" ] || missing+=("$line"); done
-  [ ${#missing[@]} -eq 0 ] && continue
-  dated=$(mktemp) || continue
-  touch -r "$reg" "$dated"
-  if printf '%s\n' "$(block_for "${missing[@]}")" >>"$reg"; then
-    printf '%s\n' "${!had[@]}" "${missing[@]}" >"$seeded"
-    echo "== seeded redist markers into $reg"
-  fi
-  touch -r "$dated" "$reg"
-  rm -f "$dated"
+    stale=() kept=()
+    for line in "${!had[@]}"; do
+      if [ -n "${vulkan[$line]:-}" ]; then stale+=("$line"); else kept+=("$line"); fi
+    done
+    if [ ${#stale[@]} -gt 0 ] && unseed "$reg" "${stale[@]}"; then
+      id=
+      had=()
+      for line in "${kept[@]}"; do had[$line]=1; done
+      printf '%s\n' "${other[@]}" "${kept[@]}" >"$seeded"
+      echo "== took Vulkan runtime, EA app and Ubisoft Connect markers out of $reg"
+    fi
+    if [ ${#had[@]} -gt 0 ] && { [ -z "$id" ] || [ "$id" != "$prev" ]; }; then
+      declare -A held=()
+      while IFS= read -r line; do [[ $line == *$'\t'* ]] && held[$line]=1; done < <([ -f "$reg" ] && printf '%s\n' "${!had[@]}" | present "$reg")
+      if [ ${#held[@]} -lt ${#had[@]} ]; then
+        echo "== $((${#had[@]} - ${#held[@]})) recorded redist markers are gone from $reg"
+        had=()
+        for line in "${!held[@]}"; do had[$line]=1; done
+        printf '%s\n' "${other[@]}" "${!had[@]}" >"$seeded"
+      fi
+      unset held
+    fi
+    missing=()
+    for line in "${want[@]}"; do
+      [[ $line == "$hive\\"* ]] || { [ "$reg" == "$system" ] && [[ $line == vcrt$'\t'* ]]; } || continue
+      [ -n "${had[$line]:-}" ] || missing+=("$line")
+    done
+    if [ ${#missing[@]} -eq 0 ]; then
+      [ -n "$id" ] && [ "$id" != "$prev" ] && printf '%s\n' "$id" >"$checked"
+      continue
+    fi
+    [ -f "$reg" ] && [ -w "$reg" ] || continue
+    rm -f "$checked"
+    dated=$(mktemp) || continue
+    touch -r "$reg" "$dated"
+    if printf '%s\n' "$(block_for "${missing[@]}")" >>"$reg"; then
+      printf '%s\n' "${other[@]}" "${!had[@]}" "${missing[@]}" >"$seeded"
+      id=
+      steps=()
+      for line in "${missing[@]}"; do [ -n "${game_step[$line]:-}" ] && steps+=("${line#*$'\t'}"); done
+      if [ ${#steps[@]} -gt 0 ]; then
+        listed=$(printf '%s\n' "${steps[@]}" | sort -u | head -n 8 | paste -sd, - | sed 's/,/, /g')
+        more=$(( $(printf '%s\n' "${steps[@]}" | sort -u | wc -l) - 8 ))
+        [ $more -gt 0 ] && listed="$listed and $more more"
+        echo "== seeded redist markers into $reg (games' own install steps: $listed)"
+      else
+        echo "== seeded redist markers into $reg"
+      fi
+    fi
+    touch -r "$dated" "$reg"
+    rm -f "$dated"
+  done
 done

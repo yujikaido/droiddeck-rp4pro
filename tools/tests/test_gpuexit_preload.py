@@ -7,7 +7,8 @@ import unittest
 
 PRELOAD = Path(__file__).resolve().parents[1] / "linuxfs/preload"
 
-# argv[1]: how to end (exit, _exit, _Exit, return), argv[2]: the status; prints without a newline first.
+# argv[1]: how to end (exit, _exit, _Exit, return), argv[2]: the status; the rest is for the
+# command line the preload reads. Prints without a newline first, so a lost stdio flush shows.
 PROGRAM = r"""
 #include <stdio.h>
 #include <stdlib.h>
@@ -49,8 +50,8 @@ class GpuExitPreloadTest(unittest.TestCase):
 
     def run_it(self, exe, how, status, *args, env=None):
         home = Path(tempfile.mkdtemp(dir=self.tmp))
-        e = {k: v for k, v in os.environ.items() if k not in ("XDG_DATA_HOME", "BL_WEBHELPER_GPU_DIAG")}
-        e.update({"HOME": str(home), "LD_PRELOAD": str(self.lib)})
+        e = {k: v for k, v in os.environ.items() if k not in ("XDG_DATA_HOME", "BL_WEBHELPER_GPU_DIAG", "BL_VKBRIDGE")}
+        e.update({"HOME": str(home), "LD_PRELOAD": str(self.lib), "BL_VKBRIDGE": "1"})
         e.update(env or {})
         (home / ".local/share/Steam/logs").mkdir(parents=True)
         r = subprocess.run([str(exe), how, str(status), *args], env=e, capture_output=True, text=True)
@@ -92,6 +93,17 @@ class GpuExitPreloadTest(unittest.TestCase):
         r, log = self.run_it(self.webhelper, "exit", 1, "--type=gpu-process", env={"BL_WEBHELPER_GPU_DIAG": "0"})
         self.assertEqual(r.returncode, 1)
         self.assertIsNone(log)
+
+    def test_off_without_the_bridge(self):
+        r, log = self.run_it(self.webhelper, "exit", 1, "--type=gpu-process", env={"BL_VKBRIDGE": "0"})
+        self.assertEqual(r.returncode, 1)
+        self.assertIsNone(log)
+        self.assertNotIn("gpu-process", r.stderr)
+
+    def test_forced_on_without_the_bridge(self):
+        r, log = self.run_it(self.webhelper, "exit", 1, "--type=gpu-process", env={"BL_VKBRIDGE": "0", "BL_WEBHELPER_GPU_DIAG": "1"})
+        self.assertEqual(r.returncode, 1)
+        self.assertIsNotNone(log)
 
     def test_xdg_data_home_and_a_long_file_started_afresh(self):
         data = Path(tempfile.mkdtemp(dir=self.tmp))

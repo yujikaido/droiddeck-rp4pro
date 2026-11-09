@@ -1,4 +1,20 @@
-/* Steam's browser GPU process only: a line at start and one per non-zero exit (status, caller, errno, time) in Steam's log folder and stderr; BL_WEBHELPER_GPU_DIAG=0 turns it off. */
+/* Steam's browser GPU process: who ends it.
+ *
+ * On vivo phones (X100 Pro, X200, X300, X300 Pro: G720, G925 and G1-Ultra alike) Chromium's GPU
+ * process (steamwebhelper --type=gpu-process) exits with status 1 about 10-50 ms after it starts,
+ * six times, and Steam turns its GPU off (webhelper.txt "Disabling GPU acceleration:
+ * Disabled/CrashCount"), so its menus draw in software at 10-15 fps. The process writes nothing
+ * first, not even with Chromium's log on, and never reaches the Vulkan bridge, so the logs cannot
+ * say what ends it. Here, in that process only:
+ *   - at start: one line saying the process got this far (the preload loaded, the dynamic linker
+ *     is done), with its pid;
+ *   - on exit() / _exit() / _Exit() with a status other than 0: the status, the library and offset
+ *     of the caller (and its symbol when it is exported), errno, and the time since start.
+ * No line at start means it ends before libraries' constructors run (in the exec or the linker).
+ * The lines go to Steam's log folder (droiddeck_webhelper_gpu.txt, collected with the other
+ * Steam logs; started afresh past 256 KB) and to stderr. Every other process: nothing but the
+ * one look at /proc/self/cmdline. Only in sessions on the Mali bridge (BL_VKBRIDGE=1);
+ * BL_WEBHELPER_GPU_DIAG=0 turns it off, =1 on in any session. */
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <errno.h>
@@ -15,11 +31,13 @@
 
 static int gpu_diag_on;
 static int gpu_diag_fd = -1;
-/* The real functions, looked up in the constructor in every process, never in the exit path. */
+/* The real functions, looked up in the constructor in every process: never in the exit path,
+ * which may run in a vfork() child sharing its parent's memory */
 static void (*real_exit)(int), (*real__exit)(int), (*real__Exit)(int);
 static struct timespec gpu_diag_t0;
 
-/* Whether this process is steamwebhelper --type=gpu-process (exposed, hidden, for the host test). */
+/* Whether this process is steamwebhelper --type=gpu-process, from /proc/self/cmdline. Exposed
+ * (hidden) for the host test. */
 __attribute__((visibility("hidden"))) int bl_gpuexit_is_gpu_process(const char *cmdline, size_t len) {
   if (!cmdline || !len) return 0;
   const char *argv0 = cmdline;
@@ -61,8 +79,11 @@ __attribute__((constructor)) static void gpu_diag_init(void) {
   real_exit = (void (*)(int))dlsym(RTLD_NEXT, "exit");
   real__exit = (void (*)(int))dlsym(RTLD_NEXT, "_exit");
   real__Exit = (void (*)(int))dlsym(RTLD_NEXT, "_Exit");
+  /* Only on the Mali bridge (BL_VKBRIDGE=1); BL_WEBHELPER_GPU_DIAG=1 turns it on anywhere, =0 off */
   const char *off = getenv("BL_WEBHELPER_GPU_DIAG");
   if (off && !strcmp(off, "0")) return;
+  const char *bridge = getenv("BL_VKBRIDGE");
+  if (!(off && !strcmp(off, "1")) && !(bridge && !strcmp(bridge, "1"))) return;
   char buf[8192];
   int fd = open("/proc/self/cmdline", O_RDONLY | O_CLOEXEC);
   if (fd < 0) return;
@@ -99,6 +120,9 @@ __attribute__((visibility("hidden"))) int bl_gpuexit_format(char *out, size_t si
                   (int)getpid(), how, status, lib, off, sym ? " (" : "", sym ? sym : "", sym ? ")" : "", err, strerror(err), ms);
 }
 
+/* childkill.c: the same for every other steamwebhelper child with a non-zero status */
+void bl_webhelper_exit_note(const char *how, int status, const void *caller, int err) __attribute__((weak, visibility("hidden")));
+
 static void gpu_diag_exit(const char *how, int status, const void *caller, int err) {
   if (!gpu_diag_on || !status) return;
   gpu_diag_on = 0; /* once: exit() may end in _exit() */
@@ -110,7 +134,9 @@ static void gpu_diag_exit(const char *how, int status, const void *caller, int e
 void exit(int status) {
   int err = errno;
   gpu_diag_exit("exit", status, __builtin_return_address(0), err);
-  /* before the constructor: looked up now, so atexit handlers and stdio still run */
+  if (bl_webhelper_exit_note) bl_webhelper_exit_note("exit", status, __builtin_return_address(0), err);
+  /* before the constructor (another library's constructor exiting): looked up now, so atexit
+   * handlers and stdio still run; exit() in a vfork() child is wrong in any case */
   if (!real_exit) real_exit = (void (*)(int))dlsym(RTLD_NEXT, "exit");
   if (real_exit) real_exit(status);
   syscall(SYS_exit_group, status);
@@ -120,6 +146,7 @@ void exit(int status) {
 void _exit(int status) {
   int err = errno;
   gpu_diag_exit("_exit", status, __builtin_return_address(0), err);
+  if (bl_webhelper_exit_note) bl_webhelper_exit_note("_exit", status, __builtin_return_address(0), err);
   if (real__exit) real__exit(status);
   syscall(SYS_exit_group, status);
   __builtin_unreachable();
@@ -128,6 +155,7 @@ void _exit(int status) {
 void _Exit(int status) {
   int err = errno;
   gpu_diag_exit("_Exit", status, __builtin_return_address(0), err);
+  if (bl_webhelper_exit_note) bl_webhelper_exit_note("_Exit", status, __builtin_return_address(0), err);
   if (real__Exit) real__Exit(status);
   syscall(SYS_exit_group, status);
   __builtin_unreachable();

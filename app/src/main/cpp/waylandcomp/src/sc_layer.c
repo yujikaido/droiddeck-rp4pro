@@ -185,6 +185,8 @@ static int g_pending_cb;
 static unsigned g_stat_layer_frames;
 static int g_two_logged;
 static AHardwareBuffer *g_blank;
+static ASurfaceControl *g_base_sc;
+static int g_base_w, g_base_h, g_base_shown;
 
 static void layers_init(void) {
     if (g_layers_ready) return;
@@ -262,13 +264,57 @@ static AHardwareBuffer *blank_buffer(void) {
                  AHARDWAREBUFFER_USAGE_CPU_WRITE_RARELY};
     if (AHardwareBuffer_allocate(&d, &g_blank) != 0 || !g_blank) { g_blank = NULL; return NULL; }
     void *p = NULL;
-    if (AHardwareBuffer_lock(g_blank, AHARDWAREBUFFER_USAGE_CPU_WRITE_RARELY, -1, NULL, &p) == 0 && p) {
-        AHardwareBuffer_Desc got; AHardwareBuffer_describe(g_blank, &got);
-        memset(p, 0, (size_t)got.stride * 4 * 16);
-        AHardwareBuffer_unlock(g_blank, NULL);
+    int locked = AHardwareBuffer_lock(g_blank, AHARDWAREBUFFER_USAGE_CPU_WRITE_RARELY, -1, NULL, &p);
+    if (locked != 0 || !p) {
+        if (locked == 0) AHardwareBuffer_unlock(g_blank, NULL);
+        AHardwareBuffer_release(g_blank); g_blank = NULL;
+        return NULL;
+    }
+    AHardwareBuffer_Desc got; AHardwareBuffer_describe(g_blank, &got);
+    memset(p, 0, (size_t)got.stride * 4 * got.height);
+    if (AHardwareBuffer_unlock(g_blank, NULL) != 0) {
+        AHardwareBuffer_release(g_blank); g_blank = NULL;
+        return NULL;
     }
     return g_blank;
 }
+
+int sc_layer_base_black(int width, int height) {
+    if (width <= 0 || height <= 0 || load_api() != 0 || !vkp_window()) return -1;
+    if (g_base_sc && g_base_shown && width == g_base_w && height == g_base_h) return 0;
+    AHardwareBuffer *black = blank_buffer();
+    if (!black) return -1;
+    if (!g_base_sc) g_base_sc = api.createFromWindow(vkp_window(), "droiddeck_wayland_black");
+    if (!g_base_sc) return -1;
+    ASurfaceTransaction *tx = api.txCreate();
+    if (!tx) return -1;
+    ARect src = {0, 0, 16, 16}, dst = {0, 0, width, height};
+    api.setBuffer(tx, g_base_sc, black, -1);
+    api.setBufferTransparency(tx, g_base_sc, ASC_TRANSPARENCY_OPAQUE);
+    api.setZOrder(tx, g_base_sc, 0); /* GAME = 1, OVERLAY = 2 */
+    api.setGeometry(tx, g_base_sc, &src, &dst, 0);
+    api.setVisibility(tx, g_base_sc, ASC_VISIBILITY_SHOW);
+    api.txApply(tx); api.txDelete(tx);
+    g_base_w = width; g_base_h = height; g_base_shown = 1;
+    return 0;
+}
+
+static void base_hide(int retire) {
+    if (!g_base_sc) return;
+    ASurfaceTransaction *tx = api.txCreate();
+    if (tx) {
+        api.setVisibility(tx, g_base_sc, ASC_VISIBILITY_HIDE);
+        if (retire) api.reparent(tx, g_base_sc, NULL);
+        api.txApply(tx); api.txDelete(tx);
+        g_base_shown = 0;
+    }
+    if (retire) {
+        api.release(g_base_sc); g_base_sc = NULL;
+        g_base_w = g_base_h = g_base_shown = 0;
+    }
+}
+
+void sc_layer_hide_base(void) { base_hide(0); }
 
 static void replace_with_blank(ASurfaceTransaction *tx, struct layer *l) {
     AHardwareBuffer *b = blank_buffer();
@@ -335,16 +381,12 @@ static int sniff_modifier(const struct droiddeck_native_handle *h, uint64_t *mod
     return 1;
 }
 
-/* A pool imported as AHardwareBuffers: the layout is whatever gralloc chose (linear, AFBC, ...) and
- * only the driver knows it. Not a DRM modifier - a marker for the log lines. */
 #define SC_MOD_GRALLOC (~0ULL - 1)
 
 static const char *pool_kind(uint64_t mod) {
     return mod == MOD_QCOM_COMPRESSED ? "UBWC" : mod == SC_MOD_GRALLOC ? "gralloc-laid-out" : "linear";
 }
 
-/* For the log, when a handle is not a QTI one: each fd's size (a dma-buf answers lseek(SEEK_END) with
- * its size) and the first ints - which fd holds the pixels, and enough to recognise the layout later. */
 static void describe_handle(const struct droiddeck_native_handle *h, char *out, size_t n) {
     size_t o = 0;
     out[0] = 0;
@@ -359,19 +401,8 @@ static void describe_handle(const struct droiddeck_native_handle *h, char *out, 
         o += (size_t)snprintf(out + o, n - o, " %#x", (unsigned)h->data[h->numFds + i]);
 }
 
-static int g_alloc_failed; /* set by alloc_slot when gralloc or the import refused a buffer */
+static int g_alloc_failed;
 
-/* How a layer's pool buffers are asked of gralloc, best first; a layer only ever moves down.
- *   TIER_UBWC   GPU render target + sampled + composer overlay + AHARDWAREBUFFER_USAGE_VENDOR_0 (bit 28):
- *               QTI gralloc's GRALLOC_USAGE_PRIVATE_ALLOC_UBWC. Without it QTI gralloc allocates LINEAR even
- *               for a GPU render target (gr_allocator.cpp IsUBwcEnabled: an explicit UBWC format, the
- *               private UBWC bit or CLIENT_TARGET, and no CPU bit). Whether gralloc really compressed the
- *               buffer is read back from its handle (sniff_modifier), never assumed.
- *   TIER_PLAIN  the same without the vendor bit (a gralloc that refuses unknown bits; what we asked before).
- *   TIER_LINEAR plus a CPU bit, so the layout is known to be linear even when the handle is unreadable.
- * A handle that is not QTI's (Arm/MediaTek gralloc on Mali) skips TIER_UBWC and is imported as an
- * AHardwareBuffer where the driver can (vkp_image_import_ahb): the driver then reads gralloc's own
- * layout, so nothing about it is guessed. Its linear dma-buf is imported directly only as a last resort. */
 enum { TIER_UBWC, TIER_PLAIN, TIER_LINEAR };
 #define DROIDDECK_AHB_USAGE_VENDOR_UBWC (1ULL << 28)
 
@@ -409,16 +440,11 @@ static int alloc_slot(struct layer *l, struct slot *s, int w, int h, uint32_t fm
         const char *path;
         char info[160] = "";
         if (sniff_modifier(nh, &mod)) {
-            /* QTI gralloc (Adreno): the dma-buf layout is read from the handle, exactly as before.
-             * The test create: vkp_image_import_dmabuf creates the image with gralloc's explicit layout,
-             * so a layout the compositor's Turnip refuses falls back a tier instead of drawing garbage. */
             img = vkp_image_import_dmabuf(nh->data[0], fmt == AHB_RGB10A2 ? DRM_ABGR2101010 : DRM_ABGR8888, mod, w, h,
                                           got.stride * 4, 0, 1);
             path = "dma-buf (QTI handle)";
         } else {
-            /* Not a handle we can read (Arm/MediaTek gralloc on Mali: "3 fds, 60 ints"). */
             if (tier == TIER_UBWC) {
-                /* The vendor bit is QTI's UBWC request; another gralloc gives it its own meaning. */
                 char hd[256];
                 describe_handle(nh, hd, sizeof(hd));
                 droiddeck_log("layer", "%s: gralloc handle is not a QTI one (%d fds, %d ints: %s): no UBWC request; "
@@ -429,14 +455,10 @@ static int alloc_slot(struct layer *l, struct slot *s, int w, int h, uint32_t fm
                 l->alloc_tier = vkp_can_import_ahb() ? TIER_PLAIN : TIER_LINEAR;
                 continue;
             }
-            /* The portable import: the driver takes the layout (linear, AFBC, ...) from gralloc itself. */
             mod = SC_MOD_GRALLOC;
             path = "AHardwareBuffer";
             img = vkp_image_import_ahb(ahb, info, sizeof(info));
             if (!img && tier == TIER_LINEAR) {
-                /* Last resort: asked for with a CPU bit, so the buffer is linear - import the handle's
-                 * dma-buf directly. The pixels' fd is the first one big enough to hold them (fds[0] on
-                 * every gralloc seen so far; logged, so a device where it differs shows it). */
                 const off_t need = (off_t)got.stride * 4 * h;
                 int fd = -1, which = -1;
                 for (int i = 0; nh && i < nh->numFds; i++) {
@@ -535,6 +557,14 @@ static int take_free_slot(struct layer *l, int w, int h, uint32_t fmt, int *wait
 
 
 int sc_layer_available(void) { return load_api() == 0; }
+
+int sc_layer_ahb_fds(const AHardwareBuffer *ahb, int *fds, int max) {
+    if (!ahb || load_api() != 0) return 0;
+    const struct droiddeck_native_handle *h = api.getNativeHandle(ahb);
+    int n = 0;
+    for (int i = 0; h && i < h->numFds && n < max; i++) fds[n++] = h->data[i];
+    return n;
+}
 
 void sc_layer_probe_dmabuf_fd(int fd) {
     static int done;
@@ -1004,6 +1034,7 @@ void sc_layer_hide_overlay(void) {
 }
 
 void sc_layer_window_gone(void) {
+    base_hide(1); /* the backdrop belongs to the old window, just like GAME and OVERLAY */
     if (api.state != 1) return;
     layers_init();
     for (int i = SC_LAYER_COUNT - 1; i >= 0; i--) retire_sc(&g_layers[i]);

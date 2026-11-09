@@ -62,14 +62,12 @@ class WebhelperPreloadTest(unittest.TestCase):
         self.assertEqual(self.argv(*args, spec="stock"), args)
 
     def test_angle_switches_are_appended_with_the_gpu_process_kept_out_of_process(self):
-        # droiddeck-session's BL_VKBRIDGE_CEF_ANGLE (Steam drops -cef-use-angle itself)
         out = self.argv(WEBHELPER, "-lang=en_US", "--enable-features=A", spec="--use-gl=angle --use-angle=vulkan")
         self.assertEqual(out, [WEBHELPER, "-lang=en_US", "--use-gl=angle", "--use-angle=vulkan",
                                "--enable-features=A"])
         self.assertNotIn("--in-process-gpu", out)
 
     def test_vulkan_compositing_features_join_steams_feature_list(self):
-        # droiddeck-session's layout for BL_VKBRIDGE_CEF_ANGLE=vulkan
         out = self.argv(WEBHELPER, "--enable-features=PlatformHEVCDecoderSupport,V4L2VideoDecode",
                         spec="--use-gl=angle --use-angle=vulkan +Vulkan +VulkanFromANGLE +DefaultANGLEVulkan")
         self.assertEqual(out, [WEBHELPER, "--use-gl=angle", "--use-angle=vulkan",

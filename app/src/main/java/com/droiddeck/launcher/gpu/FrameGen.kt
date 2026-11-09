@@ -7,12 +7,13 @@ import com.droiddeck.launcher.wayland.WaylandCompositor
 
 object FrameGen {
     const val ENGINE_OFF = "off"
-    const val ENGINE_WINFG = "winfg"
+    const val ENGINE_DDFG = "ddfg"
+    private const val LEGACY_ENGINE_WINFG = "winfg"
     const val ENGINE_LSFG = "lsfg"
 
-    private const val WINFG_PERF_PRESET = 2
-    private const val WINFG_MODEL = 4
-    private const val FLOW_SCALE_WINFG = 0.60f
+    private const val DDFG_PERF_PRESET = 2
+    private const val DDFG_MODEL = 4
+    private const val FLOW_SCALE_DDFG = 0.60f
     private const val FLOW_SCALE_LSFG = 0.80f
 
     val ADAPTIVE_TARGETS = listOf(120, 90, 60)
@@ -27,9 +28,25 @@ object FrameGen {
 
     fun engine(context: Context): String = mode(context).engine
 
+    /** Steam's own window (the client in Big Picture), as the app id gamescope reports it. */
+    const val STEAM_CLIENT_APP = 769L
+
+    /** True while the Steam client is what has focus and no game does: the focused app is the client, or nothing
+     *  is focused and the client is the only window. */
+    fun steamClientFocused(focusedApp: Long?, focusableApps: List<Long>): Boolean =
+        focusedApp == STEAM_CLIENT_APP ||
+            (focusedApp == null && focusableApps.isNotEmpty() && focusableApps.all { it == STEAM_CLIENT_APP })
+
+    /** What the compositor is armed with: the chosen mode, except off in a picture-in-picture window, in the
+     *  desktop (generated frames on the KDE desktop are pointless; a player log) and in a Steam session while no game
+     *  has focus (the Steam menu runs near 1 fps and generating frames for it only heats the phone; a player log). */
+    fun armedMode(sessionMode: String?, pip: Boolean, chosen: Mode, steamClientFocused: Boolean = false): Mode =
+        if (pip || sessionMode == com.droiddeck.launcher.session.SessionService.MODE_DESKTOP ||
+            (sessionMode == com.droiddeck.launcher.session.SessionService.MODE_STEAM && steamClientFocused)) Mode.OFF else chosen
+
     fun mode(context: Context): Mode {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val engine = prefs.getString("engine", ENGINE_OFF) ?: ENGINE_OFF
+        val engine = prefs.getString("engine", ENGINE_OFF).let { if (it == LEGACY_ENGINE_WINFG) ENGINE_DDFG else it ?: ENGINE_OFF }
         val target = prefs.getInt("target", 0)
         if (engine == ENGINE_LSFG && target in ADAPTIVE_TARGETS) return Mode(engine, target = target)
         return Mode(engine, prefs.getInt("multiplier", 2).coerceIn(2, 4))
@@ -43,14 +60,16 @@ object FrameGen {
     fun label(context: Context): String = label(context, mode(context))
 
     fun label(context: Context, mode: Mode): String = when {
-        mode.engine == ENGINE_WINFG -> context.getString(R.string.frame_gen_winfg, mode.multiplier)
+        mode.engine == ENGINE_DDFG -> context.getString(R.string.frame_gen_ddfg, mode.multiplier)
         mode.engine == ENGINE_LSFG && mode.target > 0 -> context.getString(R.string.frame_gen_lsfg_adaptive, mode.target)
         mode.engine == ENGINE_LSFG -> context.getString(R.string.frame_gen_lsfg, mode.multiplier)
         else -> context.getString(R.string.frame_gen_off)
     }
 
-    fun apply(context: Context, refreshHz: Float): String? {
-        val mode = mode(context)
+    fun apply(context: Context, refreshHz: Float): String? = apply(context, mode(context), refreshHz)
+
+    /** Arms [mode] in this process's compositor; the cloud player passes its own mode and frame-rate cap. */
+    fun apply(context: Context, mode: Mode, refreshHz: Float): String? {
         when (mode.engine) {
             ENGINE_LSFG -> {
                 val status = Lossless.sync(context)
@@ -68,10 +87,10 @@ object FrameGen {
                 WaylandCompositor.nativeSetFrameGenTuning(FLOW_SCALE_LSFG, refreshHz)
                 WaylandCompositor.nativeSetFrameGenArmed(true, mode.multiplier, mode.target)
             }
-            ENGINE_WINFG -> {
-                WaylandCompositor.nativeSetFrameGenEngine(WaylandCompositor.FG_ENGINE_WINFG)
-                WaylandCompositor.nativeSetWinFgTuning(WINFG_MODEL, WINFG_PERF_PRESET)
-                WaylandCompositor.nativeSetFrameGenTuning(FLOW_SCALE_WINFG, refreshHz)
+            ENGINE_DDFG -> {
+                WaylandCompositor.nativeSetFrameGenEngine(WaylandCompositor.FG_ENGINE_DDFG)
+                WaylandCompositor.nativeSetDdFgTuning(DDFG_MODEL, DDFG_PERF_PRESET)
+                WaylandCompositor.nativeSetFrameGenTuning(FLOW_SCALE_DDFG, refreshHz)
                 WaylandCompositor.nativeSetFrameGenArmed(true, mode.multiplier, 0)
             }
             else -> WaylandCompositor.nativeSetFrameGenArmed(false, 0, 0)

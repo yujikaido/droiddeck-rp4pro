@@ -12,7 +12,7 @@ import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import android.util.Log
-import com.droiddeck.launcher.MainActivity
+import com.droiddeck.launcher.FrontEndActivity
 import com.droiddeck.launcher.R
 
 /* Keeps a Send logs upload alive while the player is away from the app. Without it Android 16 cuts
@@ -101,7 +101,7 @@ class LogUploadService : Service() {
                 nm.createNotificationChannel(NotificationChannel(CHANNEL, context.getString(R.string.logsend_progress_channel), NotificationManager.IMPORTANCE_LOW)
                     .apply { setShowBadge(false) })
             val open = PendingIntent.getActivity(context, LogUpload.NOTIFICATION_ID,
-                Intent(context, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP),
+                Intent(context, FrontEndActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP),
                 PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
             return Notification.Builder(context, CHANNEL).setSmallIcon(R.drawable.ic_stat_session)
                 .setContentTitle(context.getString(R.string.logsend_title))

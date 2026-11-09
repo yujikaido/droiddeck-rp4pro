@@ -14,7 +14,7 @@ import android.os.IBinder
 import android.os.PowerManager
 import android.text.format.Formatter
 import android.util.Log
-import com.droiddeck.launcher.MainActivity
+import com.droiddeck.launcher.FrontEndActivity
 import com.droiddeck.launcher.R
 
 /* Holds the app up while the Network page copies: a dataSync foreground service with a progress notification,
@@ -104,7 +104,7 @@ class NetTransferService : Service() {
                 nm.createNotificationChannel(NotificationChannel(CHANNEL, context.getString(R.string.net_channel), NotificationManager.IMPORTANCE_LOW)
                     .apply { setShowBadge(false) })
             val open = PendingIntent.getActivity(context, NOTIFICATION_ID,
-                Intent(context, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP),
+                Intent(context, FrontEndActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP),
                 PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
             val job = NetTransfers.jobs.firstOrNull { it.active }
             val b = Notification.Builder(context, CHANNEL).setSmallIcon(R.drawable.ic_stat_session)

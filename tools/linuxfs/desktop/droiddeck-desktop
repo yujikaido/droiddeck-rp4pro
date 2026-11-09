@@ -11,7 +11,11 @@ export MOZ_DISABLE_CONTENT_SANDBOX=1 MOZ_DISABLE_GMP_SANDBOX=1 MOZ_DISABLE_RDD_S
 export MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1 MOZ_DISABLE_UTILITY_SANDBOX=1
 export MOZ_SHM_NO_SEALS=1
 export KWIN_COMPOSE=Q QT_QUICK_BACKEND=software LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe
+export KWIN_USE_OVERLAYS=0
 [ -e /etc/mpv/mpv.conf ] || { mkdir -p /etc/mpv && echo gpu-sw=yes >/etc/mpv/mpv.conf; } 2>/dev/null
+for conf in client client-rt; do
+  mkdir -p "/etc/pipewire/$conf.conf.d" && printf 'context.properties = {\n    module.rt = false\n}\n' >"/etc/pipewire/$conf.conf.d/droiddeck-rt.conf"
+done 2>/dev/null
 export DROIDDECK_NESTED_SCALE=1
 export DROIDDECK_GLTHREAD=${mesa_glthread:-}
 unset MESA_LOADER_DRIVER_OVERRIDE LIBGL_KOPPER_DRI2 mesa_glthread
@@ -27,10 +31,33 @@ export BL_DESKTOP=1
 ln -sf /usr/local/bin/droiddeck-steam-launch /usr/local/bin/steamdeck-steam 2>/dev/null
 ln -sf /usr/local/bin/droiddeck-steam-shim /usr/local/bin/steam 2>/dev/null
 python3 /usr/local/bin/droiddeck-desktop-games 2>&1 | sed 's/^/[games] /'
+cat > /usr/share/applications/droiddeck-steam-x64.desktop <<'ENTRY'
+[Desktop Entry]
+Type=Application
+Name=Steam x86-64 (FEX, experimental)
+Comment=Valve's x86-64 Linux client under FEX, in its own home with its own login
+Exec=konsole -e /usr/local/bin/droiddeck-steam-x64
+Icon=steam
+Categories=System;
+ENTRY
 python3 /usr/local/bin/droiddeck-pad-defaults 2>&1 | sed 's/^/[pads] /'
 ( while sleep 30; do python3 /usr/local/bin/droiddeck-pad-defaults 2>&1 | sed 's/^/[pads] /'; done ) &
 python3 /usr/local/bin/droiddeck-desktop-gpu 2>&1 | sed 's/^/[gpu] /'
 /usr/local/bin/droiddeck-desktop-window-rules 2>&1 | sed 's/^/[rules] /'
+( python3 /usr/local/bin/droiddeck-library-perms 2>&1 | sed 's/^/[perms] /' ) &
+mkdir -p /usr/local/share/applications
+cat > /usr/local/share/applications/droiddeck-ime.desktop <<'ENTRY'
+[Desktop Entry]
+Type=Application
+Name=Android keyboard
+Exec=/usr/local/bin/droiddeck-ime
+NoDisplay=true
+X-KDE-Wayland-VirtualKeyboard=true
+ENTRY
+input_method=$(kreadconfig6 --file kwinrc --group Wayland --key InputMethod 2>/dev/null)
+case $input_method in
+  ''|*/droiddeck-ime.desktop) kwriteconfig6 --file kwinrc --group Wayland --key InputMethod /usr/local/share/applications/droiddeck-ime.desktop ;;
+esac
 python3 /usr/local/bin/droiddeck-open --install 2>&1 | sed 's/^/[open] /'
 export APPIMAGE_EXTRACT_AND_RUN=1
 [ -e /etc/xdg/kiorc ] || printf '[Executable scripts]\nbehaviourOnLaunch=execute\n' >/etc/xdg/kiorc 2>/dev/null
@@ -43,6 +70,19 @@ if [ ! -e "$HOME/.config/droiddeck-desktop-icons" ]; then
   touch "$HOME/.config/droiddeck-desktop-icons"
 fi
 [ -f "$desktop_dir/Return.desktop" ] && cp -f /usr/share/applications/droiddeck-return-gaming.desktop "$desktop_dir/Return.desktop" 2>/dev/null
+if command -v flatpak >/dev/null 2>&1 && [ ! -d /var/lib/pacman ]; then
+  FLATPAK_BWRAP=/usr/local/bin/droiddeck-bwrap flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo >/dev/null 2>&1 &
+fi
+skel_done=$HOME/.local/share/droiddeck/skel-copied
+if [ -d /etc/skel ] && [ ! -e "$skel_done" ]; then
+  cp -rn /etc/skel/. "$HOME/" 2>/dev/null
+  mkdir -p "${skel_done%/*}" && : > "$skel_done"
+fi
+if [ -x /usr/lib/snapd/snap-confine ] && [ ! -d /var/lib/pacman ]; then
+  /usr/local/bin/droiddeck-snapd >/dev/null 2>&1 &
+  export XDG_DATA_DIRS=/var/lib/snapd/desktop:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}
+  export PATH=$PATH:/snap/bin
+fi
 update-mime-database /usr/share/mime >/dev/null 2>&1 &
 [ -f /usr/share/icons/hicolor/icon-theme.cache ] || gtk-update-icon-cache -q -t /usr/share/icons/hicolor 2>/dev/null &
 [ -f /usr/share/glib-2.0/schemas/gschemas.compiled ] || glib-compile-schemas /usr/share/glib-2.0/schemas 2>/dev/null
@@ -64,6 +104,49 @@ if [ -f "$HOME/.droiddeck-remote-run" ]; then
     done
   ) &
 fi
+# The package's marker asks for KWin on OpenGL (Zink). That needs a render node KWin can open: the
+# Adreno/KGSL node works. Under the Mali bridge the only node is the bridge's stand-in (a bound
+# /dev/mali0 or Xclipse node, uevent DRIVER=mali), which the host's dma-buf feedback cannot name, so an
+# unpatched KWin finds no device ("Failed to open drm node: \"\"", black desktop; v0.5.5 logs) and only
+# its software (QPainter) compositor works. DroidDeck's own KWin build (desktop package r3+, KWin 6.8,
+# which has no QPainter compositor any more) carries 0002-select-explicit-nested-render-node.patch:
+# given KWIN_RENDER_NODES it takes that node and composites on Zink over the bridge (DroidDeck
+# Preview, G615: "Using explicitly selected nested render node /dev/dri/renderD105", a working
+# desktop). So on Mali: that KWin gets the stand-in node and the GPU; any other KWin keeps software.
+# BL_DESKTOP_KWIN=software keeps software on the patched KWin too (for an A/B).
+droiddeck_kwin_select() {
+  [ "$(cat "${DD_KWIN_MARKER:-/usr/share/droiddeck/kwin-compositor}" 2>/dev/null)" = opengl ] || return 0
+  local _uevent _name _node=
+  for _uevent in "${DD_SYS_CHAR:-/sys/dev/char}"/*/device/uevent; do
+    grep -qs '^DRIVER=mali' "$_uevent" || continue
+    for _name in "${_uevent%/uevent}"/drm/renderD*; do
+      _name=${_name##*/}
+      case $_name in renderD[0-9]*) ;; *) continue ;; esac
+      if [ ${DD_NODE_TEST:--c} "${DD_DEV_DRI:-/dev/dri}/$_name" ]; then _node=${DD_DEV_DRI:-/dev/dri}/$_name; break 2; fi
+    done
+    _node=none
+  done
+  if [ -n "$_node" ]; then
+    # shellcheck disable=SC2086
+    if [ "$_node" = none ] || [ "${BL_DESKTOP_KWIN:-auto}" = software ] ||
+       ! grep -aqsF 'explicitly selected nested render node' ${DD_KWIN_LIBS:-/usr/lib/libkwin.so.* /usr/lib/aarch64-linux-gnu/libkwin.so.*}; then
+      echo "== droiddeck-desktop: Mali bridge render node, KWin keeps the software compositor"
+      return 0
+    fi
+    echo "== droiddeck-desktop: Mali bridge render node $_node, KWin composites on the GPU (Zink over the bridge)"
+    [ -n "${KWIN_RENDER_NODES:-}" ] || export KWIN_RENDER_NODES=$_node
+  fi
+  unset LIBGL_ALWAYS_SOFTWARE QT_QUICK_BACKEND
+  export KWIN_COMPOSE=O2 MESA_LOADER_DRIVER_OVERRIDE=zink GALLIUM_DRIVER=zink LIBGL_KOPPER_DRI2=true
+  if [ -z "${KWIN_RENDER_NODES:-}" ] && [ ${DD_NODE_TEST:--c} "${DD_RENDER_NODE:-/dev/dri/renderD0}" ]; then
+    export KWIN_RENDER_NODES=${DD_RENDER_NODE:-/dev/dri/renderD0}
+  fi
+  mkdir -p "${DD_KWIN_WRAP:-/run/droiddeck/kwin}"
+  printf '#!/bin/sh\nGALLIUM_THREAD=0 exec /usr/bin/kwin_wayland "$@"\n' > "${DD_KWIN_WRAP:-/run/droiddeck/kwin}/kwin_wayland"
+  chmod 755 "${DD_KWIN_WRAP:-/run/droiddeck/kwin}/kwin_wayland"
+  export PATH=${DD_KWIN_WRAP:-/run/droiddeck/kwin}:$PATH
+}
+droiddeck_kwin_select
 echo "== droiddeck-desktop: Plasma on $WAYLAND_DISPLAY"
 dbus-run-session -- startplasma-wayland
 rc=$?

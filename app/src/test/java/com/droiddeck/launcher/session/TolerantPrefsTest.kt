@@ -24,21 +24,21 @@ class TolerantPrefsTest {
     @Test
     fun theHudSettingStoredAsTextIsReadAndStoredAgainAsOnOff() {
         SessionState.mode = SessionService.MODE_STEAM
-        raw.edit().putString("hudDeck", "true").commit()
+        raw.edit().putString("hud", "true").commit()
         assertTrue(SessionPrefs.hudEnabled(context))
-        assertEquals(true, raw.all["hudDeck"])
-        raw.edit().putString("hudDeck", "false").commit()
+        assertEquals(true, raw.all["hud"])
+        raw.edit().putString("hud", "false").commit()
         assertFalse(SessionPrefs.hudEnabled(context))
-        assertEquals(false, raw.all["hudDeck"])
+        assertEquals(false, raw.all["hud"])
     }
 
     @Test
     fun textThatIsNotOnOrOffFallsBackToTheDefaultAndIsRemoved() {
         SessionState.mode = SessionService.MODE_STEAM
-        raw.edit().putString("hudDeck", "maybe").commit()
-        // In a Steam session with mangoapp the HUD is off by default.
+        raw.edit().putString("hud", "maybe").commit()
+        // The HUD is off by default.
         assertFalse(SessionPrefs.hudEnabled(context))
-        assertFalse(raw.contains("hudDeck"))
+        assertFalse(raw.contains("hud"))
     }
 
     @Test

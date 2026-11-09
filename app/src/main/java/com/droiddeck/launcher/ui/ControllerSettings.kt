@@ -29,6 +29,7 @@ class ControllerActions(
     val onQamButton: (Boolean) -> Unit,
     val onKeyboardButton: (Boolean) -> Unit,
     val onSelectSteam: (Boolean) -> Unit,
+    val onJoyConVr: (Boolean) -> Unit,
     val onEditLayout: () -> Unit,
     val onResetLayout: () -> Unit,
     val onMapping: () -> Unit,
@@ -72,6 +73,7 @@ fun ColumnScope.ControllerRows(host: MenuHost, oscMode: String, c: ControllerPre
     ToggleRow(host, "controller-qam", stringResource(R.string.ctrl_qam_button), null, c.qamButton, onChange = a.onQamButton)
     ToggleRow(host, "controller-keyboard", stringResource(R.string.ctrl_keyboard_button), null, c.keyboardButton, onChange = a.onKeyboardButton)
     ToggleRow(host, "controller-select-steam", stringResource(R.string.ctrl_select_steam), stringResource(R.string.ctrl_select_steam_hint), c.selectSteam, onChange = a.onSelectSteam)
+    ToggleRow(host, "controller-joycon-vr", stringResource(R.string.ctrl_joycon_vr), stringResource(R.string.ctrl_joycon_vr_hint), c.joyConVr, onChange = a.onJoyConVr)
     SettingsRow(stringResource(R.string.ctrl_layout), if (c.customLayout) stringResource(R.string.ctrl_layout_custom) else stringResource(R.string.ctrl_layout_default)) {
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             SecondaryButton(stringResource(R.string.ctrl_edit)) { a.onEditLayout() }
@@ -91,6 +93,9 @@ fun ControllerMappingPage(mapping: Map<String, String>, onPick: (String, String)
         lede = stringResource(R.string.ctrl_mapping_lede),
         onBack = onBack,
     ) {
+        SettingsGroup(stringResource(R.string.shortcuts_title)) {
+            PhysicalShortcutRows()
+        }
         SettingsGroup(stringResource(R.string.ctrl_onscreen_buttons)) {
             val targets = ControllerPrefs.targets.map { (id, label) -> id to stringResource(label) }
             for ((id, name) in ControllerPrefs.mappable) {

@@ -23,8 +23,6 @@ def wait_functions():
 
 
 class VkBridgeSocketWaitTest(unittest.TestCase):
-    """The session script waits for the bridge server's socket instead of testing it once."""
-
     def setUp(self):
         self.root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.root, True)
@@ -67,7 +65,6 @@ class VkBridgeSocketWaitTest(unittest.TestCase):
         self.assertLess(elapsed, 2)
 
     def test_a_server_still_probing_is_waited_for(self):
-        # A fresh startup probe after an update: the socket comes 0.4 s after the check starts.
         self.listen_after(0.4)
         out, elapsed = self.run_wait(10000)
         self.assertTrue(out.endswith("USABLE\n"), out)
@@ -105,7 +102,6 @@ class VkBridgeSocketWaitTest(unittest.TestCase):
 
 
 class VkBridgeSessionCheckTest(unittest.TestCase):
-    """How the script wires the wait into its bridge check."""
 
     def setUp(self):
         self.text = SESSION.read_text()
@@ -125,6 +121,28 @@ class VkBridgeSessionCheckTest(unittest.TestCase):
 
     def test_a_stop_ends_the_wait(self):
         self.assertRegex(self.text, r"trap '[^']*bl_stopping=1[^']*' TERM INT HUP")
+
+    def run_block(self, mode, inside=False):
+        # The real block with the socket wait stubbed out: no ICD, library or socket on this host, so the
+        # bridge is never usable here.
+        script = ("set -u\nvkbridge_wait_socket() { return 1; }\nstep() { :; }\n"
+                  "mode=$1\nBL_VKBRIDGE=1\nVKBRIDGE_SOCKET=/nonexistent/server.sock\n" +
+                  ("BL_INSIDE=1\n" if inside else "unset BL_INSIDE\n") + self.block + "echo CONTINUED\n")
+        return subprocess.run(["bash", "-c", script, "session", mode], capture_output=True, text=True, timeout=30)
+
+    def test_a_steam_session_without_the_bridge_ends_with_the_reason(self):
+        done = self.run_block("steam")
+        self.assertEqual(69, done.returncode, done.stdout + done.stderr)
+        self.assertIn("Mali bridge requested but NOT usable", done.stdout)
+        self.assertIn("== vulkan driver: the Steam session cannot start without the Mali bridge; ending it", done.stdout)
+        self.assertNotIn("CONTINUED", done.stdout)
+
+    def test_the_desktop_programs_and_inner_passes_carry_on_without_the_bridge(self):
+        for mode, inside in (("lxqt", False), ("desktop", False), ("run", False), ("steam", True)):
+            done = self.run_block(mode, inside)
+            self.assertEqual(0, done.returncode, (mode, inside, done.stdout + done.stderr))
+            self.assertIn("CONTINUED", done.stdout, (mode, inside))
+            self.assertNotIn("cannot start without the Mali bridge", done.stdout, (mode, inside))
 
 
 if __name__ == "__main__":

@@ -168,10 +168,11 @@ internal class MaliUpdatesMenu(private val activity: Activity, private val ui: H
         if (!SelfInstaller.canInstall(activity)) { pendingInstall = true; askPermission = true; return }
         error = null
         phase = MaliUpdateState.Phase.INSTALLING
+        session = -1
         Thread({
             val result = runCatching {
                 MaliUpdater.verifyReady(activity, r, file)
-                SelfInstaller.install(activity, file)
+                SelfInstaller.install(activity, file) { id -> session = id }
             }
             result.onFailure { e ->
                 ui.post {
@@ -186,13 +187,15 @@ internal class MaliUpdatesMenu(private val activity: Activity, private val ui: H
     /** PackageInstaller's answer, as UpdatesMenu's receiver hears it. */
     fun onInstallStatus(intent: Intent) {
         if (phase != MaliUpdateState.Phase.INSTALLING && phase != MaliUpdateState.Phase.CONFIRM) return
+        if (intent.getIntExtra(PackageInstaller.EXTRA_SESSION_ID, -1).let { it < 0 || it != session }) return
         when (val status = intent.getIntExtra(PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_FAILURE)) {
             PackageInstaller.STATUS_PENDING_USER_ACTION -> {
                 val confirm = if (Build.VERSION.SDK_INT >= 33) intent.getParcelableExtra(Intent.EXTRA_INTENT, Intent::class.java)
                 else @Suppress("DEPRECATION") intent.getParcelableExtra(Intent.EXTRA_INTENT)
-                if (confirm == null) { phase = MaliUpdateState.Phase.READY; error = activity.getString(R.string.upd_not_offered); return }
+                val safe = confirm?.let { SelfInstaller.safeConfirmIntent(activity, it) }
+                if (safe == null) { phase = MaliUpdateState.Phase.READY; error = activity.getString(R.string.upd_not_offered); return }
                 phase = MaliUpdateState.Phase.CONFIRM
-                activity.startActivity(confirm.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                if (runCatching { activity.startActivity(safe) }.isFailure) { phase = MaliUpdateState.Phase.READY; error = activity.getString(R.string.upd_not_offered) }
             }
             PackageInstaller.STATUS_SUCCESS -> phase = MaliUpdateState.Phase.IDLE
             else -> {
@@ -201,6 +204,8 @@ internal class MaliUpdatesMenu(private val activity: Activity, private val ui: H
             }
         }
     }
+
+    @Volatile private var session = -1
 
     fun stop() { stopDownload = true }
 

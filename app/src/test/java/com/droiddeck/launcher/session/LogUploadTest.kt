@@ -307,4 +307,40 @@ class LogUploadTest {
         val started = shadowOf(app).nextStartedService
         assertEquals(LogUploadService::class.java.name, started.component!!.className)
     }
+
+    private fun siteLink(d: AlertDialog): android.view.View? = d.window!!.decorView.findViewWithTag<android.view.View>("site-link")
+
+    @Test fun theCodeDialogOffersTheMaliBridgeSiteAndTheLinkOpensTheBrowser() {
+        resumed()
+        LogUpload.begin()
+        LogUpload.finished(app, Result.success("ML-SITE"))
+        val d = latestDialog()!!
+        val link = siteLink(d) as android.widget.TextView
+        assertEquals("See how games run on your phone and share your results on MaliBridge.com", link.text.toString())
+        link.performClick()
+        val started = shadowOf(app).nextStartedActivity
+        assertEquals(Intent.ACTION_VIEW, started.action)
+        assertEquals("https://malibridge.com/", started.data.toString())
+        assertTrue(d.isShowing)
+    }
+
+    @Test fun noBrowserLeavesTheDialogWorking() {
+        resumed()
+        LogUpload.begin()
+        LogUpload.finished(app, Result.success("ML-NOBR"))
+        val d = latestDialog()!!
+        shadowOf(app).checkActivities(true)
+        siteLink(d)!!.performClick()
+        assertTrue(d.isShowing)
+        assertEquals("ML-NOBR", LogUpload.LastCode.read(app))
+    }
+
+    @Test fun aFailedUploadShowsNoSiteLink() {
+        resumed()
+        LogUpload.begin()
+        LogUpload.finished(app, Result.failure(Exception("HTTP 500")))
+        shadowOf(Looper.getMainLooper()).idle()
+        val d = latestDialog()
+        assertTrue(d == null || siteLink(d) == null)
+    }
 }

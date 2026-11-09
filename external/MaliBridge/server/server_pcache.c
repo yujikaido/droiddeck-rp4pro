@@ -76,6 +76,14 @@
 #define PC_MAX_MB_MAX_BIGRAM 256u /* from 12 GB of RAM (see the top) */
 #define PC_BIGRAM_MB (12000u - 1000u) /* MemTotal of a "12 GB" phone reads ~11.2-11.6 GB */
 #define PC_MAX_MB_UNKNOWN_RAM 64u
+/* While the memory free is over PC_OVER_FREE_X times the limit, a program's cache may reach PC_OVER_X times it:
+ * Steam's pre-caching with the game's own file was left out for being over the limit together (a player log, a
+ * 15 GB phone with 7.5 GB free: 122 MB + 130 MB over 242 MB), and the game's shaders compiled again at
+ * every start. VKBRIDGE_PCACHE_OVER_X=<n>: the factor (1: off, the limit is hard). A merge still needs three
+ * times its size free and a file is loaded only with twice its size free (both below), and a file over the
+ * plain limit is kept as it is when the memory is not there at a start. */
+#define PC_OVER_X_DEFAULT 2u
+#define PC_OVER_FREE_X 4u
 #define PC_MAX_MB_SET_MAX (1u << 20) /* VKBRIDGE_PCACHE_MAX_MB above this is taken as this */
 /* A <file>.<pid>.<n>.tmp left by a killed save (its size reserved in full) goes at the next trim
  * once its process is gone, or after this long whatever its pid (pids are reused). */
@@ -127,13 +135,16 @@ typedef struct vkb_pcache {
     pc_ident file;        /* the file as this cache last read or wrote it */
     int covers;           /* the file holds nothing `cache` lacks (it was written from it alone) */
     int full_warned;
+    int full;             /* ours alone was over the limit at a save: never written again, so app caches are no longer merged into it (atomic) */
+    unsigned reloads;     /* times it went back to the file past the limit (reload) */
     int over_warned;      /* warn_over said for this device */
     int nomerge_warned;   /* a merge skipped for want of memory, said */
     int not_loaded;       /* the file was left unloaded for want of memory: saves only merge into it */
     int keep_warned;      /* a save skipped to keep that file, said */
     int alone_warned;     /* a save of ours alone in place of a merge over the limit, said */
     uint64_t beside;      /* Steam's pre-caching: the size of the game's own file, which the limit leaves room for */
-    uint64_t max;         /* the per-program limit in bytes (file_limit at the device's start) */
+    uint64_t max;         /* the per-program limit in bytes (file_limit at the device's start; raised to max_ext when the cache was over it with plenty of memory free) */
+    uint64_t max_ext;     /* the most it may be raised to (PC_OVER_X times file_limit, within the total limit) */
     int save_err;         /* errno of the last failed save, said once (0: the last one worked) */
     int warm_role;        /* Steam's shader pre-caching (key steam<id>.run/.dl) */
     time_t last_save;     /* CLOCK_MONOTONIC seconds */
@@ -472,6 +483,25 @@ static const char *limit_str(char out[32], uint64_t bytes)
     return out;
 }
 
+/* The most a program's file may reach when memory is plentiful: PC_OVER_X times its limit, within the total limit. */
+static uint64_t over_limit(uint64_t max)
+{
+    const char *v = vkb_srv_env("VKBRIDGE_PCACHE_OVER_X");
+    uint64_t x = v && *v ? strtoull(v, NULL, 10) : PC_OVER_X_DEFAULT;
+    if (x < 1) x = 1;
+    if (x > 16) x = 16;
+    uint64_t total = total_limit(), ext = max * x;
+    if (total && ext > total) ext = total;
+    return ext < max ? max : ext;
+}
+
+/* Is there room to go over the limit: the memory free is over PC_OVER_FREE_X times it (unknown: no). */
+static int over_ok(const vkb_pcache *p)
+{
+    uint64_t avail_kb = vkb_memavail_kb();
+    return p->max_ext > p->max && avail_kb && avail_kb > (p->max >> 10) * PC_OVER_FREE_X;
+}
+
 static time_t mono_s(void);
 
 /* <name> (in d) is a save's <file>.vkpc.<pid>[.<n>].tmp: removed when its process is gone, or when
@@ -792,8 +822,9 @@ static void warn_full(vkb_pcache *p, size_t size, int merged)
     char lim[32], beside[64] = "";
     if (p->warm_role) snprintf(beside, sizeof(beside), " (beside the game's own %llu KB)", (unsigned long long)(p->beside >> 10));
     VKB_WARN("device %u: pipeline cache %s would be %zu KB%s, over the %s limit for one program%s (VKBRIDGE_PCACHE_MAX_MB): the file "
-             "keeps what it has, pipelines compiled from now on are not saved (they stay in the driver's memory until the device goes)",
-             p->t->id, p->path, size >> 10, merged ? " with what another process saved" : "", limit_str(lim, p->max), beside);
+             "keeps what it has, pipelines compiled from now on are not saved (they stay in the driver's memory until the device goes%s)",
+             p->t->id, p->path, size >> 10, merged ? " with what another process saved" : "", limit_str(lim, p->max), beside,
+             merged ? "" : "; the app's own caches are no longer copied into this one, and once it is half the limit over it, it goes back to what the file holds");
 }
 
 /* A file over the limit (a lower limit than when it was saved) is not loaded, and the next save
@@ -813,6 +844,11 @@ static int merge_apps(vkb_pcache *p, int all)
 {
     vkb_srv_table *t = p->t;
     int n = 0;
+    /* Past the limit nothing of ours is saved again, and a merge only grows ours by a copy of what
+     * the app's cache already holds in the driver: Detroit: Become Human (a player log, G925) compiled
+     * into its own caches for 17 minutes and ours grew to 598 MB beside a 179 MB limit, part of the
+     * server heap growing by ~110 MB a minute until it aborted. */
+    if (__atomic_load_n(&p->full, __ATOMIC_RELAXED)) return 0;
     pthread_mutex_lock(&p->alock);
     for (pc_app *a = p->apps; a; a = a->next) {
         if (a->extsync || (!all && !a->used)) continue;
@@ -862,6 +898,7 @@ static void save_body(vkb_pcache *p, uint64_t t0, const char *when)
         return;
     }
     if (own > p->max) {
+        __atomic_store_n(&p->full, 1, __ATOMIC_RELAXED); /* caches only grow, and the limit stays: for good */
         warn_full(p, own, 0);
         return;
     }
@@ -966,6 +1003,91 @@ static time_t mono_s(void)
     return ts.tv_sec;
 }
 
+/* Past the limit (p->full) nothing of the cache is saved again, yet every pipeline made without a
+ * cache of the app's own (DXVK and vkd3d-proton pass none) still goes into it: it grew with each new
+ * pipeline for the rest of the session, in the driver's heap of the server (a4e691e stopped the
+ * copies of the app's caches; this is the other way in). Once it is PC_FULL_SLACK_DIV-th of the
+ * limit over it, it goes back to what the file holds: the pipelines of earlier sessions keep being
+ * found, only the ones of this session past the limit (never saved anyway) are compiled again if the
+ * game makes them again. VKBRIDGE_PCACHE_FULL_RELOAD=0: not (the cache grows as before). */
+#define PC_FULL_SLACK_DIV 2
+/* How long the saver tries for the write lock at a swap (compiles hold the read lock while the
+ * driver works; they are never made to wait for it): tried again at the next save otherwise. */
+#define PC_SWAP_TRY_MS 500
+
+static int full_reload_on(void)
+{
+    const char *v = vkb_srv_env_global("VKBRIDGE_PCACHE_FULL_RELOAD");
+    return !(v && !strcmp(v, "0"));
+}
+
+static uint64_t full_ceiling(const vkb_pcache *p) { return p->max + p->max / PC_FULL_SLACK_DIV; }
+
+/* Called by the saver (save_lock held, so the cache stays). The new cache is made beside the old
+ * one, from the file and the pre-caching files not yet in it, the way the device's start loads them;
+ * with less than twice the file's size free (where a start would not load it) it starts empty and
+ * the file is kept as it is (not_loaded: saves only merge into it). */
+static void reload(vkb_pcache *p)
+{
+    vkb_srv_table *t = p->t;
+    uint64_t t0 = vkb_hitch_now();
+    size_t was = __atomic_load_n(&p->mem_size, __ATOMIC_RELAXED), size = 0;
+    pc_ident id = {0};
+    pc_map fm = {NULL, 0, 0, 0};
+    int load = !p->warm_role && !p->not_loaded;
+    if (load) fm = map_file(p->path, p->max, &id);
+    uint64_t avail = vkb_memavail_kb();
+    int short_mem = fm.data && avail && avail < ((uint64_t)fm.size * 2 >> 10);
+    VkPipelineCache nc = short_mem ? VK_NULL_HANDLE : cache_from(t, fm.data, fm.size);
+    if (nc) size = fm.size;
+    unmap_file(&fm);
+    if (!nc) {
+        VkPipelineCacheCreateInfo ci = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, NULL, 0, 0, NULL};
+        if (t->real.vkCreatePipelineCache(t->device, &ci, NULL, &nc) != VK_SUCCESS) return; /* the next save tries again */
+    }
+    for (int i = 0; nc && load && !short_mem && i < p->nwarm; i++) {
+        pc_map wm = map_file(p->warm[i], p->max, NULL);
+        VkPipelineCache tmp = wm.data && size + wm.size <= p->max ? cache_from(t, wm.data, wm.size) : VK_NULL_HANDLE;
+        if (tmp && t->real.vkMergePipelineCaches(t->device, nc, 1, &tmp) == VK_SUCCESS) size += wm.size;
+        if (tmp) t->real.vkDestroyPipelineCache(t->device, tmp, NULL);
+        unmap_file(&wm);
+    }
+    int locked = 0;
+    for (int i = 0; i < PC_SWAP_TRY_MS && !(locked = pthread_rwlock_trywrlock(&p->use) == 0); i++) {
+        struct timespec ms = {0, 1000000};
+        nanosleep(&ms, NULL);
+    }
+    if (!locked) {
+        t->real.vkDestroyPipelineCache(t->device, nc, NULL);
+        return;
+    }
+    VkPipelineCache old = p->cache;
+    p->cache = nc;
+    pthread_rwlock_unlock(&p->use);
+    t->real.vkDestroyPipelineCache(t->device, old, NULL);
+    size_t now = 0;
+    t->real.vkGetPipelineCacheData(t->device, nc, &now, NULL);
+    __atomic_store_n(&p->mem_size, now, __ATOMIC_RELAXED);
+    p->saved_size = now;
+    if (short_mem) {
+        p->not_loaded = 1;
+        p->covers = 0;
+    } else if (size) {
+        p->file = id;
+        p->covers = 1; /* as at the start: made from the file (and pre-caching files it lacks) */
+    } else {
+        p->covers = 0; /* empty: the file (if any) holds what this one lacks */
+    }
+    p->reloads++;
+    /* said the first 3 times, then every 10th (a replay's cache with no room beside the game's file goes back at every save) */
+    if (p->reloads > 3 && p->reloads % 10) return;
+    char lim[32];
+    VKB_INFO("device %u: pipeline cache past its limit (%s) grew to %zu KB in memory, not saved: back to %s (%zu KB) in %.1f ms (%u time%s)", t->id,
+             limit_str(lim, p->max), was >> 10,
+             short_mem ? "empty, the memory free is under twice the file's size (the file is kept)" : size ? "what the file holds" : "empty", now >> 10,
+             (vkb_hitch_now() - t0) / 1e6, p->reloads, p->reloads == 1 ? "" : "s");
+}
+
 static void *saver(void *arg)
 {
     (void)arg;
@@ -985,6 +1107,9 @@ static void *saver(void *arg)
                 merge_apps(p, 0);
                 save(p, "in the background");
                 p->last_save = now;
+                if (__atomic_load_n(&p->full, __ATOMIC_RELAXED) && full_reload_on() &&
+                    __atomic_load_n(&p->mem_size, __ATOMIC_RELAXED) > full_ceiling(p))
+                    reload(p);
             }
             pthread_mutex_lock(&pc_lock);
             p = p->next;
@@ -1060,9 +1185,11 @@ static VkResult VKAPI_CALL pc_CreatePipelineCache(VkDevice device, const VkPipel
     } else {
         size_t size = 0;
         uint8_t *buf = NULL;
+        pthread_rwlock_rdlock(&p->use); /* the saver may swap the cache (reload) */
         if (p->t->real.vkGetPipelineCacheData(device, p->cache, &size, NULL) == VK_SUCCESS && size && size <= PC_SEED_MAX &&
             (buf = malloc(size)) && p->t->real.vkGetPipelineCacheData(device, p->cache, &size, buf) != VK_SUCCESS)
             size = 0;
+        pthread_rwlock_unlock(&p->use);
         VkPipelineCacheCreateInfo seeded = *ci;
         seeded.initialDataSize = buf ? size : 0;
         seeded.pInitialData = buf;
@@ -1094,7 +1221,7 @@ static void VKAPI_CALL pc_DestroyPipelineCache(VkDevice device, VkPipelineCache 
             break;
         }
     }
-    if (cache != p->cache && !(app && app->extsync)) {
+    if (cache != p->cache && !(app && app->extsync) && !__atomic_load_n(&p->full, __ATOMIC_RELAXED)) {
         pthread_rwlock_wrlock(&p->use);
         if (p->t->real.vkMergePipelineCaches(device, p->cache, 1, &cache) == VK_SUCCESS)
             __atomic_store_n(&p->dirty, 1, __ATOMIC_RELAXED);
@@ -1127,6 +1254,7 @@ void vkb_pcache_device_init(vkb_srv_table *t)
     if (!p) return;
     p->t = t;
     p->max = file_limit();
+    p->max_ext = over_limit(p->max);
     char lim[32];
     VkPhysicalDeviceProperties props;
     t->real.vkGetPhysicalDeviceProperties(t->physical, &props);
@@ -1145,6 +1273,7 @@ void vkb_pcache_device_init(vkb_srv_table *t)
         snprintf(game, sizeof(game), "%s%.*s.vkpc", base, (int)(strrchr(key, '.') - key), key);
         if (stat(game, &gs) == 0 && gs.st_size > 0) p->beside = (uint64_t)gs.st_size;
         p->max = p->beside < p->max ? p->max - p->beside : 0;
+        p->max_ext = p->max; /* a replay's file is what is left beside the game's */
     }
     p->last_save = mono_s();
     pthread_mutex_lock(&pc_lock);
@@ -1155,8 +1284,24 @@ void vkb_pcache_device_init(vkb_srv_table *t)
 
     uint64_t load_t0 = vkb_hitch_now();
     pc_map fm = {NULL, 0, 0, 0};
+    int over_load = 0; /* the file is over the plain limit (a cache that went over it with memory to spare) */
     if (!p->warm_role) fm = map_file(p->path, p->max, &p->file);
-    if (fm.over) warn_over(p, p->path, fm.over);
+    if (fm.over && !p->warm_role && p->max_ext > p->max && (uint64_t)fm.over <= p->max_ext) {
+        over_load = 1;
+        if (over_ok(p)) {
+            p->max = p->max_ext;
+            fm = map_file(p->path, p->max, &p->file);
+        }
+    }
+    if (fm.over && over_load) {
+        /* Not the memory for it now: kept as it is (a save only merges into it), not replaced. */
+        p->max = p->max_ext;
+        p->not_loaded = 1;
+        VKB_WARN("device %u: pipeline cache %s (%lld KB) is over the plain limit and %llu KB of memory are free: not loaded this time; the file is kept",
+                 t->id, p->path, (long long)(fm.over >> 10), (unsigned long long)vkb_memavail_kb());
+    } else if (fm.over) {
+        warn_over(p, p->path, fm.over);
+    }
     const char *from = p->path;
     char legacy[512];
     if (!fm.data && !p->file.valid && key[0] && !p->warm_role) {
@@ -1221,6 +1366,14 @@ void vkb_pcache_device_init(vkb_srv_table *t)
         size_t wsize = wm.data ? wm.size : (size_t)wm.over;
         if (!wsize) continue;
         VkPipelineCache tmp = VK_NULL_HANDLE;
+        if (total + wsize > p->max && total + wsize <= p->max_ext && over_ok(p)) {
+            /* over the plain limit with the rest, with the memory to spare: the limit goes up for this device
+             * (its saves keep all of it) */
+            char l2[32];
+            p->max = p->max_ext;
+            VKB_INFO("device %u: the cache's limit is %s here: %zu KB with Steam's shader pre-caching is over the plain limit, %llu KB of memory are free",
+                     t->id, limit_str(l2, p->max), (total + wsize) >> 10, (unsigned long long)vkb_memavail_kb());
+        }
         if (total + wsize > p->max)
             VKB_WARN("device %u: %s (%zu KB) left out: over the %s limit with the rest (VKBRIDGE_PCACHE_MAX_MB)", t->id, wpath,
                      wsize >> 10, limit_str(lim, p->max));

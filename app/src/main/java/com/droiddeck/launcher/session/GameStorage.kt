@@ -14,9 +14,12 @@ object GameStorage {
 
     fun options(context: Context): List<Option> {
         val sm = context.getSystemService(StorageManager::class.java)
+        val primary = context.getExternalFilesDir(null)?.absolutePath
+        val primaryStorage = Environment.getExternalStorageDirectory()?.absolutePath
         return context.getExternalFilesDirs(null).orEmpty().filterNotNull().mapNotNull { dir ->
-            val removable = try { Environment.isExternalStorageRemovable(dir) } catch (e: Exception) { false }
-            if (!removable) return@mapNotNull null
+            // Non-primary app dirs are usable even when Android reports the volume as non-removable (USB SSDs often do).
+            if (primary != null && dir.absolutePath == primary) return@mapNotNull null
+            if (!primaryStorage.isNullOrBlank() && dir.absolutePath.startsWith("$primaryStorage/")) return@mapNotNull null
             val volume = try { sm?.getStorageVolume(dir) } catch (e: Exception) { null }
             val name = volume?.getDescription(context)?.takeIf { it.isNotBlank() && !it.equals("android", true) } ?: context.getString(R.string.gstore_sd_card)
             Option(context.getString(R.string.gstore_volume_free, name, free(dir)), File(dir, "steam").absolutePath, name)
@@ -49,6 +52,11 @@ object GameStorage {
             else -> Option(SessionPrefs.gameStorageLabel(context), pref)
         }
     }
+
+    const val X64_CARD_DIR = "x86-64"
+    const val X64_CARD_GUEST = "/mnt/droiddeck-sd/$X64_CARD_DIR"
+
+    fun x64CardLibrary(context: Context): File? = effective(context)?.let { File(it.path, X64_CARD_DIR) }
 
     class Library(val host: File, val guest: String, val label: String)
 

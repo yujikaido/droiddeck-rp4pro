@@ -169,8 +169,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", default="scenario-runs")
     parser.add_argument("--adb")
     parser.add_argument("--serial")
-    parser.add_argument("--package", type=ctl.package_name,
-                        help="the app's package (defaults to DROIDDECK_PACKAGE or com.droiddeck.launcher)")
     parser.add_argument("--keep-going", action="store_true", help="run every repeat even after a failure")
     args = parser.parse_args(argv)
 
@@ -186,16 +184,11 @@ def main(argv: list[str] | None = None) -> int:
     scenario = substitute(scenario, variables)
     repeat = args.repeat or int(scenario.get("repeat", 1))
 
-    try:
-        ctl.use_package(ctl.selected_package(args))
-    except ctl.ControlError as exc:
-        print(json.dumps({"ok": False, "error": str(exc)}))
-        return 2
     adb = ctl.adb_path(args.adb)
     serial = ctl.resolve_serial(adb, args.serial, log=True)
     out = Path(args.out).expanduser().resolve() / f"{scenario.get('name', 'scenario')}-{time.strftime('%Y%m%d-%H%M%S')}"
     out.mkdir(parents=True, exist_ok=True, mode=0o700)
-    global_args = (["--adb", adb] if args.adb else []) + ["--serial", serial] + (["--package", args.package] if args.package else [])
+    global_args = (["--adb", adb] if args.adb else []) + ["--serial", serial]
     runner = Runner(adb, serial, out, global_args)
     report = {"name": scenario.get("name"), "serial": serial, "vars": variables, "repeat": repeat,
               "out": str(out), "runs": []}

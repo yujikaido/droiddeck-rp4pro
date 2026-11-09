@@ -57,6 +57,8 @@ FAKE_ADB = textwrap.dedent('''\
         print(config.get("dumpsys_display", ""))
     elif args[:3] == ["shell", "dumpsys", "power"]:
         print("  mWakefulness=Awake")
+    elif args[:3] == ["shell", "dumpsys", "SurfaceFlinger"] and "-dump" in args:
+        print(config.get("timestats", ""))
     elif args[:2] == ["exec-out", "screencap"]:
         sys.stdout.buffer.write(b"\\x89PNG fake")
     with open(config["log"], "a") as log:
@@ -77,6 +79,32 @@ DUMPSYS_DISPLAY = textwrap.dedent('''\
         mPrimaryDisplayDevice=Screen-2
         mBaseDisplayInfo=DisplayInfo{"Screen-2", displayId 4", real 1080 x 1240, x}
 ''')
+
+
+def timestats_record(name, frames, histogram, hz):
+    bins = " ".join(f"{ms}ms={histogram.get(ms, 0)}" for ms in (8, 16, 17, 25, 33, 50))
+    return (f"displayRefreshRate = {hz} fps\nrenderRate = {hz} fps\nuid = 10479\nlayerName = {name}\n"
+            f"packageName = \ntotalFrames = {frames}\ndroppedFrames = 0\n"
+            f"present2present histogram is as below:\n{bins}\nlatch2present histogram is as below:\n8ms={frames}\n")
+
+
+# A capture where the panel went from 60 to 120 Hz: the game layer is split in two records. The
+# activity's own window and an unrelated app draw too, and must not count.
+TIMESTATS_SPLIT = "SurfaceFlinger TimeStats:\ntotalFrames = 2000\n" + "".join([
+    timestats_record("droiddeck_wayland_game#6110", 900, {16: 700, 33: 199}, 60),
+    timestats_record("droiddeck_wayland_game#6110", 900, {16: 850, 25: 49}, 120),
+    timestats_record("com.droiddeck.launcher/com.droiddeck.launcher.SessionActivity#6097", 8, {16: 7}, 60),
+    timestats_record("f291fb6 SurfaceView[com.droiddeck.launcher/com.droiddeck.launcher.SessionActivity]#6101",
+                     30, {33: 29}, 60),
+    timestats_record("StatusBar#106", 1, {}, 60),
+])
+
+# A build that presents the game on the session's SurfaceView instead of a layer of its own.
+TIMESTATS_SURFACEVIEW = "SurfaceFlinger TimeStats:\n" + "".join([
+    timestats_record("a1b2c3 SurfaceView[com.droiddeck.launcher/com.droiddeck.launcher.SessionActivity]#77",
+                     1800, {16: 1796, 33: 3}, 120),
+    timestats_record("a1b2c3 SurfaceView[com.other.app/com.other.app.Main]#12", 500, {8: 499}, 120),
+])
 
 
 def state(phase="READY", focused=None, focusable=()):
@@ -123,42 +151,31 @@ class DroiddeckctlTest(FakeAdbTest):
         self.assertEqual("INVALID_REQUEST", caught.exception.code)
         self.assertFalse(self.calls())
 
+    def test_a_variant_package_is_reached_through_its_own_provider_and_activity(self):
+        with unittest.mock.patch.dict(os.environ, {"DROIDDECK_PACKAGE": "com.antutu.benchmark.full"}):
+            variant = load("droiddeckctl")
+        self.assertEqual("content://com.antutu.benchmark.full.agent", variant.AUTHORITY)
+        with self.assertRaises(variant.ControlError):  # the fake adb does not answer `am start`
+            variant.start_agent_activity(str(self.adb), "fake-1", {"mode": "steam"})
+        started = [e["args"] for e in self.calls() if e["args"][:3] == ["shell", "am", "start"]]
+        self.assertIn("com.antutu.benchmark.full/com.droiddeck.launcher.agent.AgentStartActivity", started[0])
+
+    def test_a_malformed_package_is_refused_before_adb(self):
+        with unittest.mock.patch.dict(os.environ, {"DROIDDECK_PACKAGE": "com.example;reboot"}):
+            variant = load("droiddeckctl")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            code = variant.main(["--adb", str(self.adb), "--serial", "fake-1", "state"])
+        self.assertEqual(2, code)
+        self.assertEqual("INVALID_REQUEST", json.loads(out.getvalue())["error"]["code"])
+        self.assertFalse(self.calls())
+
     def test_state_passes_through_with_the_serial(self):
         self.configure({"state": state()})
         code, out = self.run_ctl("state")
         self.assertEqual(0, code)
         self.assertEqual("READY", out["session"]["phase"])
         self.assertEqual("fake-1", out["deviceSerial"])
-
-    def uris(self):
-        return [e["args"][e["args"].index("--uri") + 1] for e in self.calls() if "--uri" in e["args"]]
-
-    def test_the_package_defaults_to_the_standard_build(self):
-        self.configure({"state": state()})
-        with unittest.mock.patch.dict(os.environ):
-            os.environ.pop("DROIDDECK_PACKAGE", None)
-            self.assertEqual(0, self.run_ctl("state")[0])
-        self.assertEqual(["content://com.droiddeck.launcher.agent"], self.uris())
-
-    def test_package_option_and_environment_pick_a_side_by_side_build(self):
-        self.configure({"state": state()})
-        with unittest.mock.patch.dict(os.environ, {"DROIDDECK_PACKAGE": "com.droiddeck.launcher.mali"}):
-            self.assertEqual(0, self.run_ctl("state")[0])
-            self.assertEqual(0, self.run_ctl("--package", "com.example.other", "state")[0])
-        with unittest.mock.patch.dict(os.environ):
-            os.environ.pop("DROIDDECK_PACKAGE", None)
-            self.assertEqual(0, self.run_ctl("state")[0])
-        self.assertEqual(["content://com.droiddeck.launcher.mali.agent", "content://com.example.other.agent",
-                          "content://com.droiddeck.launcher.agent"], self.uris())
-
-    def test_a_bad_package_is_refused_before_any_provider_call(self):
-        with unittest.mock.patch.dict(os.environ, {"DROIDDECK_PACKAGE": "com.droiddeck;reboot"}):
-            code, out = self.run_ctl("state")
-        self.assertEqual(2, code)
-        self.assertEqual("INVALID_REQUEST", out["error"]["code"])
-        self.assertFalse(self.uris())
-        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
-            ctl.build_parser().parse_args(["--package", "not a package", "state"])
 
     def test_launch_sends_the_app_id_and_waits_for_focus(self):
         self.configure({
@@ -264,6 +281,99 @@ class DroiddeckctlTest(FakeAdbTest):
         self.assertEqual(2, code)
         self.assertEqual("NO_SUCH_DISPLAY", out["error"]["code"])
 
+    def test_pacing_sums_split_records_of_the_game_layer_only(self):
+        summary = ctl.pacing_summary(TIMESTATS_SPLIT, "com.droiddeck.launcher")
+        self.assertEqual(["droiddeck_wayland_game"], summary["layers"])
+        self.assertEqual(1800, summary["frames"])
+        self.assertEqual([60, 120], summary["refreshRates"])
+        self.assertEqual({"16": 1550, "25": 49, "33": 199}, summary["presentToPresentMs"])
+        self.assertEqual(16, summary["cadenceMs"])
+        self.assertEqual(248, summary["offCadence"])
+        self.assertEqual(13.8, summary["offCadencePercent"])
+
+    def test_pacing_falls_back_to_the_sessions_surfaceview(self):
+        summary = ctl.pacing_summary(TIMESTATS_SURFACEVIEW, "com.droiddeck.launcher")
+        self.assertEqual(1, len(summary["layers"]))
+        self.assertIn("SurfaceView[com.droiddeck.launcher/", summary["layers"][0])
+        self.assertEqual(1800, summary["frames"])
+        self.assertEqual(3, summary["offCadence"])
+
+    def test_pacing_captures_then_turns_timestats_off(self):
+        self.configure({}, timestats=TIMESTATS_SURFACEVIEW)
+        with unittest.mock.patch.object(ctl.time, "sleep"):
+            code, out = self.run_ctl("pacing", "--seconds", "1")
+        self.assertEqual(0, code)
+        self.assertEqual("pacing", out["command"])
+        self.assertIn("fpsOnScreen", out)
+        sf = [c["args"][3:] for c in self.calls() if c["args"][:3] == ["shell", "dumpsys", "SurfaceFlinger"]]
+        self.assertEqual([["--timestats", "-clear", "-enable"], ["--timestats", "-dump"], ["--timestats", "-disable"]], sf)
+
+    def test_pacing_without_a_session_on_screen_exits_4(self):
+        self.configure({}, timestats="SurfaceFlinger TimeStats:\n" + timestats_record("StatusBar#1", 3, {16: 2}, 60))
+        with unittest.mock.patch.object(ctl.time, "sleep"):
+            code, out = self.run_ctl("pacing", "--seconds", "1")
+        self.assertEqual(4, code)
+        self.assertEqual("NO_FRAMES", out["error"]["code"])
+
+    def test_pacing_counts_both_buckets_of_one_cadence_and_only_the_chosen_layers_rates(self):
+        text = "SurfaceFlinger TimeStats:\n" + "".join([
+            timestats_record("droiddeck_wayland_game#7", 910, {16: 450, 17: 450, 33: 10}, 60),
+            timestats_record("StatusBar#106", 4, {8: 3}, 90),
+        ])
+        summary = ctl.pacing_summary(text, "com.droiddeck.launcher")
+        self.assertEqual(10, summary["offCadence"])
+        self.assertEqual([60], summary["refreshRates"])
+
+    def test_pacing_skips_a_game_layer_with_no_frames_for_the_surfaceview(self):
+        text = "SurfaceFlinger TimeStats:\n" + "".join([
+            timestats_record("droiddeck_wayland_game#7", 0, {}, 120),
+            timestats_record("a1 SurfaceView[com.droiddeck.launcher/com.droiddeck.launcher.SessionActivity]#8", 600, {16: 598, 33: 1}, 120),
+        ])
+        summary = ctl.pacing_summary(text, "com.droiddeck.launcher")
+        self.assertEqual(600, summary["frames"])
+        self.assertIn("SurfaceView[com.droiddeck.launcher/", summary["layers"][0])
+
+    def test_pacing_with_a_layer_that_drew_no_frames_exits_4(self):
+        self.configure({}, timestats="SurfaceFlinger TimeStats:\n" + timestats_record("droiddeck_wayland_game#7", 0, {}, 120))
+        with unittest.mock.patch.object(ctl.time, "sleep"):
+            code, out = self.run_ctl("pacing", "--seconds", "1")
+        self.assertEqual(4, code)
+        self.assertEqual("NO_FRAMES", out["error"]["code"])
+
+    def test_pacing_turns_timestats_off_when_the_dump_fails(self):
+        calls = []
+
+        def adb(_adb, _serial, *args, timeout=30):
+            calls.append(args[3:])
+            if "-dump" in args:
+                raise ctl.ControlError("timed out", "ADB_FAILED")
+            return ctl.subprocess.CompletedProcess(args, 0, b"", b"")
+
+        with unittest.mock.patch.object(ctl, "run_adb", adb), unittest.mock.patch.object(ctl.time, "sleep"):
+            with self.assertRaises(ctl.ControlError) as caught:
+                ctl.pacing("adb", "fake-1", 1)
+        self.assertEqual("PACING_FAILED", caught.exception.code)
+        self.assertEqual(("--timestats", "-disable"), calls[-1])
+
+    def test_pacing_fails_when_timestats_cannot_be_turned_off(self):
+        def adb(_adb, _serial, *args, timeout=30):
+            return ctl.subprocess.CompletedProcess(args, 1 if "-disable" in args else 0, b"", b"")
+
+        with unittest.mock.patch.object(ctl, "run_adb", adb), unittest.mock.patch.object(ctl.time, "sleep"):
+            with self.assertRaises(ctl.ControlError) as caught:
+                ctl.pacing("adb", "fake-1", 1)
+        self.assertEqual("PACING_FAILED", caught.exception.code)
+        self.assertIn("timestats off", str(caught.exception))
+
+    def test_pacing_maps_an_adb_failure_while_enabling_to_pacing_failed(self):
+        def adb(*_args, **_kwargs):
+            raise ctl.ControlError("adb vanished", "ADB_FAILED")
+
+        with unittest.mock.patch.object(ctl, "run_adb", adb):
+            with self.assertRaises(ctl.ControlError) as caught:
+                ctl.pacing("adb", "fake-1", 1)
+        self.assertEqual("PACING_FAILED", caught.exception.code)
+
     def test_input_requests(self):
         self.configure({"input": {"ok": True, "command": "input"}})
         self.run_ctl("input", "tap", "0.5", "0.25", "--space", "fraction")
@@ -302,6 +412,21 @@ class DroiddeckctlTest(FakeAdbTest):
         self.assertEqual(0, code)
         self.assertEqual("Awake", out["wakefulness"])
         self.assertIn(["shell", "input", "keyevent", "KEYCODE_WAKEUP"], [c["args"] for c in self.calls()])
+
+    def test_proot_profile_queues_only_the_next_session(self):
+        self.configure({"env": {"ok": True}})
+        code, out = self.run_ctl("proot-profile", "enable", "--slow-us", "250")
+        self.assertEqual(0, code, out)
+        self.assertEqual({"op": "set", "lines": ["PROOT_PROFILE=1", "PROOT_PROFILE_SLOW_US=250"], "persistent": False},
+                         self.calls("env")[0]["request"])
+
+    def test_proot_profile_report_needs_no_adb_or_device(self):
+        path = self.dir / "session.log"
+        path.write_text('ordinary log')
+        with unittest.mock.patch.object(ctl, "adb_path", side_effect=AssertionError("must stay offline")):
+            code, out = self.run_ctl("proot-profile", "report", str(path))
+        self.assertEqual(0, code, out)
+        self.assertFalse(out["hasCounters"])
 
     def test_override_pushes_to_the_inbox_first(self):
         self.configure({

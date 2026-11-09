@@ -1,4 +1,3 @@
-"""The web helper layout droiddeck-session hands the preload on the Mali bridge."""
 import os
 import re
 import subprocess
@@ -28,8 +27,6 @@ class WebhelperLayoutTest(unittest.TestCase):
         self.assertEqual(self.layout(), "stock")
 
     def test_angle_on_vulkan_brings_chromiums_vulkan_compositing(self):
-        # ANGLE-Vulkan's X11 EGL configs carry only the root visual; Chromium wants the ARGB one under
-        # gamescope, so GL compositing gets EGL_BAD_CONFIG and falls back to software.
         self.assertEqual(self.layout(BL_VKBRIDGE_CEF_ANGLE="vulkan"),
                          "--use-gl=angle --use-angle=vulkan +Vulkan +VulkanFromANGLE +DefaultANGLEVulkan")
 
@@ -75,6 +72,108 @@ class CefGpuFailedLastTest(unittest.TestCase):
         self.assertIn("_bl_cef+=(-cef-enable-logging=stderr)", block)
         code = "\n".join(line for line in block.splitlines() if not line.lstrip().startswith("#"))
         self.assertNotIn("-cef-v=", code)
+
+
+class CefGpuChoiceTest(unittest.TestCase):
+    """Two GPU-process failures in a row put the next sessions' menus in software; the GPU is tried again later."""
+
+    FAIL = "[1] Startup - webhelper launched pid: 1\n[2] Disabling GPU acceleration: Disabled/CrashCount\n"
+    OK = "[1] Startup - webhelper launched pid: 1\nGPU process started\n"
+
+    def setUp(self):
+        text = SESSION.read_text()
+        self.funcs = "".join(re.search(r"^%s\(\) \{\n.*?^\}\n" % n, text, re.M | re.S).group(0)
+                             for n in ("bl_cef_gpu_failed_last", "bl_cef_gpu_choice"))
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        (self.root / "logs").mkdir()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def session(self, webhelper):
+        """One session start: the web helper log as the last session left it, then the choice."""
+        if webhelper is not None:
+            (self.root / "logs/webhelper.txt").write_text(webhelper)
+        out = subprocess.run(["bash", "-c", "set -u\n" + self.funcs + 'bl_cef_gpu_choice "$1"\n', "-", str(self.root)],
+                             capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return out.stdout.strip()
+
+    def state(self):
+        return (self.root / ".bl-cef-gpu-state").read_text().split()
+
+    def test_first_start_tries_the_gpu(self):
+        self.assertEqual(self.session(None), "gpu")
+        self.assertEqual(self.state(), ["0", "0", "1", "2"])
+
+    def test_one_failure_changes_nothing(self):
+        self.session(None)
+        self.assertEqual(self.session(self.FAIL), "gpu")
+        self.assertEqual(self.state(), ["1", "0", "1", "2"])
+
+    def test_a_working_start_clears_the_count(self):
+        self.session(None)
+        self.session(self.FAIL)
+        self.assertEqual(self.session(self.OK), "gpu")
+        self.assertEqual(self.state(), ["0", "0", "1", "2"])
+
+    def test_two_failures_in_a_row_go_to_software(self):
+        self.session(None)
+        self.session(self.FAIL)
+        self.assertEqual(self.session(self.FAIL), "soft")
+        self.assertEqual(self.state(), ["2", "1", "0", "2"])
+
+    def test_software_sessions_keep_the_count_and_the_gpu_is_tried_after_eight(self):
+        self.session(None)
+        self.session(self.FAIL)
+        self.assertEqual([self.session(self.FAIL) for _ in range(8)], ["soft"] * 8)
+        self.assertEqual(self.session(self.FAIL), "gpu")  # the retry
+        self.assertEqual(self.state(), ["2", "8", "1", "2"])
+        self.assertEqual(self.session(self.OK), "gpu")     # it works now
+        self.assertEqual(self.state(), ["0", "0", "1", "2"])
+
+    def test_a_failed_retry_goes_back_to_software(self):
+        self.session(None)
+        self.session(self.FAIL)
+        for _ in range(9):
+            self.session(self.FAIL)
+        self.assertEqual(self.session(self.FAIL), "soft")
+        self.assertEqual(self.state(), ["3", "1", "0", "2"])
+
+    def test_only_the_last_web_helper_start_counts(self):
+        self.session(None)
+        # an old CrashCount line before a start that worked
+        self.assertEqual(self.session(self.FAIL + self.OK), "gpu")
+        self.assertEqual(self.state(), ["0", "0", "1", "2"])
+
+    def test_a_damaged_state_file_starts_over(self):
+        (self.root / ".bl-cef-gpu-state").write_text("x y\n")
+        self.assertEqual(self.session(self.FAIL), "gpu")
+        self.assertEqual(self.state(), ["0", "0", "1", "2"])
+
+    def test_a_phone_put_in_software_before_the_fix_tries_the_gpu_again(self):
+        # the state as the 0.5.4.3 test build left a vivo phone: two failures, software since then, no fix level
+        (self.root / ".bl-cef-gpu-state").write_text("2 3 0\n")
+        self.assertEqual(self.session(self.FAIL), "gpu")
+        self.assertEqual(self.state(), ["0", "0", "1", "2"])
+        self.assertEqual(self.session(self.OK), "gpu")
+        self.assertEqual(self.state(), ["0", "0", "1", "2"])
+
+    def test_after_the_fix_failures_count_as_before(self):
+        (self.root / ".bl-cef-gpu-state").write_text("2 3 0\n")
+        self.session(self.FAIL)
+        self.assertEqual(self.session(self.FAIL), "gpu")
+        self.assertEqual(self.session(self.FAIL), "soft")
+        self.assertEqual(self.state(), ["2", "1", "0", "2"])
+
+    def test_the_steam_block_leaves_the_players_choice_and_dev_switches_alone(self):
+        text = SESSION.read_text()
+        self.assertIn('[ -z "${BL_VKBRIDGE_CEF_GPU:-}" ] &&', text)
+        block = text.split('[ "$(bl_cef_gpu_choice "$steam_root")" = soft ]; then\n', 1)[1].split("elif", 1)[0]
+        self.assertIn("-cef-disable-gpu -cef-disable-gpu-compositing", block)
+        kotlin = (SESSION.parents[6] / "app/src/main/java/com/droiddeck/launcher/session/SessionService.kt").read_text()
+        self.assertIn('guest.add("BL_VKBRIDGE_CEF_GPU=1")', kotlin)
 
 
 if __name__ == "__main__":
