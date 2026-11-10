@@ -26,6 +26,7 @@ import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.outlined.CheckCircle
 import androidx.compose.material.icons.outlined.CloudDone
 import androidx.compose.material.icons.outlined.CloudUpload
@@ -223,7 +224,7 @@ internal fun SteamShelfView(share: NetShare, s: FrontEndState, a: FrontEndAction
     }
 
     open?.let { card ->
-        SteamGameDialog(card, share, shelf, targets, s.sessionRunning, onClose = { open = null })
+        SteamGameDialog(card, share, shelf, targets, s.sessionRunning, onPlay = a.onSteamGame, onClose = { open = null })
     }
 }
 
@@ -310,7 +311,7 @@ private fun CoverName(name: String) = Box(Modifier.fillMaxSize().padding(8.dp), 
 }
 
 @Composable
-private fun SteamGameDialog(card: SteamCard, share: NetShare, shelf: NetSteamShelf?, targets: List<SteamTarget>, steamRunning: Boolean, onClose: () -> Unit) {
+private fun SteamGameDialog(card: SteamCard, share: NetShare, shelf: NetSteamShelf?, targets: List<SteamTarget>, steamRunning: Boolean, onPlay: (Library.SteamGame) -> Unit, onClose: () -> Unit) {
     val ctx = LocalContext.current
     val colors = MaterialTheme.colorScheme
     val pal = LocalPalette.current
@@ -334,6 +335,13 @@ private fun SteamGameDialog(card: SteamCard, share: NetShare, shelf: NetSteamShe
                 Actions {
                     if (card.net != null) ActionChip(stringResource(R.string.net_steam_on_share_named, share.title), ok = true)
                     if (card.local != null) ActionChip(stringResource(R.string.net_steam_on_device_named, card.local.library.let { if (it == "internal") stringResource(R.string.net_builtin) else it }), ok = true)
+                }
+                if (card.local != null) {
+                    PrimaryButton(stringResource(R.string.stores_play), enabled = job == null && !steamRunning, main = true, icon = Icons.Filled.PlayArrow) {
+                        close()
+                        onPlay(card.local)
+                    }
+                    if (steamRunning) Text(stringResource(R.string.net_steam_play_running), fontSize = 13.sp, color = colors.onSurfaceVariant)
                 }
                 if (card.net != null && card.local == null) {
                     if (card.net.dir == null) Note(stringResource(R.string.net_steam_no_folder, card.net.installDir))

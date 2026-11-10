@@ -3704,6 +3704,7 @@
     <string name="net_steam_back_up">Back up to %1$s</string>
     <string name="net_steam_update_backup">Update the backup on %1$s</string>
     <string name="net_steam_copying">Copying: the progress shows on the cover and at the bottom of the page.</string>
+    <string name="net_steam_play_running">Steam is running: play this game from Steam.</string>
     <string name="net_steam_restart_note">Steam is running: it lists a new game the next time it starts.</string>
     <string name="net_no_space_device">Not enough space on this device: it needs %1$s and has %2$s free</string>
     <string name="net_no_space_share">Not enough space on the share: it needs %1$s and has %2$s free</string>
