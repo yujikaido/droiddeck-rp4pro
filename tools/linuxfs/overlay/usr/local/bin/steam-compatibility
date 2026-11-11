@@ -1737,6 +1737,8 @@ def new_title_tools(steam_root, state, apps, catalog, runnable, default, chosen,
     """{app: tool}: titles with no prefix yet start on the newest DroidDeck-Proton (a pinned build) instead of Valve's
     auto-updating Proton Experimental (see new_title_apps), and only when a DroidDeck-Proton is installed.
     A title that has a prefix keeps its tool: no prefix-family change for a game that works."""
+    if not own_default_enabled(environ):
+        return {}
     target = newest_own_proton(catalog, set(runnable), environ)
     if target is None:
         return {}
@@ -2006,8 +2008,13 @@ def guard_prefixes(steam_root, changes, why, current, catalog, runnable, overrid
         if app != "0" and entry is not None:
             risk = prefix_risk(prefix_version(steam_root, app), tool_prefix_version(steam_root, entry, cache))
         name = current.get(app, "")
+        implicit = app != "0" and not name
+        if implicit:
+            name = current.get("0", "") if "0" in changes else ""
         if hold and risk and app not in overrides and name and not unrunnable(name, runs):
             held[app] = name
+            if implicit:
+                allowed[app] = name  # it ran on the old general default: pin it there, or it moves with "0"
         else:
             allowed[app] = tool
     return allowed, held
@@ -2530,6 +2537,28 @@ def move_back_default(state, default, chosen, catalog, why, lines, environ=None,
     return target
 
 
+# RP4 Pro build: Proton Experimental ARM64 stays the default and new titles start on it; DroidDeck-Proton is a per-game pick.
+# The RP4 Pro fixes were tested on Experimental, and on DroidDeck-Proton 11-11.10 Turtles' audio stutters there.
+# DD_PROTON_OWN_DEFAULT=1 restores upstream's choice.
+
+def own_default_enabled(environ=None):
+    value = (os.environ if environ is None else environ).get("DD_PROTON_OWN_DEFAULT", "0")
+    return value.strip().lower() not in ("0", "off", "false", "no")
+
+
+def keep_valve_default(state, default, chosen, catalog, why, lines, environ=None, now=None):
+    """The general default: TOOL when `default` is a DroidDeck-Proton build that no record shows the player picked."""
+    if own_default_enabled(environ) or not any(t["name"] == default for t in own_builds(catalog)):
+        return default
+    if player_default(state, default, chosen):
+        return default
+    origin = default_origin(state, default, chosen)
+    why["0"] = "Proton Experimental ARM64 is this build's default (%s was %s)" % (default, origin)
+    state.update(default=TOOL, seq=now or now_ms(), source="update")
+    lines.append("default: %s -> %s (%s; to keep DroidDeck-Proton, pick it in Steam's menu or in the app)" % (default, TOOL, origin))
+    return TOOL
+
+
 def move_back_games(state, current, default, overrides, chosen, requests, catalog, steam_root, why, lines, environ=None, now=None):
     """{app: target}: the titles on an unvalidated DroidDeck-Proton build that no record shows the player picked (see above),
     which go to the default validated build, and the set of them that follow the default (they stay followers)."""
@@ -2625,6 +2654,7 @@ def register_default(config_path, apps=(), protect=(), default=None, catalog=Non
             if settle:
                 back_lines = []
                 default = move_back_default(state, default, chosen, catalog, why, back_lines)
+                default = keep_valve_default(state, default, chosen, catalog, why, back_lines)
                 for line in back_lines:
                     print("steam-compatibility: " + line)
                 if any(t["name"] == default for t in own_builds(catalog)):
