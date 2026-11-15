@@ -218,6 +218,50 @@ object DeckyManager {
         }
     }
 
+    const val RP4_PRO_PLUGIN = "DroidDeck RP4 Pro"
+    private const val RP4_PRO_ASSET = "decky-plugins/droiddeck-rp4pro"
+
+    fun bundledPluginInstalled(context: Context, name: String = RP4_PRO_PLUGIN) =
+        File(LinuxRuntime.rootDir(context), "root/homebrew/plugins").listFiles().orEmpty().any { folder ->
+            folder.isDirectory && !folder.name.startsWith(".droiddeck-") && runCatching {
+                JSONObject(File(folder, "plugin.json").readText()).getString("name") == name
+            }.getOrDefault(false)
+        }
+
+    // Installs the RP4 Pro panel shipped in the APK and turns Decky on so Steam's quick menu shows it.
+    fun installRp4ProPlugin(context: Context): String? {
+        if (SessionState.running) return context.getString(R.string.deckymgr_stop_session_plugin)
+        if (installed(context) == null) return context.getString(R.string.deckymgr_loader_required)
+        val plugins = File(LinuxRuntime.rootDir(context), "root/homebrew/plugins")
+        if (!plugins.exists() && !plugins.mkdirs()) return context.getString(R.string.deckymgr_plugins_dir_failed)
+        val staging = File(plugins, ".droiddeck-import-${UUID.randomUUID()}")
+        try {
+            val plugin = File(staging, RP4_PRO_ASSET.substringAfterLast('/'))
+            copyAsset(context, RP4_PRO_ASSET, plugin)
+            DeckyPluginInstall.activate(plugin, plugins, RP4_PRO_PLUGIN,
+                File(plugins.parentFile, "settings/loader.json"), ".droiddeck-backup-${UUID.randomUUID()}")
+            setSupervisorEnabled(context, true)
+            return null
+        } catch (e: Exception) {
+            Log.w(TAG, "RP4 Pro plugin install", e)
+            if (e is DeckyPluginInstall.Failure) return context.getString(e.text)
+            return e.message?.takeIf { it.isNotBlank() } ?: context.getString(R.string.deckymgr_plugin_install_failed)
+        } finally {
+            staging.deleteRecursively()
+        }
+    }
+
+    private fun copyAsset(context: Context, path: String, target: File) {
+        val children = context.assets.list(path).orEmpty()
+        if (children.isEmpty()) {
+            target.parentFile?.mkdirs()
+            context.assets.open(path).use { input -> FileOutputStream(target).use { input.copyTo(it) } }
+            return
+        }
+        target.mkdirs()
+        for (child in children) copyAsset(context, "$path/$child", File(target, child))
+    }
+
     private fun extractPluginZip(context: Context, archive: File, destination: File) {
         var totalBytes = 0L
         var entries = 0

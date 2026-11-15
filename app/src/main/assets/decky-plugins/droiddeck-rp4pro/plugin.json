@@ -1,0 +1,10 @@
+{
+  "name": "DroidDeck RP4 Pro",
+  "author": "yujikaido",
+  "flags": ["root"],
+  "publish": {
+    "tags": ["droiddeck", "retroid"],
+    "description": "Fan, performance, Wi-Fi and Bluetooth for the Retroid Pocket 4 Pro under DroidDeck.",
+    "image": ""
+  }
+}
