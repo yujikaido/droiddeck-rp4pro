@@ -22,7 +22,7 @@ import kotlinx.coroutines.withContext
 @Composable
 internal fun Rp4ProGroup(host: MenuHost) {
     val context = LocalContext.current
-    if (!remember { Rp4ProControls.supported(context) }) return
+    if (!Rp4ProControls.supported()) return
     val scope = rememberCoroutineScope()
     var state by remember { mutableStateOf(Rp4ProControls.state(context)) }
     var refresh by remember { mutableIntStateOf(0) }
@@ -35,7 +35,6 @@ internal fun Rp4ProGroup(host: MenuHost) {
         }
     }
     val toast = { text: String -> Toast.makeText(context, text, Toast.LENGTH_LONG).show() }
-    val openTiles = { if (!Rp4ProControls.openQuickSettings(context)) toast(context.getString(R.string.rp4_qs_failed)) }
     val switch = { set: (Boolean) -> Boolean, on: Boolean ->
         scope.launch {
             if (!withContext(Dispatchers.IO) { set(on) }) toast(context.getString(R.string.rp4_switch_failed))
@@ -46,12 +45,6 @@ internal fun Rp4ProGroup(host: MenuHost) {
     }
 
     SettingsGroup(stringResource(R.string.rp4_title)) {
-        ActionRow(stringResource(R.string.rp4_fan),
-            stringResource(R.string.rp4_mode_hint, stringResource(Rp4ProControls.fanLabel(state.fan))),
-            stringResource(R.string.rp4_change), onClick = openTiles)
-        ActionRow(stringResource(R.string.rp4_performance),
-            stringResource(R.string.rp4_mode_hint, stringResource(Rp4ProControls.performanceLabel(state.performance))),
-            stringResource(R.string.rp4_change), onClick = openTiles)
         if (state.wifi != null) ToggleRow(host, "rp4-wifi", stringResource(R.string.rp4_wifi), null, state.wifi == true) {
             switch({ on -> Rp4ProControls.setWifi(context, on) }, it)
         }

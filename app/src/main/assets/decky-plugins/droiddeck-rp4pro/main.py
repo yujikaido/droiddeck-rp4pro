@@ -2,7 +2,7 @@ import json
 import os
 
 CONTROLS = "/etc/droiddeck-device-controls"
-REQUESTS = ("wifi", "bluetooth", "quicksettings")
+REQUESTS = ("wifi", "bluetooth")
 
 
 class Plugin:

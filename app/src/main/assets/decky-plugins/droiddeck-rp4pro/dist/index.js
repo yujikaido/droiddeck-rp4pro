@@ -41,11 +41,6 @@
           description: loaded ? "Start Steam from DroidDeck on a Retroid Pocket 4 Pro." : null })));
     }
     return h(React.Fragment, null,
-      h(PanelSection, { title: "Fan and performance" },
-        h(PanelSectionRow, null, h(Field, { label: "Fan" }, state.fanLabel)),
-        h(PanelSectionRow, null, h(Field, { label: "Performance" }, state.performanceLabel)),
-        h(PanelSectionRow, null, h(ButtonItem, { layout: "below", onClick: () => send("quicksettings", true) },
-          "Change in Android quick settings"))),
       h(PanelSection, { title: "Wireless" },
         h(PanelSectionRow, null, h(ToggleField, { label: "Wi-Fi", checked: !!state.wifi, onChange: (on) => send("wifi", on) })),
         h(PanelSectionRow, null, h(ToggleField, { label: "Bluetooth", checked: !!state.bluetooth, onChange: (on) => send("bluetooth", on) }))));
@@ -54,11 +49,10 @@
   function Icon() {
     return h("svg", { viewBox: "0 0 24 24", width: "1em", height: "1em", fill: "none", stroke: "currentColor", strokeWidth: 2,
       strokeLinecap: "round", strokeLinejoin: "round" },
-      h("circle", { cx: 12, cy: 12, r: 2 }),
-      h("path", { d: "M12 10c0-4 1-7 4-7 2 0 3 2 2 4-1 1.5-3 2.5-6 3" }),
-      h("path", { d: "M14 12c4 0 7 1 7 4 0 2-2 3-4 2-1.5-1-2.5-3-3-6" }),
-      h("path", { d: "M12 14c0 4-1 7-4 7-2 0-3-2-2-4 1-1.5 3-2.5 6-3" }),
-      h("path", { d: "M10 12c-4 0-7-1-7-4 0-2 2-3 4-2 1.5 1 2.5 3 3 6" }));
+      h("path", { d: "M2 8.5a15 15 0 0 1 20 0" }),
+      h("path", { d: "M5 12a10 10 0 0 1 14 0" }),
+      h("path", { d: "M8.5 15.5a5 5 0 0 1 7 0" }),
+      h("circle", { cx: 12, cy: 19, r: 1 }));
   }
 
   return function (serverAPI) {

@@ -137,7 +137,6 @@ class DeviceControlsComponent(context: Context, root: File, private val activity
                     }
                     "wifi.request" -> if (text == "0" || text == "1") Rp4ProControls.setWifi(context, text == "1")
                     "bluetooth.request" -> if (text == "0" || text == "1") Rp4ProControls.setBluetooth(context, text == "1")
-                    "quicksettings.request" -> if (text == "1") Rp4ProControls.openQuickSettings(context)
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "Could not apply $name", e)
@@ -200,7 +199,7 @@ class DeviceControlsComponent(context: Context, root: File, private val activity
         private const val PERMISSION_CHANNEL = "brightness_permission"
         private const val PERMISSION_NOTIFICATION = 0x4442
         private val REQUESTS = setOf("brightness.request", "volume.request", "mute.request",
-            "wifi.request", "bluetooth.request", "quicksettings.request")
+            "wifi.request", "bluetooth.request")
         @JvmStatic fun directory(root: File) = File(root, "etc/droiddeck-device-controls")
         @JvmStatic fun prepareBacklight(context: Context, root: File): File {
             val base = File(directory(root), "backlight")
