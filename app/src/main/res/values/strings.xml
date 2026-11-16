@@ -3821,10 +3821,4 @@
     <string name="rp4_wifi">Wi-Fi</string>
     <string name="rp4_bluetooth">Bluetooth</string>
     <string name="rp4_switch_failed">Android did not allow the switch</string>
-    <string name="rp4_quick_menu">Steam quick menu</string>
-    <string name="rp4_quick_menu_hint">Adds a DroidDeck RP4 Pro panel (Wi-Fi, Bluetooth) to Steam\'s quick menu and turns Decky on. Stop the Steam session first.</string>
-    <string name="rp4_quick_menu_on">Panel installed and Decky on. It shows in Steam\'s quick menu (… button) under the plug icon.</string>
-    <string name="rp4_quick_menu_done">Installed. The panel shows the next time Steam starts.</string>
-    <string name="rp4_add">Add</string>
-    <string name="rp4_reinstall">Reinstall</string>
 </resources>

@@ -6,7 +6,6 @@ import android.content.Context
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.util.Log
-import org.json.JSONObject
 
 object Rp4ProControls {
     private const val TAG = "Rp4ProControls"
@@ -47,11 +46,5 @@ object Rp4ProControls {
     } catch (e: Exception) {
         Log.w(TAG, "Could not switch Bluetooth", e)
         false
-    }
-
-    fun json(context: Context): JSONObject? {
-        if (!supported()) return null
-        val s = state(context)
-        return JSONObject().put("wifi", s.wifi == true).put("bluetooth", s.bluetooth == true)
     }
 }

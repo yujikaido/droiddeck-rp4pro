@@ -13,7 +13,6 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import com.droiddeck.launcher.R
 import com.droiddeck.launcher.core.Rp4ProControls
-import com.droiddeck.launcher.runtime.DeckyManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -26,8 +25,6 @@ internal fun Rp4ProGroup(host: MenuHost) {
     val scope = rememberCoroutineScope()
     var state by remember { mutableStateOf(Rp4ProControls.state(context)) }
     var refresh by remember { mutableIntStateOf(0) }
-    var pluginInstalled by remember { mutableStateOf(DeckyManager.bundledPluginInstalled(context)) }
-    var installing by remember { mutableStateOf(false) }
     LaunchedEffect(refresh) {
         while (true) {
             state = withContext(Dispatchers.IO) { Rp4ProControls.state(context) }
@@ -51,19 +48,5 @@ internal fun Rp4ProGroup(host: MenuHost) {
         if (state.bluetooth != null) ToggleRow(host, "rp4-bluetooth", stringResource(R.string.rp4_bluetooth), null, state.bluetooth == true) {
             switch({ on -> Rp4ProControls.setBluetooth(context, on) }, it)
         }
-        if (DeckyManager.installed(context) != null) ActionRow(stringResource(R.string.rp4_quick_menu),
-            stringResource(if (pluginInstalled && DeckyManager.supervisorEnabled(context)) R.string.rp4_quick_menu_on else R.string.rp4_quick_menu_hint),
-            stringResource(if (pluginInstalled) R.string.rp4_reinstall else R.string.rp4_add),
-            onClick = {
-                if (!installing) {
-                    installing = true
-                    scope.launch {
-                        val error = withContext(Dispatchers.IO) { DeckyManager.installRp4ProPlugin(context) }
-                        installing = false
-                        pluginInstalled = DeckyManager.bundledPluginInstalled(context)
-                        toast(error ?: context.getString(R.string.rp4_quick_menu_done))
-                    }
-                }
-            })
     }
 }

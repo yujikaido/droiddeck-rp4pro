@@ -15,7 +15,6 @@ import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
 import android.util.Log
-import com.droiddeck.launcher.core.Rp4ProControls
 import com.droiddeck.launcher.core.SessionPart
 import com.droiddeck.launcher.R
 import java.io.File
@@ -76,8 +75,7 @@ class DeviceControlsComponent(context: Context, root: File, private val activity
             write("backlight/droiddeck/brightness", "$value\n")
             write("backlight/droiddeck/actual_brightness", "$value\n")
             val state = JSONObject().put("brightness", (value.coerceIn(1, 255) - 1) / 254.0)
-                .put("brightnessWritable", Settings.System.canWrite(context))
-                .apply { Rp4ProControls.json(context)?.let { put("rp4pro", it) } }.toString()
+                .put("brightnessWritable", Settings.System.canWrite(context)).toString()
             if (force || state != previous) {
                 write("state.json", JSONObject(state).put("revision", ++revision).toString())
                 previous = state
@@ -135,8 +133,6 @@ class DeviceControlsComponent(context: Context, root: File, private val activity
                         audio.adjustStreamVolume(AudioManager.STREAM_MUSIC,
                             if (text == "1") AudioManager.ADJUST_MUTE else AudioManager.ADJUST_UNMUTE, 0)
                     }
-                    "wifi.request" -> if (text == "0" || text == "1") Rp4ProControls.setWifi(context, text == "1")
-                    "bluetooth.request" -> if (text == "0" || text == "1") Rp4ProControls.setBluetooth(context, text == "1")
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "Could not apply $name", e)
@@ -198,8 +194,7 @@ class DeviceControlsComponent(context: Context, root: File, private val activity
         private const val STREAM_MUTE_CHANGED_ACTION = "android.media.STREAM_MUTE_CHANGED_ACTION"
         private const val PERMISSION_CHANNEL = "brightness_permission"
         private const val PERMISSION_NOTIFICATION = 0x4442
-        private val REQUESTS = setOf("brightness.request", "volume.request", "mute.request",
-            "wifi.request", "bluetooth.request")
+        private val REQUESTS = setOf("brightness.request", "volume.request", "mute.request")
         @JvmStatic fun directory(root: File) = File(root, "etc/droiddeck-device-controls")
         @JvmStatic fun prepareBacklight(context: Context, root: File): File {
             val base = File(directory(root), "backlight")
