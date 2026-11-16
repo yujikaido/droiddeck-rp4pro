@@ -634,6 +634,60 @@ class GameEnvironmentTest(unittest.TestCase):
                 (asylum / name).touch()
             self.assertEqual(MODULE["engine_fixes"](str(asylum / "BmLauncher.exe"), []), ({}, [], []))
 
+    def test_beyond_good_and_evil_runs_without_main_tso_capped_at_60(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            game = Path(tmp) / "Beyond Good and Evil"
+            game.mkdir()
+            for name in ("BGE.exe", "SettingsApplication.exe"):
+                (game / name).touch()
+            env, extra, notes = MODULE["engine_fixes"](str(game / "BGE.exe"), [])
+            self.assertEqual((env, extra), ({"FEX_TSOENABLED": "0", "DXVK_FRAME_RATE": "60"}, []))
+            self.assertEqual(MODULE["engine_fixes"](str(game / "BGE.exe"), [], level="off")[0], {"DXVK_FRAME_RATE": "60"})
+            config = {"version": 1, "shared": {"FEX_TSOENABLED": "1"}}
+            self.assertEqual(MODULE["apply_config"]({}, config, "15130", env)["FEX_TSOENABLED"], "0")
+            config["games"] = {"15130": {"FEX_TSOENABLED": "1"}}
+            self.assertEqual(MODULE["apply_config"]({}, config, "15130", env)["FEX_TSOENABLED"], "1")
+            (game / "SettingsApplication.exe").unlink()
+            self.assertEqual(MODULE["engine_fixes"](str(game / "BGE.exe"), []), ({}, [], []))
+
+    def test_beyond_good_and_evil_blur_and_flare_go_off_once(self):
+        section = "[Software\\\\Ubisoft\\\\Beyond Good & Evil\\\\SettingsApplication.INI\\\\Basic video] 1794782964\n"
+        video = '"AfterFx"=dword:00000001\n"Blurryness"=dword:00000000\n"Flare"=dword:00000001\n'
+        other = "[Software\\Other] 1\n\"Flare\"=dword:00000001\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix = Path(tmp) / "compatdata/15130/pfx"
+            prefix.mkdir(parents=True)
+            registry = prefix / "user.reg"
+            env = {"STEAM_COMPAT_DATA_PATH": str(prefix.parent)}
+            command = ["proton", "waitforexitandrun", "/g/Beyond Good and Evil/BGE.exe"]
+            registry.write_text("WINE REGISTRY Version 2\n\n" + other + "\n")
+            MODULE["beyond_good_and_evil_picture"](command, env)
+            self.assertFalse((prefix / ".droiddeck-bge-picture").exists())
+            registry.write_text("WINE REGISTRY Version 2\n\n" + section + video + "\n" + other)
+            MODULE["beyond_good_and_evil_picture"](["proton", "waitforexitandrun", "/g/x/SettingsApplication.exe"], env)
+            self.assertIn('"AfterFx"=dword:00000001', registry.read_text())
+            MODULE["beyond_good_and_evil_picture"](command, env)
+            text = registry.read_text()
+            self.assertIn('"AfterFx"=dword:00000000\n"Blurryness"=dword:00000000\n"Flare"=dword:00000000\n', text)
+            self.assertTrue(text.endswith(other))
+            registry.write_text(text.replace('"Flare"=dword:00000000', '"Flare"=dword:00000001'))
+            MODULE["beyond_good_and_evil_picture"](command, env)
+            self.assertIn('"Flare"=dword:00000001', registry.read_text())
+
+    def test_beyond_good_and_evil_picture_waits_for_wine(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix = Path(tmp) / "compatdata/15130/pfx"
+            prefix.mkdir(parents=True)
+            registry = prefix / "user.reg"
+            registry.write_text("[Software\\\\Ubisoft\\\\Beyond Good & Evil\\\\SettingsApplication.INI\\\\Basic video] 1\n"
+                                '"AfterFx"=dword:00000001\n')
+            env = {"STEAM_COMPAT_DATA_PATH": str(prefix.parent)}
+            command = ["proton", "waitforexitandrun", "/g/BGE.exe"]
+            with mock.patch.dict(MODULE["beyond_good_and_evil_picture"].__globals__, {"wineserver_running": lambda p: True}):
+                MODULE["beyond_good_and_evil_picture"](command, env, wait=0)
+            self.assertIn('"AfterFx"=dword:00000001', registry.read_text())
+            self.assertFalse((prefix / ".droiddeck-bge-picture").exists())
+
     def test_d3dgear_capture_hook_beside_the_game_is_turned_off(self):
         with tempfile.TemporaryDirectory() as tmp:
             game = Path(tmp) / "The Crew 2"
