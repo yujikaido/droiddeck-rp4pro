@@ -16,7 +16,7 @@ for each game you try; "Playable" means a full session without crashes or render
 | Tales of Eternia Remastered | SD card (exFAT) | Playable | about 53 in towns and battles | Needs an **exFAT** card or internal storage: on FAT32, Steam stops with "Not enough disk space" (one folder holds 9,362 files, more than a FAT32 folder can list). Copied from a PC instead of downloaded, see the tip below. About a minute to start from a slow card |
 | STAR OCEAN THE SECOND STORY R | SD card (exFAT) | Playable | towns ~60, dungeons 50-60, field battles 34-47, open views (outside Krosse) 12-25 | Settings: Anti-aliasing None, Render Distance 0.5, Cull Distance shortest, Depth of Field off, Shadows Low. Open views max out the GPU. Frame generation off: it lowers real frames here. Settings may carry over from a PC. Loads 30-60 s from a slow card |
 | Tales of Vesperia: Definitive Edition | Internal storage | Playable | about 60 in battle, 51-57 in the field, about 42 in towns (fix53: about 46) (with anti-aliasing off, no frame generation) | With anti-aliasing on it ran about 27 in battle and 17 in towns. No graphics menu was found in the game: with the game closed, set `antialiasing=0` in `settings.ini` (in the game prefix under `AppData\Local\BANDAI NAMCO Entertainment\Tales of Vesperia`). Frame generation off feels smoother at these speeds. Short stutters on first visits to new areas |
-| | | | | |
+| Beyond Good & Evil | SD card | Playable with fixes (fix55) | 60 (was 13-22) | D3D8 32-bit, 1280x720. Before fix55 it stopped with "Application settings not correctly set" and Game Settings with "EAX not properly installed". fix55 applies its fixes by itself (blur and flare off, FEX TSO off, 60 fps cap), see the notes below the table |
 | | | | | |
 | | | | | |
 
@@ -46,3 +46,11 @@ whether the game is on internal storage or the SD card, and the frame-generation
 - **Ys: The Oath in Felghana:** needs fix45 or later for the DirectX 9 version; DroidDeck sets it up by itself.
   Before/after screenshots are in the [CHANGELOG](CHANGELOG.md#fix45-ys-the-oath-in-felghana-draws-its-world).
 - **Ys VI: The Ark of Napishtim:** Steam's launch menu offers four entries; "Play Ys VI" is the DirectX 9 game.
+- **Beyond Good & Evil:** needs fix55 or later: earlier builds marked the game's own settings and EAX installers as
+  already run, so it never started. fix55 sets it up by itself, nothing to change by hand:
+  - The game's **Antialiasing** (a full-screen blur, not anti-aliasing) and **Flare** are turned off once, at the
+    first start: with them on the picture is a washed-out grey with streaks. Turning them back on in Game Settings
+    sticks.
+  - FEX's main TSO is off for this game: with it on, the game's main thread maxes out a fast core at 13-22 fps;
+    off, a steady 60. A FEX preset you pick for the game yourself still wins.
+  - Capped at 60 fps in DXVK: Steam's 60 fps limit didn't hold (about 65) and cutscene sound drifted.
