@@ -445,7 +445,11 @@ object ComponentsManager {
                 for (arch in PE_ARCHES) {
                     val target = File(dir, "$compDir/$arch")
                     if (!File(staged, "$compDir/$arch").isDirectory || !target.isDirectory) continue
-                    target.listFiles()?.filter { it.name.lowercase() in COMP_DLLS.getValue(comp) }?.forEach { it.delete() }
+                    // only what the package brings again: DXVK 1.10.3 has no d3d8.dll, and Valve's steampipe_fixups
+                    // stops the launch when a file of its manifest is gone (Proton Experimental on Vulkan 1.1 drivers)
+                    val brought = File(staged, "$compDir/$arch").list()?.map { it.lowercase() }?.toSet().orEmpty()
+                    target.listFiles()?.filter { it.name.lowercase() in COMP_DLLS.getValue(comp) && it.name.lowercase() in brought }
+                        ?.forEach { it.delete() }
                 }
             }
             val hashes = LinkedHashMap<String, String>()
@@ -483,6 +487,37 @@ object ComponentsManager {
         check(tmp.renameTo(dest)) { "Could not save original bundle ${dest.name}" }
     }
 
+
+    /** The files of [comp] a package left out (DXVK 1.10.3 has no d3d8.dll) come back from the saved original: Valve's
+     *  steampipe_fixups ends the launch when a file of its manifest is missing. */
+    private fun fillFromOriginal(context: Context, p: Proton, comp: String) {
+        val compDir = COMP_DIR[comp] ?: return
+        val original = originalFile(context, p, comp)
+        if (!original.isFile) return
+        readWcp(original) { tar ->
+            while (true) {
+                val e = tar.nextTarEntry ?: break
+                val rel = normalize(e.name)
+                if (e.isDirectory || !rel.startsWith("$compDir/") || rel.split('/').any { it == ".." }) continue
+                val dst = File(p.dir, rel)
+                if (dst.exists()) continue
+                dst.parentFile?.mkdirs()
+                val tmp = File(dst.parentFile, dst.name + ".dcm-new")
+                FileOutputStream(tmp).use { tar.copyTo(it) }
+                tmp.setReadable(true, false)
+                if (!tmp.renameTo(dst)) tmp.delete() else Log.i(TAG, "${p.name}: $rel back from the original (the package has none)")
+            }
+        }
+    }
+
+    /** fillFromOriginal for every Proton with a package in place, for swaps made before it existed. */
+    private fun fillAllFromOriginals(context: Context) = synchronized(lock) {
+        val active = loadState(context).optJSONObject("active") ?: return@synchronized
+        for (p in protons(context)) for (comp in COMP_DIR.keys) {
+            if (active.optJSONObject(p.id)?.has(comp) != true || inUse(context, p)) continue
+            runCatching { fillFromOriginal(context, p, comp) }.onFailure { Log.w(TAG, "original $comp files for ${p.name}", it) }
+        }
+    }
 
     private fun originalFile(context: Context, p: Proton, comp: String) =
         File(originalsDir(context), "${p.id}/${safeName(p.version)}/$comp.wcp").apply { parentFile?.mkdirs() }
@@ -631,7 +666,20 @@ object ComponentsManager {
                     .filter { owned(comp, it) }.associateWith { File(base, it) }
             }
             // A bionic tool never loses a FEX file: its launch.sh would put the whole bundled FEX back.
-            val removed = if (comp == "fex" && bionicTool(p.dir.name)) emptySet() else managed(comp) - files.keys
+            var removed = if (comp == "fex" && bionicTool(p.dir.name)) emptySet() else managed(comp) - files.keys
+            // A DLL the package leaves out (DXVK 1.10.3 has no d3d8.dll) stays Proton's own, from the saved original:
+            // Valve's steampipe_fixups ends the launch when a file of its manifest is missing.
+            val original = originalFile(context, p, comp)
+            if (comp != "fex" && removed.isNotEmpty() && original.isFile && wcp != original) {
+                val base = unpack("original-${p.id}-${safeName(p.version)}-$comp", original, comp)
+                val kept = removed.filter { File(base, it).isFile }
+                for (rel in kept) {
+                    val guestSrc = "/" + File(base, rel).relativeTo(root(context)).invariantSeparatorsPath
+                    lines.append(scope).append('\t').append(p.dir.name).append('\t').append(p.version).append('\t').append(comp)
+                        .append('\t').append(rel).append('\t').append(Hashes.sha256(File(base, rel))).append('\t').append(guestSrc).append('\n')
+                }
+                removed = removed - kept.toSet()
+            }
             for (rel in removed) {
                 lines.append(scope).append('\t').append(p.dir.name).append('\t').append(p.version).append('\t').append(comp)
                     .append('\t').append(rel).append("\t-\t-\n")
@@ -730,6 +778,7 @@ object ComponentsManager {
         requireFits(p, info)
         ensureOriginal(context, p, info.comp, state)
         val hashes = installFiles(context, p.dir, info.comp, wcp)
+        fillFromOriginal(context, p, info.comp)
         state.sub("active").sub(p.id).put(info.comp, JSONObject()
             .put("file", wcp.name).put("label", info.version).put("protonVersion", p.version)
             .put("files", JSONObject(hashes.filterKeys { owned(info.comp, it) } as Map<*, *>))
@@ -1320,7 +1369,9 @@ object ComponentsManager {
 
     private val forcedLock = Any()
 
-    fun ensureForcedPackages(context: Context): String? = synchronized(forcedLock) { ensureForcedPackages(
+    fun ensureForcedPackages(context: Context): String? = synchronized(forcedLock) { ensureForcedPackagesNow(context).also { fillAllFromOriginals(context) } }
+
+    private fun ensureForcedPackagesNow(context: Context): String? = synchronized(forcedLock) { ensureForcedPackages(
         context, GpuInfo.detect(),
         { file, release -> catalogItem(context, file, release) },
         { download(context, it) {} },
