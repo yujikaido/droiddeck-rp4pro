@@ -568,5 +568,40 @@ class SeedRedistsTest(unittest.TestCase):
         self.assertNotIn("EADesktopSetup", (self.reg.parent / ".droiddeck-redists").read_text())
         self.assertIn("EA app markers out", result.stdout)
 
+    def settings_game(self):
+        # Beyond Good & Evil: support.bat imports the settings BGE.exe refuses to start without, and its settings
+        # program refuses to open without EAX.
+        script = self.tmp / "common/Beyond Good and Evil/installscript.vdf"
+        script.parent.mkdir(parents=True)
+        script.write_text('"installscript"\n{\n\t"appid"\t\t"15130"\n\t"Run Process"\n\t{\n'
+                          '\t\t"DirectX"\n\t\t{\n\t\t\t"Process 1"\t\t"%INSTALLDIR%\\\\Support\\\\DirectX\\\\DXSETUP.exe"\n\t\t}\n'
+                          '\t\t"EAX"\n\t\t{\n\t\t\t"Process 1"\t\t"%INSTALLDIR%\\\\Support\\\\EAX4Unified_redist_4001.exe"\n\t\t}\n'
+                          '\t\t"support"\n\t\t{\n\t\t\t"Process 1"\t\t"%INSTALLDIR%\\\\Support\\\\support.bat"\n'
+                          '\t\t\t"description"\t\t"Game settings"\n\t\t}\n\t}\n}\n')
+        env = dict(os.environ, DROIDDECK_LIBRARIES="", DROIDDECK_SEED_SCRIPTS=str(script))
+        return subprocess.run(["bash", str(SCRIPT), str(self.steam)], env=env, capture_output=True, text=True, check=True)
+
+    def test_a_games_settings_script_is_left_to_run(self):
+        self.settings_game()
+        reg = self.reg.read_text()
+        self.assertIn('"DirectX"=dword:00000001', reg)
+        self.assertNotIn('"support"', reg)
+        self.assertNotIn('"EAX"', reg)
+        self.assertNotIn("\tsupport", (self.reg.parent / ".droiddeck-redists").read_text())
+
+    def test_a_settings_script_marker_an_earlier_seeding_wrote_comes_out(self):
+        marker = "HKEY_LOCAL_MACHINE\\\\Software\\\\Valve\\\\Steam\\\\Apps\\\\15130\tsupport"
+        self.reg.write_text(
+            "WINE REGISTRY Version 2\n"
+            "\n[Software\\\\Valve\\\\Steam\\\\Apps\\\\15130] 1791729070\n"
+            '"support"=dword:00000001\n'
+            "\n[Software\\\\Wow6432Node\\\\Valve\\\\Steam\\\\Apps\\\\15130] 1791729070\n"
+            '"support"=dword:00000001\n')
+        (self.reg.parent / ".droiddeck-redists").write_text(marker + "\n")
+        result = self.settings_game()
+        self.assertNotIn('"support"', self.reg.read_text())
+        self.assertNotIn("\tsupport", (self.reg.parent / ".droiddeck-redists").read_text())
+        self.assertIn("settings script", result.stdout)
+
 if __name__ == "__main__":
     unittest.main()

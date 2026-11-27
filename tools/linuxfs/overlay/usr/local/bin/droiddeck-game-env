@@ -12,6 +12,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 GAME_PREFIX = "DROIDDECK_GAME_"
@@ -121,6 +122,37 @@ def dotnet_memory_ordering(game):
 def unity_memory_ordering(game):
     if {"unityplayer.so", "gameassembly.so", "unityplayer.dll"} & game.files:
         return {"FEX_TSOENABLED": "1"}, [], "Unity: FEX with TSO"
+
+
+# Ys Origin and Ys: The Oath in Felghana (DirectX 9) under FEX on Mali-G77 r32p1: Microsoft's own d3dx9 hands the
+# world's draws NaN matrices (Origin's white rooms, only the HUD in Oath after a save loads); Wine's builtin draws them.
+YS_BUILTIN_D3DX9 = {"207350": "d3dx9_43=b", "207320": "d3dx9_41,d3dx9_43=b"}
+
+
+@fix
+def ys_builtin_d3dx9(game):
+    overrides = YS_BUILTIN_D3DX9.get(game.app_id or "")
+    if overrides:
+        return {"WINEDLLOVERRIDES": overrides}, [], "Ys: Wine's builtin d3dx9 (Microsoft's gives NaN world matrices under FEX)"
+
+
+def is_beyond_good_and_evil(game):
+    return game.stem == "bge" and "settingsapplication.exe" in game.files
+
+
+@fix
+def beyond_good_and_evil_tso(game):
+    """Beyond Good & Evil (D3D8, one busy main thread) runs 13-22 fps on an RP4 Pro with FEX's main TSO on
+    and a steady 60 with it off; a game's own FEX preset still wins."""
+    if is_beyond_good_and_evil(game):
+        return {"FEX_TSOENABLED": "0"}, [], "Beyond Good & Evil: FEX main TSO off (13-22 fps with it on)"
+
+
+@fix
+def beyond_good_and_evil_frame_cap(game):
+    """Steam's 60 fps limit does not hold here (about 65 through the bridge) and the cutscene sound drifts."""
+    if is_beyond_good_and_evil(game):
+        return {"DXVK_FRAME_RATE": "60"}, [], "Beyond Good & Evil: capped at 60 fps (cutscene sound drifts above it)"
 
 
 @fix
@@ -421,6 +453,87 @@ def project_zomboid_jvm(command):
               file=sys.stderr)
     except (OSError, ValueError, AttributeError) as error:
         print("droiddeck-game-env: Project Zomboid JVM settings left as is (%s)" % error, file=sys.stderr)
+
+
+BGE_VIDEO = r"[Software\\Ubisoft\\Beyond Good & Evil\\SettingsApplication.INI\\Basic video]"
+BGE_PICTURE_STAMP = ".droiddeck-bge-picture"
+# "Antialiasing" in its settings is the Blurryness slider (0-10), a full-screen blur; with it up or Flare on, the
+# picture is a washed-out grey with streaks on Mali. AfterFx stays as it is: the game plays right with it on.
+BGE_PICTURE_OFF = ("Blurryness", "Flare")
+
+
+def wineserver_running(prefix):
+    """True while a wineserver serves [prefix]: Wine's server runs in /tmp/.wine-<uid>/server-<dev>-<inode>."""
+    try:
+        info = os.stat(prefix)
+    except OSError:
+        return False
+    name = "server-%x-%x" % (info.st_dev, info.st_ino)
+    try:
+        pids = os.listdir("/proc")
+    except OSError:
+        return False
+    for pid in pids:
+        if pid.isdigit():
+            try:
+                if os.path.basename(os.readlink("/proc/%s/cwd" % pid)) == name:
+                    return True
+            except OSError:
+                pass
+    return False
+
+
+def picture_off(text):
+    """[text] (a user.reg) with BGE_PICTURE_OFF set to 0 in BGE_VIDEO, or None while that section is missing."""
+    lines = text.split("\n")
+    inside = found = False
+    for index, line in enumerate(lines):
+        if line.startswith("["):
+            inside = line.startswith(BGE_VIDEO)
+            found = found or inside
+        elif inside:
+            for name in BGE_PICTURE_OFF:
+                if line.startswith('"%s"=' % name):
+                    lines[index] = '"%s"=dword:00000000' % name
+    return "\n".join(lines) if found else None
+
+
+def beyond_good_and_evil_picture(command, env, wait=15):
+    """Turns the blur and flare passes off once, the first launch after the game's own settings were imported
+    (support.bat at first start); a player who turns them on again in Game Settings keeps them. Edits user.reg only
+    once no wineserver holds it (Proton waits for that too before the game), else tries again next launch."""
+    if len(command) < 3 or os.path.basename(command[2]).lower() != "bge.exe":
+        return
+    prefix = Path(env.get("STEAM_COMPAT_DATA_PATH", "/nonexistent")) / "pfx"
+    stamp, registry = prefix / BGE_PICTURE_STAMP, prefix / "user.reg"
+    if stamp.exists() or not registry.is_file():
+        return
+    try:
+        ends = time.monotonic() + wait
+        while wineserver_running(prefix):
+            if time.monotonic() > ends:
+                print("droiddeck-game-env: Beyond Good & Evil picture settings left for the next launch (Wine still running)",
+                      file=sys.stderr)
+                return
+            time.sleep(0.5)
+        text = registry.read_text(encoding="utf-8", errors="surrogateescape")
+        updated = picture_off(text)
+        if updated is None:
+            return
+        if updated != text:
+            handle, staged = tempfile.mkstemp(prefix=".user-", dir=prefix)
+            try:
+                with os.fdopen(handle, "w", encoding="utf-8", errors="surrogateescape", newline="") as target:
+                    target.write(updated)
+                os.chmod(staged, registry.stat().st_mode & 0o7777)
+                os.replace(staged, registry)
+            except BaseException:
+                os.unlink(staged)
+                raise
+        stamp.write_text("Blurryness and Flare turned off once\n")
+        print("droiddeck-game-env: Beyond Good & Evil: Antialiasing (blur) and Flare off", file=sys.stderr)
+    except OSError as error:
+        print("droiddeck-game-env: Beyond Good & Evil picture settings left as is (%s)" % error, file=sys.stderr)
 
 
 def offline_without_anticheat(command, env):
@@ -1653,6 +1766,7 @@ def main():
                 death_stranding_allocator(app_id, command[2])
                 dragon_quest_monsters_4_mesh_detail(command[2], effective_env)
             ubisoft_overlay_off(env)
+            beyond_good_and_evil_picture(command, env)
             project_zomboid_jvm(command)
             fixes, extra, notes = engine_fixes(command[2], command[3:], app_id) if len(command) > 2 else ({}, [], [])
             if not gl_default:
