@@ -33,7 +33,8 @@ static int card_path(int dirfd, const char *path) {
   return statfs(path, &fs) == 0 && card_type(fs.f_type);
 }
 
-static int card_fd(int fd) {
+/* fchmod itself is owner.c's (Wine's server on any storage without Unix owners); it asks this too. */
+__attribute__((visibility("hidden"))) int dd_card_fd(int fd) {
   struct statfs fs;
 
   return fstatfs(fd, &fs) == 0 && card_type(fs.f_type);
@@ -56,13 +57,13 @@ static int card_fd(int fd) {
 int utimensat(int dirfd, const char *path, const struct timespec times[2], int flags) {
   NEXT(utimensat);
   int result = next_utimensat(dirfd, path, times, flags);
-  REFUSED_ON_CARD(result, path == NULL ? card_fd(dirfd) : card_path(dirfd, path));
+  REFUSED_ON_CARD(result, path == NULL ? dd_card_fd(dirfd) : card_path(dirfd, path));
 }
 
 int futimens(int fd, const struct timespec times[2]) {
   NEXT(futimens);
   int result = next_futimens(fd, times);
-  REFUSED_ON_CARD(result, card_fd(fd));
+  REFUSED_ON_CARD(result, dd_card_fd(fd));
 }
 
 int utime(const char *path, const struct utimbuf *times) {
@@ -86,7 +87,7 @@ int lutimes(const char *path, const struct timeval times[2]) {
 int futimes(int fd, const struct timeval times[2]) {
   NEXT(futimes);
   int result = next_futimes(fd, times);
-  REFUSED_ON_CARD(result, card_fd(fd));
+  REFUSED_ON_CARD(result, dd_card_fd(fd));
 }
 
 int futimesat(int dirfd, const char *path, const struct timeval times[2]) {
@@ -99,12 +100,6 @@ int chmod(const char *path, mode_t mode) {
   NEXT(chmod);
   int result = next_chmod(path, mode);
   REFUSED_ON_CARD(result, card_path(AT_FDCWD, path));
-}
-
-int fchmod(int fd, mode_t mode) {
-  NEXT(fchmod);
-  int result = next_fchmod(fd, mode);
-  REFUSED_ON_CARD(result, card_fd(fd));
 }
 
 int fchmodat(int dirfd, const char *path, mode_t mode, int flags) {

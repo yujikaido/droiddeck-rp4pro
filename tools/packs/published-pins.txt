@@ -1,0 +1,14 @@
+# The add-on packs DroidDeck 0.7.11 (c6169cba8) was released with: name, sha256, size. This tree's local builds
+# have no packs of their own (app/build/packs), so app/build.gradle pins these, as the official APK does; they
+# download from Droid-Deck/DroidDeck-Components, release pack-<name>-<first 16 hex digits of the sha256>.
+butler f09fe478841a79a43267fce9050235c34207020274b8f62afe811dbe7bb725cf 7855451
+comet 73cca25e9c2b9506737ff6c9714d20c74b2a2bd5036fdfbbd4d9d8c1942a103a 4187027
+directaudio fc3deada9eb56deca7a8f930c193ad9dbcf2a2c0f4fe094edcf905a82550b33f 22583
+dirt 9e75ac1fcd1ce0ee0df950414034e46f59acfea7a0e650ea59b84ad20f682af2 4169
+epic 106f09e614220b9d9c10d24c797bf8f374d089b3a00b6357b251c5f6acbd65e0 147201
+powervr c9542df0c518e9986846aa1dcf14f6ac427225954773bc6b8248890de3dbe1d0 33401736
+proot 7800e188363f2b99485e8b9e4f68ea77eb65b088ca66b9e508a3a0938acea394 99536
+rockstar 2fc252dbf9ef82eaddbc08a83afd44806ae4c9be0dd64511bfef55eead1223ad 435127
+tracking 968fcb3ff812c26d7f8421a2584cf42498458004c08c6f28900b09c0f4432415 25576818
+ubisoft df0515429e9dacf90a162edaf518d47690f967befbfac961247e7a59cfbe8221 179614
+xbox f287ffffec20121b417498f860b9d259787e727c33373e2d6a06523fb3165b47 13000449

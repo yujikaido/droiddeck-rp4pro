@@ -93,6 +93,9 @@ def trackingPack = rootProject.file('tools/packs/tracking/release.env').readLine
 def prootPackPin = rootProject.file('tools/packs/proot/release.env').readLines()
     .findAll { it.contains('=') && !it.startsWith('#') }
     .collectEntries { def kv = it.split('=', 2); [(kv[0].trim()): kv[1].trim()] }
+def publishedPins = rootProject.file('tools/packs/published-pins.txt').with { it.isFile() ? it.readLines() : [] }
+    .findAll { it.trim() && !it.startsWith('#') }
+    .collectEntries { def f = it.trim().split(/\s+/); [(f[0]): [sha256: f[1], size: f[2] as long]] }
 def addonPacks = ['proot', 'directaudio', 'tracking', 'xbox', 'comet', 'butler', 'powervr', 'ubisoft', 'rockstar', 'dirt', 'epic'].collectEntries { name ->
     def pack = file("build/packs/${name}.tar.zst")
     if (!pack.isFile()) {
@@ -100,8 +103,10 @@ def addonPacks = ['proot', 'directaudio', 'tracking', 'xbox', 'comet', 'butler',
         if (name == 'proot' && prootPackPin.PROOT_PACK_SHA256) {
             return [(name): [sha256: prootPackPin.PROOT_PACK_SHA256, size: (prootPackPin.PROOT_PACK_SIZE ?: '0') as long]]
         }
-        // Same for DirectAudio: the runtime installer needs it, and without a pin a source build can never update the runtime.
-        if (name == 'directaudio' && pin) return [(name): pin]
+        // A local build pins the packs 0.7.11 was released with (tools/packs/published-pins.txt): without a pin the
+        // runtime installer cannot fetch DirectAudio, and the stores' packs never download.
+        def pin = publishedPins[name]
+        if (pin) return [(name): pin]
         return [(name): [sha256: '', size: 0L]]
     }
     def digest = java.security.MessageDigest.getInstance('SHA-256')

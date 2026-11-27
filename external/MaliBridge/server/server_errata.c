@@ -1042,7 +1042,7 @@ int vkb_errata_msaa2_shown(const vkb_srv_table *t, VkPhysicalDevice pd, char *wh
     switches w;
     read_switches(&w);
     int targeted, forced_off;
-    if (!decide_erratum(VKB_ERRATUM_MSAA2_AS_4, &d, gpu, performance_mode(), &w, &targeted, why, cap, &forced_off)) return 0;
+    if (!decide_erratum(VKB_ERRATUM_MSAA2_AS_4, &d, gpu, performance_mode(), &w, &targeted, why, cap, &forced_off, NULL)) return 0;
     size_t o = strlen(why);
     snprintf(why + o, cap - o, "; %s multisamples at 1x and 4x only", gpu);
     return 1;

@@ -51,6 +51,8 @@ void dd_storage_owner(int fd, struct stat *st) {
   errno = saved;
 }
 
+int dd_card_fd(int fd); /* cardattr.c */
+
 int fchmod(int fd, mode_t mode) {
   static int (*next_fchmod)(int, mode_t);
   int saved = errno, result;
@@ -61,8 +63,10 @@ int fchmod(int fd, mode_t mode) {
     return -1;
   }
   result = next_fchmod(fd, mode);
-  if (result != 0 && errno == EPERM && dd_is_wineserver()) {
-    if (has_no_unix_owner(fd)) {
+  if (result != 0 && errno == EPERM) {
+    /* Wine's server on storage without Unix owners; any program on a card reached natively (cardattr.c:
+     * Steam's Move install folder) */
+    if ((dd_is_wineserver() && has_no_unix_owner(fd)) || dd_card_fd(fd)) {
       errno = saved;
       return 0;
     }

@@ -84,7 +84,7 @@ internal fun RetroStart(s: FrontEndState, a: FrontEndActions, modifier: Modifier
         val played = all.filter { s.retroStats[it.hostPath.path] != null }.sortedByDescending { s.retroStats[it.hostPath.path]?.last ?: 0L }
         (played + all.shuffled(java.util.Random(7))).distinctBy { it.hostPath.path }.take(48)
     }
-    val tabs = RETRO_SECTIONS.map { it to stringResource(sectionLabel(it)) }
+    val tabs = RETRO_SECTIONS.map { it to stringResource(retroSectionLabel(it)) }
     LaunchedEffect(Unit) { a.onRetroOpen() }
     LiftHero(
         key = "retro", tabs = tabs,
@@ -118,7 +118,7 @@ internal fun RetroStart(s: FrontEndState, a: FrontEndActions, modifier: Modifier
 
 private val RETRO_SECTIONS = listOf("emulators", "paths", "wallpapers")
 
-internal fun sectionLabel(section: String) = when (section) {
+internal fun retroSectionLabel(section: String) = when (section) {
     "emulators" -> R.string.retro_emulators
     "paths" -> R.string.retro_paths_title
     else -> R.string.retro_wallpapers

@@ -85,7 +85,7 @@ internal fun RetroSettingsPage(s: FrontEndState, a: FrontEndActions, modifier: M
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth().padding(start = 26.dp, end = 22.dp, top = 6.dp, bottom = 8.dp)) {
             Icon(Icons.Outlined.Settings, null, tint = colors.onBackground, modifier = Modifier.size(26.dp))
             Text(stringResource(R.string.retro_settings), fontSize = 22.sp, fontWeight = FontWeight.Bold, color = colors.onBackground, modifier = Modifier.padding(start = 10.dp))
-            page?.let { Text(stringResource(sectionLabel(it)), fontSize = 18.sp, color = colors.onSurfaceVariant, modifier = Modifier.padding(start = 12.dp)) }
+            page?.let { Text(stringResource(retroSectionLabel(it)), fontSize = 18.sp, color = colors.onSurfaceVariant, modifier = Modifier.padding(start = 12.dp)) }
         }
         Box(Modifier.fillMaxWidth().padding(horizontal = 18.dp).height(1.dp).background(LocalPalette.current.line))
         Column(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 18.dp, vertical = 6.dp)) {

@@ -1574,6 +1574,8 @@ void vkb_mem_mutable_instance_install(vkb_srv_table *t)
     if (!t->dt.vkGetPhysicalDeviceImageFormatProperties2) return;
     mutable_next = t->dt.vkGetPhysicalDeviceImageFormatProperties2;
     t->dt.vkGetPhysicalDeviceImageFormatProperties2 = mutable_GetPhysicalDeviceImageFormatProperties2;
+}
+
 /* ------------------------------------------------------------------ linear images under the AHB strategy */
 
 /*

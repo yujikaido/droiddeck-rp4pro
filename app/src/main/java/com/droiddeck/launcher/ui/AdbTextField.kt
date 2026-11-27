@@ -9,6 +9,11 @@ import android.widget.EditText
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.relocation.bringIntoViewRequester
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -38,6 +43,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import kotlin.math.min
 import kotlin.math.roundToInt
 
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
 internal fun AdbTextField(
     value: String,
@@ -53,6 +59,9 @@ internal fun AdbTextField(
     onNext: (() -> Unit)? = null,
     onDone: (() -> Unit)? = null,
     focusOnShow: Boolean = false,
+    password: Boolean = false,
+    revealed: Boolean = false,
+    trailing: (@Composable () -> Unit)? = null,
     showLabel: Boolean = true,
     focusAtTap: Int? = null,
     onBack: (() -> Unit)? = null,
@@ -97,7 +106,17 @@ internal fun AdbTextField(
         onDispose { typingRequest[0]?.let { DualScreenPanel.stopTyping(it) } }
     }
 
-    Column(modifier = modifier.fillMaxWidth()) {
+    // the EditText lives in an AndroidView, so Compose doesn't scroll it into view on its own: once it has focus
+    // (and again as the keyboard finishes opening and the dialog shrinks), ask the scrolling parent to show it
+    val reveal = remember { androidx.compose.foundation.relocation.BringIntoViewRequester() }
+    val imeBottom = WindowInsets.ime.getBottom(androidx.compose.ui.platform.LocalDensity.current)
+    androidx.compose.runtime.LaunchedEffect(focused, imeBottom) {
+        if (focused) {
+            kotlinx.coroutines.delay(60)
+            reveal.bringIntoView()
+        }
+    }
+    Column(modifier = modifier.fillMaxWidth().bringIntoViewRequester(reveal)) {
         if (showLabel) Text(
             label,
             style = MaterialTheme.typography.labelSmall,
@@ -105,17 +124,33 @@ internal fun AdbTextField(
             color = colors.onSurfaceVariant,
             maxLines = 1,
         )
-        Box(
+        // a platform EditText rather than a Compose field: only it can ask for NO_EXTRACT_UI, which keeps the keyboard
+        // docked under the page in landscape instead of covering the whole screen with its own small text box
+        fun inputTypeFor() = when {
+            password && revealed -> InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            password -> InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+            keyboardType == KeyboardType.Number -> InputType.TYPE_CLASS_NUMBER
+            else -> InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+        }
+        fun EditText.applyInputType() {
+            val at = selectionStart
+            inputType = inputTypeFor()
+            transformationMethod = if (password && !revealed) android.text.method.PasswordTransformationMethod.getInstance()
+                else android.text.method.SingleLineTransformationMethod.getInstance()
+            typeface = android.graphics.Typeface.DEFAULT
+            if (at >= 0) setSelection(min(at, text.length))
+        }
+        Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .height(inputHeight)
                 .background(colors.surfaceVariant, shape)
                 .glideBorder(focused, shape, palette.signal, palette.line2)
-                .padding(horizontal = 10.dp),
-            contentAlignment = Alignment.CenterStart,
+                .padding(start = 10.dp, end = if (trailing != null) 4.dp else 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
             AndroidView(
-                modifier = Modifier.fillMaxSize(),
+                modifier = Modifier.weight(1f).fillMaxHeight(),
                 factory = { viewContext ->
                     EditText(viewContext).apply {
                         isSingleLine = true
@@ -126,11 +161,7 @@ internal fun AdbTextField(
                         setTextColor(colors.onBackground.toArgb())
                         setHintTextColor(colors.onSurfaceVariant.toArgb())
                         contentDescription = label
-                        inputType = if (keyboardType == KeyboardType.Number) {
-                            InputType.TYPE_CLASS_NUMBER
-                        } else {
-                            InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
-                        }
+                        applyInputType()
                         imeOptions = imeActionFlag(imeAction) or EditorInfo.IME_FLAG_NO_FULLSCREEN or EditorInfo.IME_FLAG_NO_EXTRACT_UI
                         hint = placeholder
                         setOnEditorActionListener { _, actionId, event ->
@@ -204,6 +235,7 @@ internal fun AdbTextField(
                                 ?.showSoftInput(editText, android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT)
                         }
                     }
+                    if (editText.inputType != inputTypeFor()) editText.applyInputType()
                     if (clearFocus && editText.hasFocus()) {
                         editText.clearFocus()
                         (editText.context.getSystemService(android.content.Context.INPUT_METHOD_SERVICE) as? android.view.inputmethod.InputMethodManager)
@@ -220,6 +252,7 @@ internal fun AdbTextField(
                     }
                 },
             )
+            trailing?.invoke()
         }
     }
 }
