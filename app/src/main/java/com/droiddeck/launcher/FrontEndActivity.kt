@@ -685,6 +685,20 @@ class FrontEndActivity : ComponentActivity(), com.droiddeck.launcher.ui.AgentPet
     @Volatile private var componentSweepDone = false
     @Volatile private var componentSweepSession: String? = null
     private var emulatorList by mutableStateOf<List<Library.Emulator>>(emptyList())
+    private var retroList by mutableStateOf<List<com.droiddeck.launcher.frontend.RetroLibrary.System>>(emptyList())
+    private var retroPacks by mutableStateOf<List<String>>(emptyList())
+    private var retroPack by mutableStateOf<String?>(null)
+    private var retroPackBusy by mutableStateOf<String?>(null)
+    private var retroStats by mutableStateOf<Map<String, com.droiddeck.launcher.frontend.RetroStats.Stat>>(emptyMap())
+    private var retroFavorites by mutableStateOf<Set<String>>(emptySet())
+    private var retroRoots by mutableStateOf<List<String>>(emptyList())
+    private var retroCoversShrunk = false
+    private val pickRetroRoot = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
+        if (r.resultCode == RESULT_OK) InAppFilePicker.pickedPath(r.data)?.let { path ->
+            com.droiddeck.launcher.frontend.RetroLibrary.addRoot(this, path)
+            scanRetro()
+        }
+    }
     private var runningLabel by mutableStateOf<String?>(null)
     private var logsEnabled by mutableStateOf(true)
     private var enhancedDiagnosticsArmed by mutableStateOf(false)
@@ -1424,7 +1438,7 @@ class FrontEndActivity : ComponentActivity(), com.droiddeck.launcher.ui.AgentPet
                         buildWatermark = buildWatermark,
                         clearCachedApps = clearCachedApps, adbPaired = adbPaired, memoryHud = memoryHud, backgroundAppLimit = backgroundAppLimit,
                         tpUbwcMode = drivers.tpUbwcModeForDevice(), tpUbwcRestartRequired = drivers.tpUbwcRestartRequired(), canRestartApp = !runtimeChangesBlocked(),
-                        steamGames = steamGames, steamGamesX64 = steamGamesX64, emulators = emulatorList, running = runningLabel,
+                        steamGames = steamGames, steamGamesX64 = steamGamesX64, emulators = emulatorList, retro = retroList, retroPacks = retroPacks, retroPack = retroPack, retroPackBusy = retroPackBusy, retroStats = retroStats, retroFavorites = retroFavorites, retroRoots = retroRoots, running = runningLabel,
                         frameGen = FrameGen.mode(this),
                         lossless = lossless,
                         pageKey = if (showPerformance) "performance" else if (showComponents) "components" else if (showMapping) "controller-mapping" else null,
@@ -1640,6 +1654,47 @@ class FrontEndActivity : ComponentActivity(), com.droiddeck.launcher.ui.AgentPet
                         onPerformance = { refreshCores(); showComponents = false; showMapping = false; showPerformance = true },
                         performancePanel = { PerformanceHost(embedded = true) },
                         onRoms = { showRoms = true },
+                        onRetroGame = { sys, g -> launchRetro(sys, g) },
+                        onRetroFavorite = { g ->
+                            com.droiddeck.launcher.frontend.RetroStats.toggleFavorite(this, g.hostPath.path)
+                            retroFavorites = com.droiddeck.launcher.frontend.RetroStats.favorites(this)
+                        },
+                        onRetroAddRoot = {
+                            pickRetroRoot.launch(InAppFilePicker.buildDirIntent(this, getString(R.string.retro_pick_folder), null))
+                        },
+                        onRetroRemoveRoot = { path ->
+                            com.droiddeck.launcher.frontend.RetroLibrary.removeRoot(this, path)
+                            scanRetro()
+                        },
+                        onRetroOpen = { retroOpened() },
+                        onRetroWallpaperList = {
+                            Thread({
+                                val packs = runCatching { com.droiddeck.launcher.frontend.WallpaperPacks.list(this) }.getOrDefault(emptyList())
+                                ui.post { retroPacks = packs }
+                            }, "retro-packs").start()
+                        },
+                        onRetroWallpaperPack = { pack ->
+                            if (pack == null) {
+                                com.droiddeck.launcher.frontend.WallpaperPacks.setChosen(this, null); retroPack = null; scanRetro()
+                            } else {
+                                retroPackBusy = pack
+                                Thread({
+                                    val ok = com.droiddeck.launcher.frontend.WallpaperPacks.installed(this, pack) ||
+                                        com.droiddeck.launcher.frontend.WallpaperPacks.download(this, pack)
+                                    if (ok) com.droiddeck.launcher.frontend.WallpaperPacks.setChosen(this, pack)
+                                    ui.post {
+                                        retroPackBusy = null
+                                        if (ok) retroPack = pack
+                                        else android.widget.Toast.makeText(this, getString(R.string.retro_wallpapers_failed, pack), android.widget.Toast.LENGTH_LONG).show()
+                                    }
+                                    if (ok) scanRetro()
+                                }, "retro-pack").start()
+                            }
+                        },
+                        onRetroPlayer = { sys, player ->
+                            com.droiddeck.launcher.frontend.RetroLibrary.setPlayer(this, sys.platform.id, player.id)
+                            scanRetro()
+                        },
                         onFiles = { startActivity(Intent(this, com.droiddeck.launcher.files.FileManagerActivity::class.java)) },
                         onBrowseFiles = { dir ->
                             startActivity(Intent(this, com.droiddeck.launcher.files.FileManagerActivity::class.java)
@@ -2021,9 +2076,13 @@ class FrontEndActivity : ComponentActivity(), com.droiddeck.launcher.ui.AgentPet
     }
 
     override val petBlocked: Boolean get() = false
+    /** Stopped since it last came to the front: a game or another app had the screen. */
+    private var leftFront = false
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        // Home pressed in DroidDeck itself leaves retro mode; Home from a game comes back to it
+        if (intent.getBooleanExtra(HomeActivity.EXTRA_HOME_PRESS, false) && !leftFront) com.droiddeck.launcher.ui.RetroNav.open = false
         setIntent(intent)
         supersedeUncommittedLaunch()
         if (intent.action == SteamIntegration.ACTION_SETUP) {
@@ -2178,6 +2237,11 @@ class FrontEndActivity : ComponentActivity(), com.droiddeck.launcher.ui.AgentPet
         }
         if (controllerHaptics) com.droiddeck.launcher.ui.ControllerHaptics.onKey(this, event)
         if (event.keyCode == KeyEvent.KEYCODE_BUTTON_A) com.droiddeck.launcher.ui.HeldKeys.confirm = event.action == KeyEvent.ACTION_DOWN
+        val retroShoulder = com.droiddeck.launcher.ui.RetroNav.onShoulder
+        if (!showComponents && retroShoulder != null && (event.keyCode == KeyEvent.KEYCODE_BUTTON_L1 || event.keyCode == KeyEvent.KEYCODE_BUTTON_R1)) {
+            if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) retroShoulder(if (event.keyCode == KeyEvent.KEYCODE_BUTTON_R1) 1 else -1)
+            return true
+        }
         if (showComponents && (event.keyCode == KeyEvent.KEYCODE_BUTTON_L1 || event.keyCode == KeyEvent.KEYCODE_BUTTON_R1)) {
             if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
                 components.compComp = com.droiddeck.launcher.ui.layerStep(components.compComp, if (event.keyCode == KeyEvent.KEYCODE_BUTTON_R1) 1 else -1)
@@ -2216,6 +2280,7 @@ class FrontEndActivity : ComponentActivity(), com.droiddeck.launcher.ui.AgentPet
         }
         if (settingsMode == SessionService.MODE_STEAM) refreshFoundSteamLibraries()
         settingsMode?.let { hdrOn = SessionPrefs.hdr(this, it) }
+        leftFront = false
         compatLaunchVisible = true
         com.droiddeck.launcher.ui.DualScreenPanel.yieldTo(taskId, false)
         com.droiddeck.launcher.ui.DualScreenPanel.ownerPaused(taskId, false)
@@ -2360,6 +2425,7 @@ class FrontEndActivity : ComponentActivity(), com.droiddeck.launcher.ui.AgentPet
 
     override fun onStop() {
         if (!homeChoiceOpen) HomeApp.releaseUnusedHomeEntry(this)
+        leftFront = true
         unregisterReceiver(wifiLocationReceiver)
         unregisterReceiver(dateReceiver)
         unregisterReceiver(mediaReceiver)
@@ -3356,6 +3422,12 @@ class FrontEndActivity : ComponentActivity(), com.droiddeck.launcher.ui.AgentPet
         Thread({
             val emus = Library.emulators(this) { id -> DesktopCatalog.installed(this, id) != null }
             ui.post { if (scanGeneration == libraryScanGeneration) emulatorList = emus }
+            val retro = runCatching { com.droiddeck.launcher.frontend.RetroLibrary.scan(this) }
+                .onFailure { android.util.Log.w("Retro", "scan: $it") }.getOrDefault(emptyList())
+            ui.post {
+                if (scanGeneration == libraryScanGeneration) retroList = retro
+                refreshRetroState()
+            }
             if (ready) {
                 val quick = runCatching { Library.steamGames(this) }.getOrNull()
                 val claimed = quick?.let { runCatching { Library.claimedFolders(it) }.getOrDefault(emptySet()) }.orEmpty()
@@ -3427,7 +3499,115 @@ class FrontEndActivity : ComponentActivity(), com.droiddeck.launcher.ui.AgentPet
                 val refreshed = Library.emulators(this) { id -> DesktopCatalog.installed(this, id) != null }
                 ui.post { emulatorList = refreshed }
             }
+            if (!retroCoversShrunk) {
+                retroCoversShrunk = true
+                if (CoverArt.shrinkCached(this, com.droiddeck.launcher.frontend.RetroLibrary.ID_PREFIX) > 0) {
+                    val shrunk = runCatching { com.droiddeck.launcher.frontend.RetroLibrary.scan(this) }.getOrNull()
+                    if (shrunk != null) ui.post { if (scanGeneration == libraryScanGeneration) retroList = shrunk }
+                }
+            }
+            retroExtras(retro) { scanGeneration == libraryScanGeneration }
         }, "library").start()
+    }
+
+    /** Game info and covers for the Retro page's games (on a background thread), showing the list again as they come. */
+    private fun retroExtras(retro: List<com.droiddeck.launcher.frontend.RetroLibrary.System>, current: () -> Boolean) {
+        if (OfflineMode.enabled(this) || !online()) return
+        // game info (year, genre, developer) for platforms whose metadata is missing or a month old
+        var fetched = false
+        // arcade titles, years and genres: the MAME 2003-Plus metadata, downloaded once
+        if (retro.any { com.droiddeck.launcher.frontend.RetroLibrary.isArcade(it.platform.id) } && !com.droiddeck.launcher.frontend.ArcadeTitles.cached(this))
+            fetched = com.droiddeck.launcher.frontend.ArcadeTitles.fetch(this) || fetched
+        for (sys in retro) {
+            if (sys.platform.id in com.droiddeck.launcher.frontend.NoIntro.platforms && !com.droiddeck.launcher.frontend.NoIntro.fresh(this, sys.platform.id))
+                fetched = com.droiddeck.launcher.frontend.NoIntro.fetch(this, sys.platform) || fetched
+            if (sys.platform.id in setOf("mame", "neogeo")) continue
+            if (!com.droiddeck.launcher.frontend.GameInfo.fresh(this, sys.platform.id))
+                fetched = com.droiddeck.launcher.frontend.GameInfo.fetch(this, sys.platform) || fetched
+        }
+        if (fetched) runCatching { com.droiddeck.launcher.frontend.RetroLibrary.scan(this) }.getOrNull()?.let { r ->
+            ui.post { if (current()) retroList = r }
+        }
+        // CoverArt fetches at most 40 a pass: keep going while passes find covers, refreshing the page each time
+        var rounds = 0
+        while (rounds++ < 30 && CoverArt.fetchMissing(this, retro.flatMap { it.games })) {
+            val refreshed = runCatching { com.droiddeck.launcher.frontend.RetroLibrary.scan(this) }.getOrNull() ?: break
+            ui.post { if (current()) retroList = refreshed }
+        }
+    }
+
+    /**
+     * The Retro page opened: look at the ROM folders again, so games copied in while DroidDeck stayed open (the
+     * Network page, a file manager) show without leaving the app. New games get their info and covers.
+     */
+    private fun retroOpened() {
+        val gen = libraryScanGeneration
+        val before = retroList.flatMap { s -> s.games.map { it.hostPath.path } }.toSet()
+        Thread({
+            val retro = runCatching { com.droiddeck.launcher.frontend.RetroLibrary.scan(this) }.getOrNull() ?: return@Thread
+            val now = retro.flatMap { s -> s.games.map { it.hostPath.path } }.toSet()
+            if (now == before) return@Thread
+            ui.post { if (gen == libraryScanGeneration) retroList = retro; refreshRetroState() }
+            if (!now.all { it in before }) retroExtras(retro) { gen == libraryScanGeneration }
+        }, "retro-open").start()
+    }
+
+    /** A validated internet connection: without one every cover lookup fails and would be remembered as missing. */
+    private fun online(): Boolean = runCatching {
+        val cm = getSystemService(android.net.ConnectivityManager::class.java)
+        cm.getNetworkCapabilities(cm.activeNetwork)?.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true
+    }.getOrDefault(false)
+
+    private fun refreshRetroState() {
+        retroPack = com.droiddeck.launcher.frontend.WallpaperPacks.chosen(this)
+        retroStats = com.droiddeck.launcher.frontend.RetroStats.all(this)
+        retroFavorites = com.droiddeck.launcher.frontend.RetroStats.favorites(this)
+        Thread({
+            val roots = runCatching { com.droiddeck.launcher.frontend.RetroLibrary.roots(this).map { it.path } }.getOrDefault(emptyList())
+            ui.post { retroRoots = roots }
+        }, "retro-roots").start()
+    }
+
+    private fun scanRetro() {
+        refreshRetroState()
+        Thread({
+            val retro = runCatching { com.droiddeck.launcher.frontend.RetroLibrary.scan(this) }.getOrDefault(emptyList())
+            ui.post { retroList = retro }
+        }, "retro-scan").start()
+    }
+
+    private fun launchRetro(sys: com.droiddeck.launcher.frontend.RetroLibrary.System, rom: Library.Rom) {
+        val player = sys.player
+        if (player == null) {
+            android.widget.Toast.makeText(this, getString(R.string.retro_no_player, sys.platform.name), android.widget.Toast.LENGTH_LONG).show()
+            return
+        }
+        val launch = com.droiddeck.launcher.frontend.AndroidLaunch.build(this, player, rom.hostPath)
+        if (launch == null) {
+            android.widget.Toast.makeText(this, getString(R.string.retro_player_unusable, player.label), android.widget.Toast.LENGTH_LONG).show()
+            return
+        }
+        android.util.Log.i("Retro", "${sys.platform.id}: ${rom.hostPath} in ${player.id}: ${launch.intent}")
+        // an emulator left running a game (Home out of it) keeps that game, or shows black, and never reads the new
+        // one: RetroArch takes its ROM only as its process starts. Close it first so every game starts fresh; it is in
+        // the background and paused, and RetroArch has written the game's save on its autosave interval.
+        player.pkg?.let { pkg -> runCatching { (getSystemService(ACTIVITY_SERVICE) as android.app.ActivityManager).killBackgroundProcesses(pkg) } }
+        ui.postDelayed({
+            try {
+                if (launch.fileUri) {
+                    // Android throws FileUriExposedException for a file:// intent; allow it for this one launch
+                    val policy = android.os.StrictMode.getVmPolicy()
+                    android.os.StrictMode.setVmPolicy(android.os.StrictMode.VmPolicy.Builder().build())
+                    try { startActivity(launch.intent) } finally { android.os.StrictMode.setVmPolicy(policy) }
+                } else startActivity(launch.intent)
+                player.pkg?.let { com.droiddeck.launcher.frontend.RetroPlayerClose.started(this, it) }
+                com.droiddeck.launcher.frontend.RetroStats.played(this, rom.hostPath.path)
+                retroStats = com.droiddeck.launcher.frontend.RetroStats.all(this)
+            } catch (e: Exception) {
+                android.util.Log.w("Retro", "launch failed: $e")
+                android.widget.Toast.makeText(this, getString(R.string.retro_launch_failed, player.label), android.widget.Toast.LENGTH_LONG).show()
+            }
+        }, 300)
     }
 
     private fun onRuntimeButton() {

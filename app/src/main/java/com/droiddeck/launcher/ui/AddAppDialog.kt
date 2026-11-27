@@ -321,6 +321,11 @@ internal fun AppDialog(
     val panelCap = maxWidth ?: if (wide) 860.dp else 560.dp
     VeilRing()
     Dialog(onDismissRequest = back ?: close, properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)) {
+      // resize, not pan: panning slides the whole dialog up by a guess and can leave the focused field under the
+      // keyboard; with resize, imePadding below shrinks the dialog to the space above it and the field scrolls into view
+      val dialogView = LocalView.current
+      val dialogWindow = (dialogView.parent as? androidx.compose.ui.window.DialogWindowProvider)?.window
+      androidx.compose.runtime.SideEffect { dialogWindow?.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE) }
       CompositionLocalProvider(LocalFrontFocus provides null) {
         BoxWithConstraints(
             contentAlignment = Alignment.Center,
@@ -449,7 +454,7 @@ internal fun DialogFooter(note: String?, confirm: String, enabled: Boolean, onCa
 internal fun Small(text: String, error: Boolean = false) =
     Text(text, fontSize = 12.sp, lineHeight = 16.sp, color = if (error) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
 
-private fun hideKeyboard(view: View) {
+internal fun hideKeyboard(view: View) {
     (view.context.getSystemService(android.content.Context.INPUT_METHOD_SERVICE) as? InputMethodManager)
         ?.hideSoftInputFromWindow(view.windowToken, 0)
 }

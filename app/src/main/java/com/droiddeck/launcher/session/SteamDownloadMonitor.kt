@@ -14,6 +14,9 @@ internal class SteamDownloadMonitor {
     private var contentLogOffset = 0L
     private var contentLog: File? = null
     private val activeContentUpdates = mutableSetOf<String>()
+    // Steps that only work the disk (reserving space, committing, verifying, moving a game) log nothing until they
+    // end, for many minutes on an SD card: they count from the line that started them, not from the latest line.
+    private val diskStepsSince = mutableMapOf<String, Long>()
     private var lastContentActivityAt = 0L
     private var lastReceivedBytes = -1L
     private var lastReceivedAt = 0L
@@ -47,6 +50,7 @@ internal class SteamDownloadMonitor {
         contentLogOffset = 0L
         contentLog = null
         activeContentUpdates.clear()
+        diskStepsSince.clear()
         lastContentActivityAt = 0L
         lastReceivedBytes = -1L
         lastReceivedAt = 0L
@@ -71,6 +75,7 @@ internal class SteamDownloadMonitor {
                     when {
                         "Client version:" in line -> {
                             activeContentUpdates.clear()
+                            diskStepsSince.clear()
                             lastContentActivityAt = 0L
                         }
                         " update changed : " in line && CONTENT_UPDATE.find(line)?.let { match ->
@@ -81,8 +86,23 @@ internal class SteamDownloadMonitor {
                             if ("Running Update" in state && "Stopping" !in state) {
                                 activeContentUpdates += updateId
                                 lastContentActivityAt = now
+                                if (DISK_STEPS.any { it in state }) diskStepsSince.getOrPut(updateId) { now }
+                                else diskStepsSince -= updateId
                             } else {
                                 activeContentUpdates -= updateId
+                                diskStepsSince -= updateId
+                            }
+                            true
+                        } == true -> Unit
+                        APP_STATE.find(line)?.let { match ->
+                            val moveId = "Move:${match.groupValues[1]}"
+                            if ("Moving Folder" in match.groupValues[2]) {
+                                activeContentUpdates += moveId
+                                lastContentActivityAt = now
+                                diskStepsSince.getOrPut(moveId) { now }
+                            } else {
+                                activeContentUpdates -= moveId
+                                diskStepsSince -= moveId
                             }
                             true
                         } == true -> Unit
@@ -98,7 +118,8 @@ internal class SteamDownloadMonitor {
             }
         }
         return activeContentUpdates.isNotEmpty() && lastContentActivityAt > 0L &&
-            now - lastContentActivityAt <= CONTENT_ACTIVITY_GRACE_MS
+            now - lastContentActivityAt <= CONTENT_ACTIVITY_GRACE_MS ||
+            diskStepsSince.values.any { now - it <= DISK_STEP_MAX_MS }
     }
 
     private fun read(file: File): ManifestState {
@@ -151,6 +172,9 @@ internal class SteamDownloadMonitor {
 
         private const val MANIFEST_PROGRESS_GRACE_MS = 8_000L
         private const val CONTENT_ACTIVITY_GRACE_MS = 90_000L
+        const val DISK_STEP_MAX_MS = 3L * 60L * 60L * 1000L
+        val DISK_STEPS = listOf("Preallocating", "Committing", "Verifying", "Validating")
+        private val APP_STATE = Regex("""AppID (\d+) state changed : (.*)""")
         private const val MIN_RECEIVE_BYTES_PER_SEC = 64L * 1024L
         private val PATH = Regex("\"path\"\\s+\"([^\"]+)\"")
         internal val STEAM_HOMES = listOf("root/.local/share/Steam", "root/.droiddeck-x64/.local/share/Steam")

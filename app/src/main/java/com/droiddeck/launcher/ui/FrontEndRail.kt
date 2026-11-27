@@ -60,6 +60,8 @@ import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material.icons.filled.MoreHoriz
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
+import androidx.compose.material.icons.filled.VideogameAsset
+import androidx.compose.material.icons.filled.Lan
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -197,6 +199,8 @@ internal fun SideRail(
 internal fun railLabelIcon(key: String): Pair<Int, ImageVector> = when (key) {
     "steam" -> R.string.rail_steam to Icons.Filled.SportsEsports
     "games" -> R.string.rail_games to Icons.Filled.GridView
+    "retro" -> R.string.rail_retro to Icons.Filled.VideogameAsset
+    "network" -> R.string.rail_network to Icons.Filled.Lan
     "soundtracks" -> R.string.rail_music to SoundtrackIcon
     "stores" -> R.string.rail_stores to Icons.Filled.LocalOffer
     "downloads" -> R.string.stores_tab_downloads to Icons.Filled.Download

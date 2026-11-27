@@ -28,6 +28,10 @@ object CoverArt {
         "cemu" to listOf("Nintendo_-_Wii_U"),
     )
 
+    /** The libretro-thumbnails collections for an emulator id: the Linux emulators' own, a Retro platform's from Daijishō. */
+    private fun collectionsOf(context: Context, emulatorId: String): List<String>? =
+        collections[emulatorId] ?: RetroLibrary.collectionsFor(context, emulatorId)
+
     private fun root(context: Context) = File(context.filesDir, "covers")
 
     private fun keyOf(rom: Library.Rom): String =
@@ -38,8 +42,13 @@ object CoverArt {
 
     fun cached(context: Context, rom: Library.Rom): File? = coverFile(context, rom).takeIf { it.isFile && it.length() > 0 }
 
+    private fun snapFile(context: Context, rom: Library.Rom) = File(root(context), "${rom.emulatorId}/${keyOf(rom)}.snap")
+
+    /** The game's screenshot (libretro Named_Snaps), fetched with its cover; the list view's backdrop. */
+    fun snap(context: Context, rom: Library.Rom): File? = snapFile(context, rom).takeIf { it.isFile && it.length() > 0 }
+
     private fun wanted(context: Context, rom: Library.Rom): Boolean {
-        if (rom.art != null || cached(context, rom) != null || rom.emulatorId !in collections) return false
+        if (rom.art != null || cached(context, rom) != null || collectionsOf(context, rom.emulatorId) == null) return false
         val miss = missFile(context, rom)
         return !(miss.isFile && System.currentTimeMillis() - miss.lastModified() < MISS_RETRY_MS)
     }
@@ -60,6 +69,7 @@ object CoverArt {
             val url = try { findUrl(context, rom) } catch (e: Exception) { Log.w(TAG, "${rom.name}: $e"); null }
             if (url != null && download(url, target)) {
                 Log.i(TAG, "${rom.name}: $url")
+                if ("/Named_Boxarts/" in url) download(url.replace("/Named_Boxarts/", "/Named_Snaps/"), snapFile(context, rom))
                 missFile(context, rom).delete()
                 found = true
             } else {
@@ -71,15 +81,17 @@ object CoverArt {
     }
 
     private fun findUrl(context: Context, rom: Library.Rom): String? {
-        val name = rom.hostPath.nameWithoutExtension.removeSuffix(".dec")
-        for (collection in collections.getValue(rom.emulatorId)) {
+        val fileName = rom.hostPath.nameWithoutExtension.removeSuffix(".dec")
+        // the file's name, its No-Intro name (libretro names its thumbnails so), then the name shown (a PSP disc's own title, an arcade set's)
+        val dump = rom.emulatorId.takeIf { it.startsWith(RetroLibrary.ID_PREFIX) }?.let { NoIntro.name(context, it.removePrefix(RetroLibrary.ID_PREFIX), rom.hostPath) }
+        for (name in listOfNotNull(fileName, dump, rom.name).distinct()) for (collection in collectionsOf(context, rom.emulatorId).orEmpty()) {
             val exact = thumbnailUrl(collection, name)
             if (exists(exact)) return exact
             nearest(name, names(context, collection))?.let { return thumbnailUrl(collection, it) }
         }
         return when (rom.emulatorId) {
-            "armsx2" -> ps2Serial(rom.hostPath)?.let { "https://raw.githubusercontent.com/xlenore/ps2-covers/main/covers/default/$it.jpg" }
-            "dolphin" -> nintendoDiscId(rom.hostPath)?.let { id ->
+            "armsx2", "android:ps2" -> ps2Serial(rom.hostPath)?.let { "https://raw.githubusercontent.com/xlenore/ps2-covers/main/covers/default/$it.jpg" }
+            "dolphin", "android:gc", "android:wii" -> nintendoDiscId(rom.hostPath)?.let { id ->
                 val region = when (id.getOrNull(3)) { 'P' -> "EN"; 'J' -> "JA"; 'K' -> "KO"; else -> "US" }
                 "https://art.gametdb.com/wii/cover/$region/$id.png"
             }
@@ -107,10 +119,27 @@ object CoverArt {
         if (candidates.isEmpty()) return null
         val want = base(name)
         if (want.isEmpty()) return null
-        val same = candidates.filter { base(it) == want }
+        val same = candidates.filter { base(it) == want }.ifEmpty { subtitled(want, candidates) }
         if (same.isEmpty()) return null
         val region = tags(name).firstOrNull { it in setOf("usa", "europe", "japan", "world", "korea") } ?: "usa"
         return same.firstOrNull { region in tags(it) } ?: same.firstOrNull { "usa" in tags(it) } ?: same.first()
+    }
+
+    private fun digits(words: Set<String>) = words.filter { w -> w.any { it.isDigit() } }.toSet()
+
+    /**
+     * Names that add a subtitle to the file's (Donkey Kong Country 2 -> Donkey Kong Country 2 - Diddy's Kong Quest):
+     * every word of the file's name present, the numbers the same (a sequel is not its first game), at most five words
+     * more; the fewest extra words win.
+     */
+    private fun subtitled(want: String, candidates: List<String>): List<String> {
+        val w = want.split(' ').toSet()
+        val fits = candidates.mapNotNull { c ->
+            val h = base(c).split(' ').toSet()
+            if (h.containsAll(w) && digits(h) == digits(w) && h.size - w.size <= 5) c to (h.size - w.size) else null
+        }
+        val least = fits.minOfOrNull { it.second } ?: return emptyList()
+        return fits.filter { it.second == least }.map { it.first }
     }
 
     private fun names(context: Context, collection: String): List<String> {
@@ -183,7 +212,8 @@ object CoverArt {
     }
 
     private fun nintendoDiscId(file: File): String? {
-        val offset = when (file.extension.lowercase()) { "iso", "gcm" -> 0L; "wbfs" -> 0x200L; else -> return null }
+        // RVZ/WIA keep a copy of the disc header 0x10 into their second header, which starts at 0x48
+        val offset = when (file.extension.lowercase()) { "iso", "gcm" -> 0L; "wbfs" -> 0x200L; "rvz", "wia" -> 0x58L; else -> return null }
         RandomAccessFile(file, "r").use { f ->
             val b = ByteArray(6); f.seek(offset); f.readFully(b)
             val id = String(b, Charsets.US_ASCII)
@@ -238,25 +268,77 @@ object CoverArt {
         }
     } catch (e: Exception) { Log.w(TAG, "$url: $e"); null }
 
-    private fun download(url: String, target: File): Boolean = through(url) { source, original -> fetch(source, target, original) } ?: false
+    private const val MAX_SIDE = 600
+    private const val SHRINK_OVER = 200_000L
 
-    private fun fetch(url: String, target: File, original: Boolean): Boolean? = try {
-        val c = open(url)
-        when (val code = c.responseCode) {
-            200 -> {
-                target.parentFile?.mkdirs()
-                val tmp = File(target.path + ".part")
-                c.inputStream.use { input -> tmp.outputStream().use { input.copyTo(it) } }
-                val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-                BitmapFactory.decodeFile(tmp.path, bounds)
-                when {
-                    bounds.outWidth > 0 && tmp.renameTo(target) -> true
-                    original -> { tmp.delete(); false }
-                    else -> { tmp.delete(); null }
-                }
-            }
-            404, 410 -> { c.disconnect(); if (original) false else null }
-            else -> { c.disconnect(); null }
+    /**
+     * Box art as the pages show it: libretro's scans run to several MB; anything over 200 KB is redrawn at most 600 px
+     * on its long side as WebP (alpha kept). True when the file was rewritten.
+     */
+    fun shrink(file: File): Boolean {
+        if (file.length() <= SHRINK_OVER) return false
+        return try {
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(file.path, bounds)
+            val long = maxOf(bounds.outWidth, bounds.outHeight)
+            if (long <= 0) return false
+            var sample = 1
+            while (long / (sample * 2) >= MAX_SIDE) sample *= 2
+            val decoded = BitmapFactory.decodeFile(file.path, BitmapFactory.Options().apply { inSampleSize = sample }) ?: return false
+            val scale = MAX_SIDE.toFloat() / maxOf(decoded.width, decoded.height)
+            val bmp = if (scale < 1f) android.graphics.Bitmap.createScaledBitmap(decoded, (decoded.width * scale).toInt().coerceAtLeast(1),
+                (decoded.height * scale).toInt().coerceAtLeast(1), true) else decoded
+            val tmp = File(file.path + ".small")
+            val format = if (android.os.Build.VERSION.SDK_INT >= 30) android.graphics.Bitmap.CompressFormat.WEBP_LOSSY
+                else @Suppress("DEPRECATION") android.graphics.Bitmap.CompressFormat.WEBP
+            val ok = tmp.outputStream().use { bmp.compress(format, 85, it) }
+            if (bmp !== decoded) bmp.recycle()
+            decoded.recycle()
+            if (ok && tmp.length() in 1 until file.length()) tmp.renameTo(file) else { tmp.delete(); false }
+        } catch (e: Exception) { Log.w(TAG, "shrink ${file.name}: $e"); false }
+    }
+
+    /** Shrinks the covers already cached for the given emulator ids' prefix (the Retro page's: "android:"); count rewritten. */
+    fun shrinkCached(context: Context, prefix: String): Int {
+        var n = 0
+        root(context).listFiles()?.filter { it.isDirectory && it.name.startsWith(prefix) }?.forEach { d ->
+            d.listFiles()?.filter { it.isFile && (it.name.endsWith(".img") || it.name.endsWith(".snap")) }?.forEach { if (shrink(it)) n++ }
         }
-    } catch (e: Exception) { Log.w(TAG, "$url: $e"); null }
+        if (n > 0) Log.i(TAG, "shrank $n covers")
+        return n
+    }
+
+    private fun download(url: String, target: File, depth: Int = 0): Boolean =
+        through(url) { source, original -> fetch(source, target, original, depth) } ?: false
+
+    private fun fetch(url: String, target: File, original: Boolean, depth: Int): Boolean? {
+        return try {
+            val c = open(url)
+            when (c.responseCode) {
+                200 -> {
+                    target.parentFile?.mkdirs()
+                    val tmp = File(target.path + ".part")
+                    c.inputStream.use { input -> tmp.outputStream().use { input.copyTo(it) } }
+                    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                    BitmapFactory.decodeFile(tmp.path, bounds)
+                    // libretro-thumbnails keeps some boxarts as symlinks: the file holds the name of the image it stands for
+                    if (bounds.outWidth <= 0 && tmp.length() in 1..511 && depth < 3) {
+                        val link = tmp.readText().trim()
+                        tmp.delete()
+                        if ((link.endsWith(".png", true) || link.endsWith(".jpg", true)) && '/' !in link)
+                            return download(url.substringBeforeLast('/') + "/" + URLEncoder.encode(link, "UTF-8").replace("+", "%20"), target, depth + 1)
+                        return false
+                    }
+                    if (bounds.outWidth > 0) shrink(tmp)
+                    when {
+                        bounds.outWidth > 0 && tmp.renameTo(target) -> true
+                        original -> { tmp.delete(); false }
+                        else -> { tmp.delete(); null }
+                    }
+                }
+                404, 410 -> { c.disconnect(); if (original) false else null }
+                else -> { c.disconnect(); null }
+            }
+        } catch (e: Exception) { Log.w(TAG, "$url: $e"); null }
+    }
 }

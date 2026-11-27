@@ -126,6 +126,16 @@ class FrontEndState(
     val steamGames: List<Library.SteamGame>,
     val steamGamesX64: Boolean = false,
     val emulators: List<Library.Emulator>,
+    /** The Retro page: ROM folders played in Android emulators (RetroLibrary). */
+    val retro: List<com.droiddeck.launcher.frontend.RetroLibrary.System> = emptyList(),
+    /** Daijisho's platform wallpaper packs (WallpaperPacks): the names offered, the chosen one, the one downloading. */
+    val retroPacks: List<String> = emptyList(),
+    val retroPack: String? = null,
+    val retroPackBusy: String? = null,
+    /** Play counts and last-played times by ROM path, favourites, and the ROM folders scanned (RetroStats, RetroLibrary). */
+    val retroStats: Map<String, com.droiddeck.launcher.frontend.RetroStats.Stat> = emptyMap(),
+    val retroFavorites: Set<String> = emptySet(),
+    val retroRoots: List<String> = emptyList(),
     val running: String?,
     val frameGen: FrameGen.Mode = FrameGen.Mode.OFF,
     val lossless: Lossless.State = Lossless.State.NONE,
@@ -226,6 +236,15 @@ class FrontEndActions(
     val onUserApp: (com.droiddeck.launcher.runtime.UserApps.App) -> Unit = {},
     val onBattleNet: () -> Unit = {},
     val onRom: (Library.Rom) -> Unit,
+    val onRetroGame: (com.droiddeck.launcher.frontend.RetroLibrary.System, Library.Rom) -> Unit = { _, _ -> },
+    val onRetroPlayer: (com.droiddeck.launcher.frontend.RetroLibrary.System, com.droiddeck.launcher.frontend.Platforms.Player) -> Unit = { _, _ -> },
+    val onRetroWallpaperList: () -> Unit = {},
+    val onRetroWallpaperPack: (String?) -> Unit = {},
+    val onRetroFavorite: (Library.Rom) -> Unit = {},
+    val onRetroAddRoot: () -> Unit = {},
+    val onRetroRemoveRoot: (String) -> Unit = {},
+    /** The Retro page opened: look for ROMs added since the last scan. */
+    val onRetroOpen: () -> Unit = {},
     val onResume: () -> Unit,
     val onSteamSettings: () -> Unit,
     val onDesktopSettings: () -> Unit,
@@ -518,6 +537,9 @@ private fun FrontEndScreenBody(s: FrontEndState, a: FrontEndActions, page: (@Com
     val ctx = LocalContext.current
     val phantomGateVisible = s.showPhantomGate && PhantomProcessLimit.blocksSteam(s.phantomProcessStatus)
     val processSettingsPageVisible = phantomGateVisible || showDeveloperDisplayChoice
+    val retroOpen = RetroNav.open
+    // retro mode has its own Back (RetroMode), so none of the rail's may take it
+    val backBlocked = processSettingsPageVisible || retroOpen
     val requestDeveloperOptions = {
         developerChoiceGuided = false
         developerChoiceToggle = false
@@ -579,19 +601,22 @@ private fun FrontEndScreenBody(s: FrontEndState, a: FrontEndActions, page: (@Com
         }
     }
     val pageBack = { if (!Hops.back(a.onPageBack)) a.onPageBack() }
-    BackHandler(enabled = !processSettingsPageVisible && s.pageKey != null && page != null) { pageBack() }
+    BackHandler(enabled = !backBlocked && s.pageKey != null && page != null) { pageBack() }
     LaunchedEffect(s.pageKey, selected) { Hops.forget(s.pageKey ?: selected) }
-    BackHandler(enabled = !processSettingsPageVisible && s.pageKey == null && Hops.origin?.page == selected) {
+    BackHandler(enabled = !backBlocked && s.pageKey == null && Hops.origin?.page == selected) {
         val rail = Hops.origin?.rail ?: return@BackHandler
         Hops.back { selected = rail }
     }
     val density = androidx.compose.ui.platform.LocalDensity.current.density
     remember(density) { Hops.density = density; true }
     BackHandler(
-        enabled = !processSettingsPageVisible && (s.pageKey == null || page == null) &&
+        enabled = !backBlocked && (s.pageKey == null || page == null) &&
             (selected.startsWith("emu:") || selected.startsWith("rom:") || selected.startsWith("user:") || selected == "store"),
     ) {
         selected = if (selected.startsWith("rom:")) "emu:" + selected.removePrefix("rom:").substringBefore(':') else "desktop"
+    }
+    BackHandler(enabled = !backBlocked && (s.pageKey == null || page == null) && (selected.startsWith("rsys:") || selected.startsWith("rgame:"))) {
+        selected = if (selected.startsWith("rgame:")) "rsys:" + selected.removePrefix("rgame:").substringBefore(':') else "retro"
     }
     val backToMore = s.pageKey == null && Hops.origin == null && selected in NavTabs.more(s)
     BackHandler(enabled = !processSettingsPageVisible && backToMore) {
@@ -615,6 +640,7 @@ private fun FrontEndScreenBody(s: FrontEndState, a: FrontEndActions, page: (@Com
         selected.startsWith("app:") -> "games"
         selected.startsWith("sound:") -> "soundtracks"
         selected.startsWith("emu:") || selected.startsWith("rom:") || selected.startsWith("user:") || selected == "store" -> "desktop"
+        selected.startsWith("rsys:") || selected.startsWith("rgame:") -> "retro"
         else -> s.pageKey ?: selected
     }
     val railSelection = if (openTab in NavTabs.more(s)) NavTabs.MORE else openTab
@@ -691,8 +717,8 @@ private fun FrontEndScreenBody(s: FrontEndState, a: FrontEndActions, page: (@Com
             .onFocusChanged { anyFocused = it.hasFocus },
     ) {
         val bottomNavigation = maxHeight > maxWidth
-        LaunchedEffect(processSettingsPageVisible) {
-            if (processSettingsPageVisible) return@LaunchedEffect
+        LaunchedEffect(processSettingsPageVisible, retroOpen) {
+            if (processSettingsPageVisible || retroOpen) return@LaunchedEffect
             snapshotFlow { window.isWindowFocused }.first { it }
             if (inputModeManager.inputMode != InputMode.Keyboard) inputModeManager.requestInputMode(InputMode.Keyboard)
             if (s.dualScreen && frontFocus.primaryAttached == 0) focusDualPane()
@@ -706,8 +732,8 @@ private fun FrontEndScreenBody(s: FrontEndState, a: FrontEndActions, page: (@Com
             withFrameNanos { }
             runCatching { frontFocus.paneEntry().requestFocus() }
         }
-        LaunchedEffect(selected, s.pageKey, processSettingsPageVisible) {
-            if (processSettingsPageVisible) return@LaunchedEffect
+        LaunchedEffect(selected, s.pageKey, processSettingsPageVisible, retroOpen) {
+            if (processSettingsPageVisible || retroOpen) return@LaunchedEffect
             kotlinx.coroutines.delay(Motion.ms(PAGE_EXIT_MS).toLong())
             if (inputModeManager.inputMode != InputMode.Keyboard) return@LaunchedEffect
             if (s.pageKey == "performance") {
@@ -722,7 +748,7 @@ private fun FrontEndScreenBody(s: FrontEndState, a: FrontEndActions, page: (@Com
             else focusWithinFrames({ anyFocused }) { if (frontFocus.primaryAttached > 0) frontFocus.primary else frontFocus.railFor(railSelection) }
         }
         LaunchedEffect(railPicks) {
-            if (railPicks == 0 || processSettingsPageVisible) return@LaunchedEffect
+            if (railPicks == 0 || processSettingsPageVisible || retroOpen) return@LaunchedEffect
             kotlinx.coroutines.delay(Motion.ms(PAGE_EXIT_MS).toLong())
             if (inputModeManager.inputMode != InputMode.Keyboard) return@LaunchedEffect
             val entry = withTimeoutOrNull(1_000) { snapshotFlow { frontFocus.primaryAttached > 0 }.first { it } }
@@ -802,7 +828,7 @@ private fun FrontEndScreenBody(s: FrontEndState, a: FrontEndActions, page: (@Com
         val swipeContext = androidx.compose.ui.platform.LocalContext.current
         remember { com.droiddeck.launcher.core.AppUiPrefs.pageSwipe(swipeContext).also { PageSwipe.on = it } }
         val agentKeyboardOpen = openTab == "agent" && WindowInsets.ime.getBottom(androidx.compose.ui.platform.LocalDensity.current) > 0
-        LauncherLayout(
+        if (!retroOpen) LauncherLayout(
             bottomNavigation && !s.dualScreen, pal.line,
             Modifier.fillMaxSize().onGloballyPositioned { screenAt = it.positionInRoot() }
                 .then(if (openTab == "agent") Modifier.imePadding() else Modifier),
@@ -832,6 +858,12 @@ private fun FrontEndScreenBody(s: FrontEndState, a: FrontEndActions, page: (@Com
                     onRequestWirelessAdb = startGuidedPairing,
                 )
         }
+        AnimatedVisibility(
+            visible = retroOpen,
+            enter = fadeIn(Motion.tw(280)) + androidx.compose.animation.scaleIn(Motion.tw(380), initialScale = 1.06f),
+            exit = androidx.compose.animation.ExitTransition.None,
+            label = "retroMode",
+        ) { CompositionLocalProvider(LocalSolidFocus provides true) { RetroMode(s, a) { RetroNav.open = false } } }
 
         }
         FlightsLayer(screenAt)
@@ -841,6 +873,7 @@ private fun FrontEndScreenBody(s: FrontEndState, a: FrontEndActions, page: (@Com
         com.droiddeck.launcher.stores.StoresState.itchPicking?.let { item -> StoreTheme(item.store) { ItchBuildPicker(item) { com.droiddeck.launcher.stores.StoresState.itchPicking = null } } }
         com.droiddeck.launcher.stores.StoresState.gameJoltPicking?.let { item -> StoreTheme(item.store) { GameJoltBuildPicker(item) { com.droiddeck.launcher.stores.StoresState.gameJoltPicking = null } } }
         StepsLayer(screenAt)
+        MaliUpdateBanner(s.updates.mali, a.updates.mali, hidden = selected == "updates" || s.sessionRunning)
         UiZooSheet()
         SessionDrawerPreview(s.secondScreenDisplays)
 
@@ -896,8 +929,9 @@ private fun FrontEndScreenBody(s: FrontEndState, a: FrontEndActions, page: (@Com
     val hasBackTarget = backToMore || (s.pageKey != null && page != null) ||
         (s.pageKey == null && Hops.origin?.page == selected) ||
         ((s.pageKey == null || page == null) &&
-            (selected.startsWith("emu:") || selected.startsWith("rom:") || selected.startsWith("user:") || selected == "store"))
-    val exitArmed = !processSettingsPageVisible && !hasBackTarget
+            (selected.startsWith("emu:") || selected.startsWith("rom:") || selected.startsWith("user:") || selected == "store" ||
+                selected.startsWith("rsys:") || selected.startsWith("rgame:")))
+    val exitArmed = !backBlocked && !hasBackTarget
     LaunchedEffect(exitArmed, selected) { ExitGesture.reset() }
     BackHandler(enabled = exitArmed && DevPreview.drawer == null) {
         when (ExitGesture.back()) {

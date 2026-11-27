@@ -97,6 +97,7 @@ import coil.compose.AsyncImage
 import com.droiddeck.launcher.HomeApp
 import com.droiddeck.launcher.R
 import com.droiddeck.launcher.frontend.Library
+import com.droiddeck.launcher.frontend.RetroLibrary
 import com.droiddeck.launcher.runtime.UserApps
 import com.droiddeck.launcher.store.UserAppsState
 import java.io.File
@@ -117,6 +118,8 @@ internal fun Pane(
             selected == "games" -> s.steamGames.maxByOrNull { it.lastPlayed }?.art
             selected.startsWith("sound:") -> s.soundtracks.firstOrNull { "sound:${it.appId}" == selected }?.let { it.hero ?: it.art }
             selected.startsWith("rom:") -> romFor(s, selected)?.second?.art
+            selected.startsWith("rgame:") -> retroFor(s, selected)?.second?.art
+            selected.startsWith("rsys:") -> retroSystem(s, selected)?.games?.firstOrNull { it.art != null }?.art
             else -> null
         }
         Backdrop(backdropArt)
@@ -226,6 +229,42 @@ private fun Backdrop(art: File?) {
     Spacer(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color.Transparent, colors.background.copy(alpha = 0.35f)))))
 }
 
+private const val RETRO_SHELF = 12
+
+private fun retroSystem(s: FrontEndState, selected: String): RetroLibrary.System? {
+    val id = selected.substringAfter(':').substringBefore(':')
+    return s.retro.firstOrNull { it.platform.id == id }
+}
+
+private fun retroFor(s: FrontEndState, selected: String): Pair<RetroLibrary.System, Library.Rom>? {
+    val sys = retroSystem(s, selected) ?: return null
+    val index = selected.substringAfterLast(':').toIntOrNull() ?: return null
+    return sys.games.getOrNull(index)?.let { sys to it }
+}
+
+private fun retroTile(sys: RetroLibrary.System, index: Int, g: Library.Rom, density: Float, onSelect: (String) -> Unit): Tile {
+    val key = "rgame:${sys.platform.id}:$index"
+    return Tile(g.name, g.hostPath.extension.uppercase(), g.art, key) {
+        g.art?.let { TileBounds.mark(key, it, 12f * density) }
+        onSelect(key)
+    }
+}
+
+/** The emulator a system plays in: the Daijisho players whose app is installed. */
+@Composable
+internal fun RetroPlayerPicker(sys: RetroLibrary.System, a: FrontEndActions) {
+    val players = sys.players
+    when {
+        players.isEmpty() -> Note(stringResource(R.string.retro_no_player_hint, sys.platform.name,
+            sys.platform.players.map { it.label }.filter { it.isNotBlank() }.distinct().take(6).joinToString(", ")))
+        players.size == 1 -> ActionChip(stringResource(R.string.retro_emulator) + ": " + players[0].label, ok = true)
+        else -> Column {
+            Text(stringResource(R.string.retro_emulator), fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(bottom = 4.dp))
+            SheetChips(players.map { it.label }, players.indexOf(sys.player).coerceAtLeast(0)) { i -> a.onRetroPlayer(sys, players[i]) }
+        }
+    }
+}
+
 private fun romFor(s: FrontEndState, selected: String): Pair<Library.Emulator, Library.Rom>? {
     val parts = selected.split(":")
     val e = s.emulators.firstOrNull { it.id == parts.getOrNull(1) } ?: return null
@@ -234,7 +273,7 @@ private fun romFor(s: FrontEndState, selected: String): Pair<Library.Emulator, L
 }
 
 @Composable
-private fun Content(
+internal fun Content(
     s: FrontEndState, selected: String, a: FrontEndActions, modifier: Modifier,
     onSelect: (String) -> Unit, onAndroidAppClick: (HomeApp.LaunchableApp) -> Unit,
     onOpenDeveloperOptions: () -> Unit, onRequestWirelessAdb: (Boolean) -> Unit, onPairWirelessDebugging: () -> Unit,
@@ -298,6 +337,18 @@ private fun Content(
         DesktopPage(s, a, modifier, onSelect)
         return
     }
+    if (selected == "retro") {
+        RetroStart(s, a, modifier)
+        return
+    }
+    if (selected == "network") {
+        NetworkPage(s, a, modifier)
+        return
+    }
+    if (selected.startsWith("rsys:")) {
+        RetroGallery(s, a, selected, onSelect, modifier)
+        return
+    }
     if (selected == NavTabs.MORE) {
         Box(modifier) {
             MorePage(s, a, onSelect, Modifier.padding(horizontal = padH).padding(top = padV))
@@ -315,6 +366,76 @@ private fun Content(
     }
     Column(modifier = modifier.verticalScroll(rememberScrollState()).padding(horizontal = padH, vertical = padV)) {
         when {
+            selected == "retro" -> {
+                Rise(0) { PageHeader(stringResource(R.string.retro_title)) { Chip(stringResource(R.string.retro_games_count, s.retro.sumOf { it.games.size }), ok = false) } }
+                if (s.retro.isEmpty()) Rise(3) { Note(stringResource(R.string.retro_empty)) }
+                s.retro.forEachIndexed { n, sys ->
+                    Rise(2 + n) { SectionTitle(sys.platform.name, sys.games.size.toString()) }
+                    Rise(2 + n, Modifier.fillMaxWidth()) {
+                        Column {
+                            ArtGrid(sys.games.take(RETRO_SHELF).mapIndexed { index, g -> retroTile(sys, index, g, density, onSelect) })
+                            if (sys.games.size > RETRO_SHELF) Box(Modifier.padding(top = 8.dp)) {
+                                SecondaryButton(stringResource(R.string.retro_all_games, sys.games.size), compact = true) { onSelect("rsys:${sys.platform.id}") }
+                            }
+                        }
+                    }
+                }
+                if (s.retro.isNotEmpty()) Rise(3) { Text(stringResource(R.string.retro_credit), fontSize = 11.sp, color = colors.onSurfaceVariant, modifier = Modifier.padding(top = 16.dp)) }
+            }
+            selected.startsWith("rsys:") -> {
+                val sys = retroSystem(s, selected)
+                if (sys == null) Note(stringResource(R.string.content_rom_gone)) else {
+                    Rise(0) { Eyebrow(stringResource(R.string.retro_title)) }
+                    Rise(1) { Title(sys.platform.name) }
+                    Rise(2) {
+                        Text(
+                            listOf(stringResource(R.string.retro_games_count, sys.games.size)).plus(sys.folders.map { it.path }).joinToString(" · "),
+                            fontSize = 13.sp, color = colors.onSurfaceVariant, maxLines = 2, overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                    Rise(3) { RetroPlayerPicker(sys, a) }
+                    Rise(4) { SectionTitle(stringResource(R.string.content_games), sys.games.size.toString()) }
+                    Rise(5, Modifier.fillMaxWidth()) { ArtGrid(sys.games.mapIndexed { index, g -> retroTile(sys, index, g, density, onSelect) }) }
+                }
+            }
+            selected.startsWith("rgame:") -> {
+                val pair = retroFor(s, selected)
+                if (pair == null) Note(stringResource(R.string.content_rom_gone)) else {
+                    val (sys, g) = pair
+                    Rise(0) { Eyebrow(sys.platform.name) }
+                    Rise(1) { Title(g.name) }
+                    Rise(1) {
+                        Text(
+                            listOfNotNull(sys.info[g.hostPath.path]?.line()?.takeIf { it.isNotEmpty() },
+                                s.retroStats[g.hostPath.path]?.let { playedLine(it) } ?: stringResource(R.string.retro_never_played)).joinToString("   ·   "),
+                            fontSize = 14.sp, color = colors.onSurfaceVariant, modifier = Modifier.padding(bottom = 8.dp),
+                        )
+                    }
+                    Rise(2) {
+                        Row {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(g.hostPath.path, fontSize = 12.sp, color = colors.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.clip(RoundedCornerShape(8.dp)).background(colors.surface).padding(horizontal = 10.dp, vertical = 6.dp))
+                                Spacer(Modifier.height(14.dp))
+                                Actions {
+                                    val player = sys.player
+                                    PrimaryButton(
+                                        if (player != null) stringResource(R.string.retro_play) else stringResource(R.string.retro_no_player, sys.platform.name),
+                                        enabled = player != null, main = true,
+                                    ) { a.onRetroGame(sys, g) }
+                                    FavoriteStar(g.hostPath.path in s.retroFavorites) { a.onRetroFavorite(g) }
+                                    ActionChip(g.hostPath.extension.uppercase().ifEmpty { stringResource(R.string.content_rom_folder) }, ok = false)
+                                }
+                            }
+                            if (!narrow) Poster(g.art, g.name, Modifier.width(detailPosterWidth))
+                        }
+                    }
+                    val others = sys.games.withIndex().filter { it.value !== g }
+                    if (others.isNotEmpty()) {
+                        Rise(3) { SectionTitle(stringResource(R.string.retro_more_in, sys.platform.name), null) }
+                        Rise(4, Modifier.fillMaxWidth()) { ArtGrid(others.take(RETRO_SHELF).map { (index, o) -> retroTile(sys, index, o, density, onSelect) }) }
+                    }
+                }
+            }
             selected.startsWith("user:") -> {
                 val app = UserAppsState.items.firstOrNull { "user:${it.key}" == selected }
                 if (app == null) Note(stringResource(R.string.user_apps_gone)) else UserAppPage(app, s, a, onSelect)

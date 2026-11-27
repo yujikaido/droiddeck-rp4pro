@@ -17,8 +17,12 @@ object GameStorage {
         val primary = context.getExternalFilesDir(null)?.absolutePath
         val primaryStorage = Environment.getExternalStorageDirectory()?.absolutePath
         return context.getExternalFilesDirs(null).orEmpty().filterNotNull().mapNotNull { dir ->
-            if (primary != null && dir.absolutePath == primary) return@mapNotNull null
-            if (!primaryStorage.isNullOrBlank() && dir.absolutePath.startsWith("$primaryStorage/")) return@mapNotNull null
+            // Non-primary app dirs are usable even when Android reports the volume as non-removable (USB SSDs often do).
+            // Primary storage is skipped only when it is built in: on an SD card adopted as internal storage, Android
+            // reports primary as removable, and that card's library is the one Steam already uses.
+            val removable = try { Environment.isExternalStorageRemovable(dir) } catch (e: Exception) { false }
+            if (!removable && primary != null && dir.absolutePath == primary) return@mapNotNull null
+            if (!removable && !primaryStorage.isNullOrBlank() && dir.absolutePath.startsWith("$primaryStorage/")) return@mapNotNull null
             val volume = try { sm?.getStorageVolume(dir) } catch (e: Exception) { null }
             val name = volume?.getDescription(context)?.takeIf { it.isNotBlank() && !it.equals("android", true) } ?: context.getString(R.string.gstore_sd_card)
             Option(context.getString(R.string.gstore_volume_free, name, free(dir)), File(dir, "steam").absolutePath, name)
