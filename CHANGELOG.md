@@ -5,6 +5,35 @@
 Newest first. Each build is on the [Releases](../../releases) page; from fix43 on, the app's **Updates** page
 offers new ones by itself.
 
+## fix55: DroidDeck Mali v0.5.5.3 underneath
+
+ASEbrahim released DroidDeck Mali v0.5.5.3 (on DroidDeck 0.6.9) on November 6. fix55 moves this build onto it,
+app and bridge both, and keeps everything the RP4 Pro builds added: the Retro tab, the Network page, the per-game
+settings, fast cores first and the bridge fixes.
+
+What v0.5.5.3 brings, from its notes (most of it is for other phones; the ones that matter here):
+- Xbox components download again, and so do GOG and itch.io; slow downloads retry instead of failing.
+- When a game crashes inside the graphics driver, Steam and the session keep running.
+- Mouse buttons and the wheel as on-screen keys, the controller as mouse and keyboard for games outside Steam, a
+  heat level in the HUD, and 30/60 fps buttons next to the frame limit.
+
+What fix55 adds on top:
+- **Proton Experimental ARM64 stays the default.** v0.5.5.3 moved most games to DroidDeck-Proton 11. On the RP4 Pro,
+  Turtles: Shredder's Revenge closed after a few seconds on it and plays fine on Experimental, where every game on
+  the [Games](GAMES.md) page was tested. Games you set to another Proton yourself keep it.
+- **SD card library:** with the card set up as internal storage, v0.5.5.3 dropped the card's games from Steam.
+  fix55 keeps them.
+- **Network page:** a **Play** button in an installed game's window starts Steam and then the game. It's greyed out
+  while Steam is already open (Steam only lists games copied in during a session after it restarts) and while the
+  game is still copying.
+- **Games' own setup steps run:** some games install their own settings or sound drivers the first time Steam starts
+  them. DroidDeck used to mark those steps as already done, so **Beyond Good & Evil** never started ("Application
+  settings not correctly set", then "EAX not properly installed" in its settings). They run now.
+- **Beyond Good & Evil sets itself up:** its blur and flare effects (a washed-out grey picture with streaks here)
+  are turned off once at its first start, FEX's TSO is off for it (13-22 fps before, a steady 60 now) and it's
+  capped at 60 so cutscene sound stays in sync. Nothing to change by hand; see [Games](GAMES.md).
+- **RP4 Pro switches:** Setup → Launcher → RP4 Pro has Wi-Fi and Bluetooth switches.
+
 ## fix54: the Network page
 
 This is the big one for me. I keep my games on my NAS, and getting them onto the RP4 Pro's SD card meant pulling
