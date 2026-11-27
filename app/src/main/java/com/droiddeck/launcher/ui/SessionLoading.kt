@@ -77,6 +77,7 @@ import androidx.compose.ui.text.PlatformTextStyle
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.style.LineHeightStyle
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.platform.testTag
 
 
 @Composable
@@ -148,12 +149,9 @@ fun LoadingOverlay(
     topic: LoadingState.Topic, readable: Boolean,
     title: String = stringResource(R.string.load_starting_steam), steam: Boolean = true, onCancel: (() -> Unit)? = null,
     endedDetail: String? = null,
-    diagnosis: String? = null,
     onRetry: (() -> Unit)? = null,
     onRepair: (() -> Unit)? = null,
     onShareLogs: (() -> Unit)? = null,
-    onSendLogs: (() -> Unit)? = null,
-    onReport: (() -> Unit)? = null,
     onClose: (() -> Unit)? = null,
     flood: Color? = null,
     onFlooded: () -> Unit = {},
@@ -212,19 +210,13 @@ fun LoadingOverlay(
                 maxLines = if (ended) 12 else 2, overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.padding(top = 6.dp).widthIn(max = 520.dp),
             )
-            // The first-frame watchdog: which stage of the start stalled (FirstFrameWatch)
-            if (!ended && diagnosis != null) Text(
-                diagnosis, fontSize = 14.sp, lineHeight = 20.sp, color = colors.onBackground, textAlign = TextAlign.Center,
-                maxLines = 5, overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.padding(top = 10.dp).widthIn(max = 560.dp),
-            )
             if (!ended) LoadSegments(stages.size, active, percent, Modifier.padding(top = 18.dp))
             if (ended && endedDetail != null) Text(
                 endedDetail, fontSize = 12.sp, fontFamily = FontFamily.Monospace, color = colors.onSurfaceVariant.copy(alpha = 0.8f),
                 textAlign = TextAlign.Center, maxLines = 3, overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.padding(top = 12.dp).widthIn(max = 520.dp),
             )
-            if (ended) EndedActions(onRetry, onRepair, onShareLogs, onSendLogs, onReport, onClose)
+            if (ended) EndedActions(onRetry, onRepair, onShareLogs, onClose)
         }
         if (!ended && hint.isNotEmpty()) Text(
             hint, fontSize = 13.sp, lineHeight = 18.sp, color = colors.onSurfaceVariant.copy(alpha = 0.8f), textAlign = TextAlign.Center,
@@ -232,12 +224,15 @@ fun LoadingOverlay(
             modifier = Modifier.align(Alignment.BottomCenter).padding(start = 120.dp, end = 120.dp, bottom = 28.dp),
         )
         if (!ended && onCancel != null) CancelHint(onCancel, Modifier.align(Alignment.BottomEnd).padding(end = 16.dp, bottom = 16.dp))
+        if (!ended && onShareLogs != null) androidx.compose.material3.TextButton(
+            onClick = onShareLogs, modifier = Modifier.align(Alignment.BottomStart).padding(start = 16.dp, bottom = 12.dp).testTag("loading-report"),
+        ) { Text(stringResource(R.string.report_problem), fontSize = 13.sp, color = colors.onSurfaceVariant) }
         if (flood != null) FloodGather(flood, ball, onFlooded)
     }
 }
 
 @Composable
-private fun EndedActions(onRetry: (() -> Unit)?, onRepair: (() -> Unit)?, onShareLogs: (() -> Unit)?, onSendLogs: (() -> Unit)?, onReport: (() -> Unit)?, onClose: (() -> Unit)?) {
+private fun EndedActions(onRetry: (() -> Unit)?, onRepair: (() -> Unit)?, onShareLogs: (() -> Unit)?, onClose: (() -> Unit)?) {
     val first = remember { FocusRequester() }
     LaunchedEffect(Unit) {
         androidx.compose.runtime.withFrameNanos { }
@@ -251,10 +246,8 @@ private fun EndedActions(onRetry: (() -> Unit)?, onRepair: (() -> Unit)?, onShar
             if (onRepair != null) SecondaryButton(stringResource(R.string.store_try_again), modifier = claim(), onClick = onRetry)
             else PrimaryButton(stringResource(R.string.store_try_again), modifier = claim(), onClick = onRetry)
         }
-        if (onShareLogs != null) SecondaryButton(stringResource(R.string.drawer_share_logs), modifier = claim(),
+        if (onShareLogs != null) SecondaryButton(stringResource(R.string.report_problem), modifier = claim(),
             progress = com.droiddeck.launcher.session.SessionLogShare.progress, onClick = onShareLogs)
-        if (onSendLogs != null) SecondaryButton(stringResource(R.string.drawer_send_logs), modifier = claim(), onClick = onSendLogs)
-        if (onReport != null) SecondaryButton(stringResource(R.string.session_end_report), modifier = claim(), onClick = onReport)
         if (onClose != null) SecondaryButton(stringResource(R.string.mode_back), modifier = claim(), onClick = onClose)
     }
 }

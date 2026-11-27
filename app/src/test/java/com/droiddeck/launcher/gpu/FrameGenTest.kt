@@ -48,40 +48,21 @@ class FrameGenTest {
         assertEquals(FrameGen.Mode(FrameGen.ENGINE_DDFG, 2), FrameGen.mode(context))
     }
 
-    @Test fun noFrameGenerationInTheDesktopOrInPictureInPicture() {
-        val chosen = FrameGen.Mode(FrameGen.ENGINE_LSFG, 3)
-        assertEquals(FrameGen.Mode.OFF, FrameGen.armedMode(com.droiddeck.launcher.session.SessionService.MODE_DESKTOP, false, chosen))
-        assertEquals(FrameGen.Mode.OFF, FrameGen.armedMode("steam", true, chosen))
-        assertEquals(chosen, FrameGen.armedMode("steam", false, chosen))
-        assertEquals(chosen, FrameGen.armedMode("run", false, chosen))
-        assertEquals(chosen, FrameGen.armedMode(null, false, chosen))
+    @Test fun perGameOverrideIsIsolatedFromGlobalMode() {
+        val global = FrameGen.Mode(FrameGen.ENGINE_LSFG, target = 90)
+        val game = FrameGen.Mode(FrameGen.ENGINE_DDFG, 3)
+
+        FrameGen.set(context, global)
+        FrameGen.setForGame(context, "12345", game)
+
+        assertEquals(global, FrameGen.mode(context))
+        assertEquals(game, FrameGen.mode(context, "12345"))
+        assertTrue(FrameGen.hasGameOverride(context, "12345"))
+
+        FrameGen.clearGame(context, "12345")
+
+        assertFalse(FrameGen.hasGameOverride(context, "12345"))
+        assertEquals(global, FrameGen.mode(context, "12345"))
     }
 
-    @Test fun noFrameGenerationOnTheSteamMenu() {
-        val chosen = FrameGen.Mode(FrameGen.ENGINE_DDFG, 2)
-        val steam = com.droiddeck.launcher.session.SessionService.MODE_STEAM
-        assertEquals(FrameGen.Mode.OFF, FrameGen.armedMode(steam, false, chosen, steamClientFocused = true))
-        assertEquals(chosen, FrameGen.armedMode(steam, false, chosen, steamClientFocused = false))
-        assertEquals(chosen, FrameGen.armedMode(steam, false, chosen))
-        // a program run has no Steam client to be on
-        assertEquals(chosen, FrameGen.armedMode("run", false, chosen, steamClientFocused = true))
-    }
-
-    @Test fun steamClientFocusFromTheFocusSnapshot() {
-        // Big Picture focused over a game in the base layer
-        assertTrue(FrameGen.steamClientFocused(769L, listOf(769L)))
-        assertTrue(FrameGen.steamClientFocused(769L, listOf(413091L, 769L)))
-        assertTrue(FrameGen.steamClientFocused(null, listOf(769L)))
-        assertFalse(FrameGen.steamClientFocused(413091L, listOf(413091L, 769L)))
-        assertFalse(FrameGen.steamClientFocused(null, emptyList()))      // loading: nothing known yet
-        assertFalse(FrameGen.steamClientFocused(null, listOf(413091L, 769L)))
-        assertTrue(com.droiddeck.launcher.agent.AgentGuest.steamClientFocused(
-            org.json.JSONObject("""{"focusedApp":769,"focusableApps":[769],"baselayerAppIds":[413091,769]}""")))
-        assertTrue(com.droiddeck.launcher.agent.AgentGuest.steamClientFocused(
-            org.json.JSONObject("""{"focusedApp":null,"focusableApps":[769]}""")))
-        assertFalse(com.droiddeck.launcher.agent.AgentGuest.steamClientFocused(
-            org.json.JSONObject("""{"focusedApp":413091,"focusableApps":[413091,769]}""")))
-        assertFalse(com.droiddeck.launcher.agent.AgentGuest.steamClientFocused(org.json.JSONObject("""{"focusedApp":null,"focusableApps":[]}""")))
-        assertFalse(com.droiddeck.launcher.agent.AgentGuest.steamClientFocused(null))
-    }
 }

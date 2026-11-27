@@ -63,9 +63,9 @@ class LibraryListTest(unittest.TestCase):
 
     def run_main(self, listing=True):
         with patch.dict(os.environ), patch("sys.argv", ["droiddeck-steam-library", str(self.steam)]):
-            os.environ.pop("BL_STEAM_LIBRARIES", None)
+            os.environ.pop("DD_STEAM_LIBRARIES", None)
             if listing:
-                os.environ["BL_STEAM_LIBRARIES"] = str(self.listing)
+                os.environ["DD_STEAM_LIBRARIES"] = str(self.listing)
             library.main()
         return self.vdf.read_text()
 
@@ -89,6 +89,20 @@ class LibraryListTest(unittest.TestCase):
         moved.rename(self.pc)
         self.assertIn(self.pc, self.paths(self.run_main()))
         self.assertIn(self.card, self.paths(self.vdf.read_text()))
+
+    def test_added_library_is_registered_while_listed_and_forgotten_once_removed(self):
+        added = self.root / "lib" / "1"
+        manifest(added / "steamapps", 20)
+        with patch.object(library, "ADDED_DIR", str(self.root / "lib") + "/"):
+            self.listing.write_text(json.dumps([{"path": str(added), "label": "Documents"}]))
+            text = self.run_main()
+            self.assertIn(added, self.paths(text))
+            self.assertIn('"20"\t\t"0"', text)
+            self.listing.write_text(json.dumps([]))
+            text = self.run_main()
+        self.assertNotIn(added, self.paths(text))
+        self.assertIn(self.user, self.paths(text))
+        self.assertTrue((added / "steamapps/appmanifest_20.acf").is_file())
 
     def test_without_a_list_only_the_card_is_managed(self):
         text = self.run_main(listing=False)

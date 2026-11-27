@@ -2,14 +2,17 @@ package com.droiddeck.launcher.session
 
 import com.droiddeck.launcher.runtime.LinuxRuntime
 import java.io.File
-import java.nio.charset.StandardCharsets
 import java.text.SimpleDateFormat
+import java.util.UUID
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.TimeUnit
 import java.util.zip.ZipFile
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.After
+import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -21,13 +24,75 @@ import org.robolectric.annotation.Config
 class SessionLogShareZipTest {
     private val app get() = RuntimeEnvironment.getApplication()
 
+    @Before fun installSecureSourceOpener() = installJvmSecureSourceOpener()
+
+    @After fun resetSourceOpener() = resetSecureSourceOpener()
+
+    @Test fun startupRemovesAbandonedDiagnosticStagesAndPreservesActiveSnapshots() {
+        val abandoned = File(app.cacheDir, "share-${UUID.randomUUID()}.diagnostic-stage").apply { mkdirs() }
+        val active = EnhancedSessionLogShare.acquireDiagnosticStage(app, "share")
+        try {
+            EnhancedSessionLogShare.cleanupAbandonedStages(app)
+            assertFalse(abandoned.exists())
+            assertTrue(active.directory.isDirectory)
+            EnhancedSessionLogShare.cleanupAbandonedStages(app)
+            assertTrue(active.directory.isDirectory)
+            val probeClassResource = checkNotNull(
+                DiagnosticStageLockProbe::class.java.getResource("DiagnosticStageLockProbe.class"),
+            )
+            val probeClass = File(probeClassResource.toURI())
+            var classPathRoot = checkNotNull(probeClass.parentFile)
+            repeat(4) { classPathRoot = checkNotNull(classPathRoot.parentFile) }
+            val classPath = classPathRoot.absolutePath
+            val javaName = if (checkNotNull(System.getProperty("os.name")).startsWith("Windows")) {
+                "java.exe"
+            } else {
+                "java"
+            }
+            val java = File(File(System.getProperty("java.home"), "bin"), javaName)
+            val probe = ProcessBuilder(
+                java.absolutePath,
+                "-cp",
+                classPath,
+                DiagnosticStageLockProbe::class.java.name,
+                File(active.directory, ".active").absolutePath,
+            ).redirectErrorStream(true).start()
+            val completed = probe.waitFor(5, TimeUnit.SECONDS)
+            if (!completed) probe.destroyForcibly()
+            assertTrue("lock probe timed out", completed)
+            assertEquals("cleanup released the active stage lock", 0, probe.exitValue())
+        } finally {
+            active.close()
+        }
+    }
+
+    @Test fun anArchiveCanBeWrittenOutsideTheShareFolder() {
+        SessionLogShare.clear(app)
+        val session = File(LinuxRuntime.logDir(app), "2026-11-03-01-steam").apply { mkdirs() }
+        val out = File(app.getExternalFilesDir(null), "agent-logs/request-1")
+        val secondOut = File(app.getExternalFilesDir(null), "agent-logs/request-2")
+        try {
+            File(session, "session.log").writeText("booted\n")
+            val zip = SessionLogShare.zipFolder(app, session, out)!!
+            val secondZip = SessionLogShare.zipFolder(app, session, secondOut)!!
+            assertEquals(out, zip.parentFile)
+            assertFalse(File(app.cacheDir, "share").exists())
+            assertTrue(zip.isFile)
+            assertEquals(secondOut, secondZip.parentFile)
+            assertTrue(secondZip.isFile)
+        } finally {
+            out.deleteRecursively()
+            secondOut.deleteRecursively()
+            session.deleteRecursively()
+        }
+    }
+
     @Test fun aLargeSteamLogIsRedactedInTheSharedArchive() {
         val session = File(LinuxRuntime.logDir(app), "2026-10-08-02-steam").apply { mkdirs() }
         val raw = File(session, "steam-42.log")
         val earlySecret = "early-sessionid-abcdef123456"
         val trailingSecret = "late-refresh-token-abcdef123456"
         try {
-            // One long line exercises the streaming limit; the final ordinary line must still be redacted.
             raw.bufferedWriter().use { out ->
                 out.write("sessionid=$earlySecret")
                 val chunk = "x".repeat(8192)
@@ -39,24 +104,11 @@ class SessionLogShareZipTest {
             val zip = SessionLogShare.zipFolder(app, session)!!
             ZipFile(zip).use { archive ->
                 val entry = archive.getEntry("${session.name}/steam-42.log")!!
-                archive.getInputStream(entry).use { input ->
-                    // Only inspect the bounded scrubbed prefix: the pre-fix raw archive is over 64 MiB.
-                    val expected = "${com.droiddeck.launcher.core.LogRedactor.OVERSIZED_LINE}\n"
-                    val prefix = ByteArray(expected.toByteArray(StandardCharsets.UTF_8).size)
-                    var offset = 0
-                    while (offset < prefix.size) {
-                        val count = input.read(prefix, offset, prefix.size - offset)
-                        assertTrue("zip entry ended before its scrubbed prefix", count > 0)
-                        offset += count
-                    }
-                    assertEquals(expected, String(prefix, StandardCharsets.UTF_8))
-                    input.bufferedReader().use { reader ->
-                        val trailing = requireNotNull(reader.readLine())
-                        assertFalse("trailing secret survived", trailing.contains(trailingSecret))
-                        assertEquals("refresh_token=<redacted:token>", trailing)
-                        assertEquals(null, reader.readLine())
-                    }
-                }
+                val shared = archive.getInputStream(entry).bufferedReader().readText()
+                assertTrue(shared.contains("diagnostic file truncated"))
+                assertFalse("early secret survived", shared.contains(earlySecret))
+                assertFalse("trailing secret survived", shared.contains(trailingSecret))
+                assertTrue(shared.contains("refresh_token=<redacted:token>"))
             }
         } finally {
             SessionLogShare.clear(app)
@@ -74,7 +126,6 @@ class SessionLogShareZipTest {
                 "Authorization: Bearer abc.def.ghi\n" +
                 "kept: EResult 5, app 1086940, steamapps/common/Game\n"
         )
-        // StoreLogFiles.prune, started by App.onCreate, deletes a stores log named for a day over a week old.
         val storesLog = "stores-" + SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date()) + ".log"
         File(logs, "stores").apply { mkdirs() }.resolve(storesLog).writeText("epic: f_token=zzzzzzzz12 window 32\n")
         File(logs, SessionPaths.TOOLS_DIR).apply { mkdirs() }.resolve("flatpak-install.log").writeText("== install\nCookie: steamLoginSecure=76561198000000000%7C%7Ceyabc\n")
@@ -90,63 +141,8 @@ class SessionLogShareZipTest {
         assertTrue(all.contains("kept: EResult 5, app 1086940, steamapps/common/Game"))
         assertTrue(all.contains("https://gog-cdn-fastly.gog.com/"))
 
-        // A zip just handed to another app stays (it may still be reading it); an hour-old one goes.
-        SessionLogShare.clear(app)
-        assertTrue(zip.exists())
-        zip.setLastModified(System.currentTimeMillis() - 2 * 60 * 60 * 1000L)
         SessionLogShare.clear(app)
         assertFalse(zip.exists())
-    }
-
-    @Test fun protonLogsWrittenDuringTheSessionComeAlongScrubbedAndALongOneIsCut() {
-        val session = File(LinuxRuntime.logDir(app), "2026-10-22-01-steam").apply { mkdirs() }
-        val start = 1_790_000_000_000L
-        File(session, "session.log").apply { writeText("start\n"); setLastModified(start) }
-        File(session, "events.jsonl").apply { writeText("{}\n"); setLastModified(start + 600_000) }
-        val home = File(LinuxRuntime.rootDir(app), "root").apply { mkdirs() }
-        File(home, "steam-560430.log").apply {
-            writeText("err:d3d:wined3d_check_gl_call invalid camera matrix\nlogin someone@example.com\n"); setLastModified(start + 60_000)
-        }
-        File(home, "steam-413150.log").apply { writeText("an older run\n"); setLastModified(start - 86_400_000) }
-        File(home, "steam-268910.log").apply {
-            writeText("x".repeat(100) + "\n" + "0024:fixme:line\n".repeat(600_000) + "the end\n"); setLastModified(start + 120_000)
-        }
-
-        val zip = SessionLogShare.zipFolder(app, session)!!
-        val text = ZipFile(zip).use { z -> z.entries().toList().associate { e -> e.name to z.getInputStream(e).bufferedReader().readText() } }
-        val p = "2026-10-22-01-steam/proton/"
-        assertTrue(text.keys.containsAll(listOf(p + "steam-560430.log", p + "steam-268910.log")))
-        assertFalse(text.containsKey(p + "steam-413150.log"))
-        assertTrue(text.getValue(p + "steam-560430.log").contains("invalid camera matrix"))
-        assertFalse(text.getValue(p + "steam-560430.log").contains("someone@example.com"))
-        val long = text.getValue(p + "steam-268910.log")
-        assertTrue(long.startsWith("[first ") && long.endsWith("the end\n"))
-        assertFalse(long.contains("xxxx"))
-        assertTrue(long.length <= 8 * 1024 * 1024 + 64)
-        SessionLogShare.clear(app)
-    }
-
-    @Test fun theGamesOwnLogsFromTheSessionComeAlongScrubbed() {
-        val session = File(LinuxRuntime.logDir(app), "2026-10-24-05-desktop").apply { mkdirs() }
-        val start = 1_790_100_000_000L
-        File(session, "session.log").apply { writeText("start\n"); setLastModified(start) }
-        File(session, "events.jsonl").apply { writeText("{}\n"); setLastModified(start + 600_000) }
-        val appData = File(LinuxRuntime.rootDir(app), "root/.local/share/Steam/steamapps/compatdata/294100/pfx/drive_c/users/steamuser/AppData")
-        File(appData, "LocalLow/Ludeon Studios/RimWorld by Ludeon Studios").apply { mkdirs() }.let { dir ->
-            File(dir, "Player.log").apply { writeText("Loading game\nlogin someone@example.com\n"); setLastModified(start + 60_000) }
-            File(dir, "Player-prev.log").apply { writeText("an older run\n"); setLastModified(start - 86_400_000) }
-        }
-        File(appData, "Local/b1/Saved/Logs").apply { mkdirs() }.resolve("b1.log").apply { writeText("Fatal error\n"); setLastModified(start + 90_000) }
-
-        val zip = SessionLogShare.zipFolder(app, session)!!
-        val text = ZipFile(zip).use { z -> z.entries().toList().associate { e -> e.name to z.getInputStream(e).bufferedReader().readText() } }
-        val g = "2026-10-24-05-desktop/game/294100/"
-        val player = g + "LocalLow/Ludeon Studios/RimWorld by Ludeon Studios/Player.log"
-        assertTrue(text.keys.containsAll(listOf(player, g + "Local/b1/Saved/Logs/b1.log")))
-        assertFalse(text.containsKey(g + "LocalLow/Ludeon Studios/RimWorld by Ludeon Studios/Player-prev.log"))
-        assertTrue(text.getValue(player).contains("Loading game"))
-        assertFalse(text.getValue(player).contains("someone@example.com"))
-        SessionLogShare.clear(app)
     }
 
     @Test fun battleNetAndBlizzardLogsComeAlongScrubbedAndNewestFirst() {
@@ -227,49 +223,5 @@ class SessionLogShareZipTest {
         val logs = LinuxRuntime.logDir(app)
         for (name in names) assertScrubbed(File(logs, name))
         assertEquals(listOf("Saves"), legacy.list()!!.toList())
-    }
-
-    @Test fun aSessionThatNeverRanBringsTheLastOneThatDid() {
-        val logs = LinuxRuntime.logDir(app)
-        val older = File(logs, "2026-10-29-01-steam").apply { mkdirs() }
-        File(older, "session.log").writeText("an older run\n")
-        val ran = File(logs, "2026-10-29-02-steam").apply { mkdirs() }
-        File(ran, "session.log").writeText("the run with the problem\n")
-        File(ran, "vkbridge-server.log").writeText("server\n")
-        val cancelled = File(logs, "2026-10-29-03-steam").apply { mkdirs() }
-        File(cancelled, "events.jsonl").writeText("{\"event\":\"session.cancelled\"}\n")
-        File(cancelled, "crash.log").writeText("\n")
-
-        val names = ZipFile(SessionLogShare.zipFolder(app, cancelled)!!).use { z -> z.entries().toList().map { it.name } }
-        assertTrue(names.containsAll(listOf("2026-10-29-03-steam/events.jsonl", "2026-10-29-02-steam/session.log", "2026-10-29-02-steam/vkbridge-server.log")))
-        assertFalse(names.any { it.startsWith("2026-10-29-01-steam/") })
-
-        // A session that ran is sent alone
-        val alone = ZipFile(SessionLogShare.zipFolder(app, ran)!!).use { z -> z.entries().toList().map { it.name } }
-        assertFalse(alone.any { it.startsWith("2026-10-29-01-steam/") || it.startsWith("2026-10-29-03-steam/") })
-    }
-
-    /* Exit-at-start diagnostics (droiddeck-game-env: a title that closed at its start without a frame gets Proton's log for its
-     * next launch, into <session>/exit-diag/): each file comes along scrubbed, a long one cut to its last 4 MB (the end holds the exit). */
-    @Test fun exitDiagnosticLogsComeAlongScrubbedAndALongOneIsCutToItsEnd() {
-        val session = File(LinuxRuntime.logDir(app), "2026-11-05-03-steam").apply { mkdirs() }
-        File(session, "session.log").writeText("start\n")
-        val diag = File(session, "exit-diag").apply { mkdirs() }
-        File(diag, "steam-424840.log").writeText("x".repeat(100) + "\n" + "0024:trace:loaddll:line\n".repeat(300_000) + "login someone@example.com\nthe exit\n")
-        File(diag, "LittleNightmares_d3d11.log").writeText("info:  DXVK: v2.7\n")
-        try {
-            val zip = SessionLogShare.zipFolder(app, session)!!
-            val text = ZipFile(zip).use { z -> z.entries().toList().associate { e -> e.name to z.getInputStream(e).bufferedReader().readText() } }
-            val p = "2026-11-05-03-steam/exit-diag/"
-            assertEquals("info:  DXVK: v2.7\n", text.getValue(p + "LittleNightmares_d3d11.log"))
-            val long = text.getValue(p + "steam-424840.log")
-            assertTrue(long.startsWith("[first ") && long.endsWith("the exit\n"))
-            assertFalse(long.contains("xxxx"))
-            assertFalse(long.contains("someone@example.com"))
-            assertTrue(long.length <= 4 * 1024 * 1024 + 64)
-        } finally {
-            SessionLogShare.clear(app)
-            session.deleteRecursively()
-        }
     }
 }

@@ -13,8 +13,10 @@ RELEASES = "https://api.github.com/repos/%s/releases"
 SOURCES = {
     "ge": ("GloriousEggroll/proton-ge-custom", re.compile(r"aarch64\.tar\.(gz|xz)$")),
     "cachyos": ("CachyOS/proton-cachyos", re.compile(r"arm64\.tar\.(gz|xz)$")),
-    "droiddeck": ("Droid-Deck/DroidDeck-Proton", re.compile(r"aarch64\.tar\.(gz|xz)$")),
+    "droiddeck": ("Droid-Deck/DroidDeck-Proton", re.compile(r"^DroidDeck-Proton-.*aarch64\.tar\.(gz|xz)$")),
+    "bionic": ("Droid-Deck/DroidDeck-Proton", re.compile(r"^DroidDeck-Bionic-.*aarch64\.tar\.(gz|xz)$")),
 }
+PRERELEASES = {"bionic"}
 USER_AGENT = "droiddeck-proton-extra"
 NEED_BYTES = 4 * 1024 * 1024 * 1024
 
@@ -31,10 +33,9 @@ def fetch_json(url):
 
 
 def pick_asset(source):
-    """(release tag, asset url, sha512 url or None) for the newest full release with an ARM64 build."""
     repo, pattern = SOURCES[source]
     for release in fetch_json(RELEASES % repo + "?per_page=15"):
-        if release.get("draft") or release.get("prerelease"):
+        if release.get("draft") or (release.get("prerelease") and source not in PRERELEASES):
             continue
         assets = {a["name"]: a["browser_download_url"] for a in release.get("assets", ())}
         for name in sorted(assets):
@@ -57,46 +58,7 @@ def release_asset(source, tag):
     raise SystemExit("droiddeck-proton-extra: %s has no ARM64 asset" % tag)
 
 
-# MaliBridge installs only DroidDeck-Proton builds it validated on Mali when "droiddeck" is asked for without a tag (the app
-# writes its list to VALIDATED_FILE; this copy is used when the file is missing and must match steam-compatibility's
-# VALIDATED_OWN_BUILDS and the app's ProtonExtras.VALIDATED_OWN: tools/tests/test_proton_pin.py). The list is in preference
-# order: the first is the default (11-11.10, the build our tablets ran), tried first; the next if a release vanished.
-# DD_PROTON_PIN=off: newest.
-VALIDATED_OWN_BUILDS = ("DroidDeck-Proton-11-11.10", "DroidDeck-Proton-11-11.11")
-VALIDATED_FILE = "/etc/droiddeck/proton-validated"
-
-
-def version_key(name):
-    return [int(n) for n in re.findall(r"\d+", re.sub(r"(?i)aarch64|arm64|x86_64|x86-64|amd64", " ", name))]
-
-
-def validated_tags(environ=None):
-    """The validated DroidDeck-Proton release tags in preference order (the default first), or None when the pin is off."""
-    environ = os.environ if environ is None else environ
-    if environ.get("DD_PROTON_PIN", "1").strip().lower() in ("0", "off", "false", "no"):
-        return None
-    names = None
-    try:
-        with open(environ.get("DD_PROTON_VALIDATED_FILE") or VALIDATED_FILE, encoding="utf-8", errors="replace") as f:
-            names = [line.strip() for line in f if line.strip() and not line.lstrip().startswith("#")]
-    except OSError:
-        pass
-    return list(names or VALIDATED_OWN_BUILDS)
-
-
-def pinned_asset(tags):
-    """(tag, url, sums) of the first validated release (in preference order) that is still published."""
-    for tag in tags:
-        try:
-            return release_asset("droiddeck", tag)
-        except (urllib.error.URLError, OSError, ValueError, SystemExit) as e:
-            log("%s is not available (%s)" % (tag, e))
-    raise SystemExit("droiddeck-proton-extra: none of the validated DroidDeck-Proton builds could be found")
-
-
 def download(url, path):
-    """Resumable, because this is hundreds of megabytes over a phone's connection. curl is used
-    rather than urllib so a retry continues rather than starting again."""
     log("downloading %s" % os.path.basename(path))
     rc = subprocess.call([
         "curl", "-fL", "--retry", "5", "--retry-delay", "3", "--retry-connrefused",
@@ -174,8 +136,7 @@ def main():
 
     local = None
     if what in SOURCES:
-        pinned = validated_tags() if what == "droiddeck" and not tag else None
-        tag, url, sums = release_asset(what, tag) if tag else pinned_asset(pinned) if pinned else pick_asset(what)
+        tag, url, sums = release_asset(what, tag) if tag else pick_asset(what)
         if not url:
             raise SystemExit("droiddeck-proton-extra: no ARM64 build published for %s" % what)
         log("%s -> %s" % (what, tag))

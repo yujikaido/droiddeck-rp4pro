@@ -1,5 +1,7 @@
 package com.droiddeck.launcher.ui
 
+import androidx.compose.material.icons.automirrored.outlined.ArrowBack
+import androidx.compose.material.icons.Icons
 import android.app.ActivityOptions
 import android.content.Context
 import android.content.Intent
@@ -59,15 +61,19 @@ class DualPanelModel(
     val appScale: Int,
     val onSelect: (String) -> Unit,
     val onResume: () -> Unit,
+    val title: String = selected,
+    val moreDownloads: Int = 0,
 )
 
 object DualScreenPanel {
     var model by mutableStateOf<DualPanelModel?>(null)
     private var displayId = -1
+    private var presentation: DualScreenPresentation? = null
+        set(value) { field = value; available = value != null || activity != null || launching }
     private var activity: DualScreenActivity? = null
-        set(value) { field = value; available = value != null || launching }
+        set(value) { field = value; available = value != null || presentation != null || launching }
     private var launching = false
-        set(value) { field = value; available = value || activity != null }
+        set(value) { field = value; available = value || activity != null || presentation != null }
     private var ownerTask = -1
     private var ownerYielded = false
     private var ownerPaused = false
@@ -77,8 +83,8 @@ object DualScreenPanel {
     var typingShown by mutableStateOf(false)
         private set
 
-    val shownOn: Int get() = if (activity != null || launching) displayId else -1
-    val attached: Boolean get() = activity != null
+    val shownOn: Int get() = if (presentation != null || activity != null || launching) displayId else -1
+    val attached: Boolean get() = presentation != null || activity != null
     var available by mutableStateOf(false)
         private set
 
@@ -123,6 +129,18 @@ object DualScreenPanel {
         ownerYielded = false
         ownerPaused = false
         launching = true
+        val host = context as? ComponentActivity
+        val target = host?.getSystemService(Context.DISPLAY_SERVICE)
+            ?.let { (it as android.hardware.display.DisplayManager).getDisplay(display) }
+        if (host != null && target != null) {
+            val shown = runCatching { DualScreenPresentation(host, target).also { it.show() } }
+            if (shown.isSuccess) {
+                presentation = shown.getOrThrow()
+                launching = false
+                return
+            }
+            android.util.Log.w("DualScreenPanel", "bottom panel presentation failed; falling back to an activity", shown.exceptionOrNull())
+        }
         val intent = Intent(context, DualScreenActivity::class.java)
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_MULTIPLE_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION)
         runCatching {
@@ -130,10 +148,66 @@ object DualScreenPanel {
         }.onFailure { launching = false; displayId = -1 }
     }
 
+    /**
+     * The panel on a presentation window sits above every activity on its screen, so an app launched there stays hidden behind it.
+     * Swapping the panel for a task of its own puts the app above it, and closing the app shows the panel again.
+     * Launches requested while the swap is under way wait for it and run in the order they were asked for.
+     */
+    fun makeRoomForApp(context: Context, display: Int, launch: () -> Unit) {
+        pendingLaunches?.let { it.add(launch); return }
+        val shown = presentation
+        if (shown == null || displayId != display) { launch(); return }
+        pendingLaunches = mutableListOf(launch)
+        val generation = ++handoffGeneration
+        handoffWaited = 0
+        presentation = null
+        shown.dismiss()
+        launching = true
+        val intent = Intent(context, DualScreenActivity::class.java)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_MULTIPLE_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION)
+            .putExtra(EXTRA_HANDOFF, generation)
+        val started = runCatching {
+            context.startActivity(intent, ActivityOptions.makeBasic().setLaunchDisplayId(display).toBundle())
+        }.isSuccess
+        if (!started) { launching = false; displayId = -1; releaseLaunches(); return }
+        handoffPoll.run()
+    }
+
+    private var pendingLaunches: MutableList<() -> Unit>? = null
+    private var handoffWaited = 0
+    private var handoffGeneration = 0
+    internal const val EXTRA_HANDOFF = "handoff"
+    private val handoffHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val handoffPoll = object : Runnable {
+        override fun run() {
+            if (pendingLaunches == null) return
+            if (activity != null || handoffWaited >= APP_WAIT_MS) releaseLaunches()
+            else { handoffWaited += APP_POLL_MS; handoffHandler.postDelayed(this, APP_POLL_MS.toLong()) }
+        }
+    }
+
+    private fun releaseLaunches() {
+        val waiting = pendingLaunches ?: return
+        pendingLaunches = null
+        handoffHandler.removeCallbacks(handoffPoll)
+        waiting.forEach { it() }
+    }
+
+    private fun dropLaunches() {
+        pendingLaunches = null
+        handoffHandler.removeCallbacks(handoffPoll)
+    }
+
+    private const val APP_POLL_MS = 100
+    private const val APP_WAIT_MS = 2000
+
     fun hide() {
+        dropLaunches()
         stopTyping()
         launching = false
         displayId = -1
+        presentation?.dismiss()
+        presentation = null
         activity?.finishAndRemoveTask()
         activity = null
     }
@@ -144,13 +218,17 @@ object DualScreenPanel {
 
     internal fun attach(host: DualScreenActivity): Boolean {
         if (!launching && activity == null) return false
+        presentation?.dismiss()
+        presentation = null
         if (activity !== host) activity?.finishAndRemoveTask()
         activity = host
         launching = false
+        val waiting = pendingLaunches
+        val generation = host.intent?.getIntExtra(EXTRA_HANDOFF, -1) ?: -1
+        handoffHandler.post { if (pendingLaunches === waiting && generation == handoffGeneration) releaseLaunches() }
         return true
     }
 
-    // The panel resumes when an app opens over the owner on the primary screen; pulling the owner back would hide that app.
     fun yieldTo(task: Int, app: Boolean) {
         if (ownerTask == task) ownerYielded = app
     }
@@ -166,18 +244,13 @@ object DualScreenPanel {
         return ownerTask.takeIf { it >= 0 }
     }
 
-    internal fun tookFocus(fresh: Boolean, touchedAt: Long, now: Long): Boolean =
-        fresh || now - touchedAt in 0..TOUCH_FOCUS_MS
-
-    private const val TOUCH_FOCUS_MS = 1000L
-
     internal fun returnFocus(context: Context, fromPanel: Boolean = false) {
         val task = focusTask(fromPanel) ?: return
         runCatching { (context.getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager).moveTaskToFront(task, 0) }
     }
 
     internal fun reclaimFocus(context: Context) {
-        val task = focusTask(false) ?: return
+        val task = focusTask(true) ?: return
         val manager = context.getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
         runCatching {
             manager.appTasks.firstOrNull {
@@ -190,6 +263,13 @@ object DualScreenPanel {
     internal fun detach(host: DualScreenActivity) {
         if (activity === host) {
             activity = null
+            displayId = -1
+        }
+    }
+
+    internal fun detach(host: DualScreenPresentation) {
+        if (presentation === host) {
+            presentation = null
             displayId = -1
         }
     }
@@ -245,21 +325,16 @@ class DualScreenActivity : ComponentActivity() {
     }
 
     private var topResumed = false
-    private var fresh = true
-    private var touchedAt = Long.MIN_VALUE
 
     override fun onTopResumedActivityChanged(isTopResumedActivity: Boolean) {
         super.onTopResumedActivityChanged(isTopResumedActivity)
         topResumed = isTopResumedActivity
-        val took = DualScreenPanel.tookFocus(fresh, touchedAt, android.os.SystemClock.uptimeMillis())
-        fresh = false
-        if (isTopResumedActivity && !DualScreenPanel.typingShown) DualScreenPanel.returnFocus(this, fromPanel = took)
+        if (isTopResumedActivity && !DualScreenPanel.typingShown) DualScreenPanel.returnFocus(this, fromPanel = true)
     }
 
     override fun dispatchTouchEvent(event: android.view.MotionEvent): Boolean {
-        if (event.actionMasked == android.view.MotionEvent.ACTION_DOWN) {
-            touchedAt = event.downTime
-            if (topResumed && !DualScreenPanel.typingShown) DualScreenPanel.returnFocus(this, fromPanel = true)
+        if (event.actionMasked == android.view.MotionEvent.ACTION_DOWN && topResumed && !DualScreenPanel.typingShown) {
+            DualScreenPanel.returnFocus(this, fromPanel = true)
         }
         return super.dispatchTouchEvent(event)
     }
@@ -308,7 +383,7 @@ internal fun DualPanelContent(model: DualPanelModel) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             Text(stringResource(R.string.app_name), fontSize = 15.sp, fontWeight = FontWeight.Bold, color = pal.signal)
             Spacer(Modifier.size(12.dp))
-            val (label, _) = railLabelIcon(model.selected)
+            val (label, _) = railLabelIcon(model.title)
             Text(stringResource(label), fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = colors.onBackground,
                 modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
             PanelClock()
@@ -322,7 +397,7 @@ internal fun DualPanelContent(model: DualPanelModel) {
                 for (row in model.keys.chunked(columns)) {
                     Row(Modifier.fillMaxWidth().height(tileHeight), horizontalArrangement = Arrangement.spacedBy(gap)) {
                         for (key in row) PanelTile(key, key == model.selected, key in model.badges,
-                            if (key == "stores") model.storeDownloads else 0, Modifier.weight(1f)) { model.onSelect(key) }
+                            if (key == "stores") model.storeDownloads else if (key == NavTabs.MORE) model.moreDownloads else 0, Modifier.weight(1f)) { model.onSelect(key) }
                         repeat(columns - row.size) { Spacer(Modifier.weight(1f)) }
                     }
                 }
@@ -347,7 +422,8 @@ internal fun DualPanelContent(model: DualPanelModel) {
 private fun PanelTile(key: String, current: Boolean, badge: Boolean, count: Int, modifier: Modifier, onClick: () -> Unit) {
     val colors = MaterialTheme.colorScheme
     val pal = LocalPalette.current
-    val (label, icon) = railLabelIcon(key)
+    val (label, base) = railLabelIcon(key)
+    val icon = if (key == NavTabs.MORE && MoreTabs.inside) Icons.AutoMirrored.Outlined.ArrowBack else base
     val shape = RoundedCornerShape(18.dp)
     Box(
         modifier.fillMaxSize().clip(shape)
@@ -357,7 +433,7 @@ private fun PanelTile(key: String, current: Boolean, badge: Boolean, count: Int,
         contentAlignment = Alignment.Center,
     ) {
         Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Icon(icon, contentDescription = null, tint = if (current) pal.signal else colors.onSurfaceVariant, modifier = Modifier.size(34.dp))
+            androidx.compose.animation.Crossfade(icon, animationSpec = Motion.tw(220), label = "panelIcon") { Icon(it, contentDescription = null, tint = if (current) pal.signal else colors.onSurfaceVariant, modifier = Modifier.size(34.dp)) }
             Text(stringResource(label), fontSize = 15.sp, fontWeight = FontWeight.SemiBold,
                 color = if (current) pal.signal else colors.onBackground, maxLines = 1, overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.padding(horizontal = 6.dp))
@@ -386,12 +462,10 @@ private fun PanelClock() {
 }
 
 @Composable
-internal fun DualPanelPublisher(s: FrontEndState, selected: String, onSelect: (String) -> Unit, a: FrontEndActions) {
-    val badges = buildSet {
-        if (setupNeedsAttention(s)) add("setup")
-        if (s.updates.hasUpdate) add("updates")
-    }
-    val model = DualPanelModel(navigationKeys(s), selected, badges, s.storeDownloadsActive, s.running, s.theme, s.appScale, onSelect, a.onResume)
+internal fun DualPanelPublisher(s: FrontEndState, selected: String, title: String, onSelect: (String) -> Unit, a: FrontEndActions) {
+    val keys = navigationKeys(s)
+    val badges = keys.filter { railBadge(s, it) }.toSet()
+    val model = DualPanelModel(keys, selected, badges, s.storeDownloadsActive, s.running, s.theme, s.appScale, onSelect, a.onResume, title, railCount(s, NavTabs.MORE))
     androidx.compose.runtime.SideEffect { DualScreenPanel.model = model }
     androidx.compose.runtime.DisposableEffect(Unit) { onDispose { DualScreenPanel.model = null } }
 }

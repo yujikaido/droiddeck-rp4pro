@@ -4,7 +4,6 @@
 #include <android/log.h>
 #include <wayland-server.h>
 #include "vk_present.h"
-#include "firstframe.h"
 
 #define COMPOSITOR_INTERNAL __attribute__((visibility("hidden")))
 
@@ -21,6 +20,7 @@
 #define DRM_XBGR8888 FOURCC('X', 'B', '2', '4')
 #define MOD_LINEAR VKP_MOD_LINEAR
 #define MOD_INVALID VKP_MOD_INVALID
+#define MOD_QCOM_COMPRESSED VKP_MOD_QCOM_COMPRESSED
 #define MAX_PLANES 4
 
 struct dmabuf_params {
@@ -40,8 +40,6 @@ struct dmabuf_buffer {
     int import_failed;
     int refs;
     void *ahb_state;
-    unsigned release_sent : 1; /* released and not committed since (compositor.c buffer_release_send) */
-    struct dmabuf_cpu cpu; /* the CPU's copy where the driver refuses the import (firstframe.c) */
 };
 
 struct client_info {
@@ -64,3 +62,6 @@ extern volatile int g_no_render_node;
 
 COMPOSITOR_INTERNAL extern dev_t g_main_device;
 COMPOSITOR_INTERNAL void bind_dmabuf(struct wl_client *c, void *data, uint32_t ver, uint32_t id);
+
+/* ---- wl_android_buffer.c */
+COMPOSITOR_INTERNAL void droiddeck_android_wlegl_init(struct wl_display *display);

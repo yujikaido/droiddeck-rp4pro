@@ -4,6 +4,8 @@ D=app/src/main/assets/linuxfs
 mkdir -p "$D"
 VK_INCLUDE=$(ls -d "${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-$ANDROID_NDK_ROOT}}"/toolchains/llvm/prebuilt/*/sysroot/usr/include | head -1) \
   tools/vr/build.sh --native "$D/usr/local/lib/droiddeck-vr"
+VK_INCLUDE=$(ls -d "${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-$ANDROID_NDK_ROOT}}"/toolchains/llvm/prebuilt/*/sysroot/usr/include | head -1) \
+  tools/gpuload/build.sh --native "$D/usr/local/lib/droiddeck-gpuload"
 for script in tools/linuxfs/overlay/usr/local/bin/droiddeck-* tools/linuxfs/overlay/usr/local/bin/steam-compatibility; do
   install -Dm644 "$script" "$D/usr/local/bin/$(basename "$script")"
 done
@@ -24,6 +26,13 @@ echo "${URUNTIME_SHA256}  uruntime" | sha256sum -c -
 install -Dm644 uruntime "$D/usr/local/lib/droiddeck/uruntime"
 install -Dm644 tools/linuxfs/licenses/uruntime-LICENSE "$D/usr/local/share/licenses/uruntime/LICENSE"
 rm uruntime
+curl -fsSL --retry 5 --retry-all-errors --connect-timeout 20 -o dwarfs-wrapper "https://github.com/mhx/dwarfs/releases/download/${DWARFS_VERSION}/${DWARFS_ASSET}"
+echo "${DWARFS_SHA256}  dwarfs-wrapper" | sha256sum -c -
+bash tools/linuxfs/unwrap-dwarfs.sh dwarfs-wrapper dwarfsextract
+echo "${DWARFS_PAYLOAD_SHA256}  dwarfsextract" | sha256sum -c -
+install -Dm644 dwarfsextract "$D/usr/local/lib/droiddeck/dwarfsextract"
+install -Dm644 tools/linuxfs/licenses/dwarfs-LICENSE "$D/usr/local/share/licenses/dwarfs/LICENSE"
+rm dwarfs-wrapper dwarfsextract
 M="$D/usr/local/lib/mangoapp"
 mkdir -p "$M" mango-pkgs
 grep -v '^#' tools/mangoapp/packages.txt | while read -r sum url; do

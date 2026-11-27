@@ -18,7 +18,6 @@ object AgentEnv {
     private const val TAG = "AgentEnv"
     private const val FILE = "agent-env.json"
     private const val GUEST_BIN = "/opt/droiddeck-agent/bin"
-    private const val BASE_PATH = "/usr/local/bin:/usr/bin:/bin"
     private val NAME = Regex("[A-Za-z0-9._-]{1,64}")
     private val KEY = Regex("[A-Za-z_][A-Za-z0-9_]*")
     private val lock = Any()
@@ -59,7 +58,8 @@ object AgentEnv {
     fun override(context: Context, name: String): JSONObject = synchronized(lock) {
         AgentAccess.requireCommands(context)
         if (NAME.matchEntire(name) == null || name in setOf(".", "..")) throw AgentException("INVALID_NAME", "Override names are letters, digits, '.', '_' and '-'")
-        if (name == "libblfastpath.so" && (SessionState.running || SessionState.guestPid > 0 || SessionState.phase == SessionPhase.STOPPING)) {
+        if (name == LEGACY_FAST_PATH) throw AgentException("INVALID_NAME", "The fast-path library is now $FAST_PATH")
+        if (name == "libddfastpath.so" && (SessionState.running || SessionState.guestPid > 0 || SessionState.phase == SessionPhase.STOPPING)) {
             throw AgentException("SESSION_ACTIVE", "Stop the session before installing a fast-path library")
         }
         val source = File(inbox(context), name)
@@ -74,7 +74,7 @@ object AgentEnv {
             staged.delete()
             throw AgentException("OVERRIDE_FAILED", "Could not stage the override")
         }
-        if (name == "libblfastpath.so" && !arm64SharedLibrary(staged)) {
+        if (name == "libddfastpath.so" && !arm64SharedLibrary(staged)) {
             staged.delete()
             throw AgentException("INVALID_LIBRARY", "The fast path must be a 64-bit little-endian ARM64 ELF shared library")
         }
@@ -87,7 +87,7 @@ object AgentEnv {
         state.put("pendingOverrides", JSONArray(merge(strings(state.optJSONArray("pendingOverrides")), listOf(name))))
         save(context, state)
         state.put("installed", "$GUEST_BIN/$name")
-        if (name == "libblfastpath.so") {
+        if (name == "libddfastpath.so") {
             val digest = MessageDigest.getInstance("SHA-256")
             target.inputStream().use { input ->
                 val buffer = ByteArray(65536)
@@ -104,10 +104,10 @@ object AgentEnv {
 
     fun fastPathLibrary(context: Context): String = synchronized(lock) {
         if (!AgentAccess.commandsAllowed(context)) return@synchronized ProotFastPath.LIBRARY
-        if ("libblfastpath.so" !in strings(load(context).optJSONArray("activeOverrides"))) return@synchronized ProotFastPath.LIBRARY
-        val file = File(bin(context), "libblfastpath.so")
+        if ("libddfastpath.so" !in strings(load(context).optJSONArray("activeOverrides"))) return@synchronized ProotFastPath.LIBRARY
+        val file = File(bin(context), "libddfastpath.so")
         if (!file.isFile || Files.isSymbolicLink(file.toPath())) return@synchronized ProotFastPath.LIBRARY
-        "$GUEST_BIN/libblfastpath.so"
+        "$GUEST_BIN/libddfastpath.so"
     }
 
     private fun arm64SharedLibrary(file: File): Boolean = file.inputStream().use { input ->
@@ -130,13 +130,18 @@ object AgentEnv {
         }
         val state = load(context)
         val active = strings(state.optJSONArray("pending"))
-        val overrides = strings(state.optJSONArray("pendingOverrides"))
+        val queued = strings(state.optJSONArray("pendingOverrides"))
+        val legacy = File(bin(context), LEGACY_FAST_PATH)
+        val stranded = FAST_PATH in queued && legacy.isFile && !File(bin(context), FAST_PATH).exists() &&
+            !legacy.renameTo(File(bin(context), FAST_PATH))
+        if (stranded) Log.w(TAG, "could not rename the queued $LEGACY_FAST_PATH; it stays queued for the next session")
+        val overrides = if (stranded) queued - FAST_PATH else queued
         bin(context).listFiles()
-            ?.filter { it.name !in overrides }?.forEach { it.delete() }
+            ?.filter { it.name !in overrides && !(stranded && it.name == LEGACY_FAST_PATH) }?.forEach { it.delete() }
         val lines = strings(state.optJSONArray("persistent")) + active
-        val withPath = if (overrides.none { it != "libblfastpath.so" }) lines else lines + "PATH=$GUEST_BIN:${pathOf(lines)}"
+        val withPath = if (overrides.none { it != "libddfastpath.so" }) lines else lines + "PATH=$GUEST_BIN:${pathOf(lines)}"
         state.put("active", JSONArray(active)).put("pending", JSONArray())
-        state.put("activeOverrides", JSONArray(overrides)).put("pendingOverrides", JSONArray())
+        state.put("activeOverrides", JSONArray(overrides)).put("pendingOverrides", JSONArray(if (stranded) listOf(FAST_PATH) else emptyList()))
         save(context, state)
         if (withPath.isNotEmpty()) Log.i(TAG, "agent environment keys for this session: ${withPath.map { it.substringBefore('=') }}")
         withPath
@@ -159,8 +164,11 @@ object AgentEnv {
         save(context, state)
     }
 
+    private const val FAST_PATH = "libddfastpath.so"
+    private const val LEGACY_FAST_PATH = "libblfastpath.so"
+
     private fun pathOf(lines: List<String>) =
-        lines.lastOrNull { it.startsWith("PATH=") }?.substringAfter('=')?.takeIf { it.isNotBlank() } ?: BASE_PATH
+        lines.lastOrNull { it.startsWith("PATH=") }?.substringAfter('=')?.takeIf { it.isNotBlank() } ?: LinuxRuntime.GUEST_PATH
 
     private fun bin(context: Context): File {
         val root = LinuxRuntime.rootDir(context).canonicalFile.toPath()
@@ -186,6 +194,9 @@ object AgentEnv {
         val state = try { if (file.isFile) JSONObject(file.readText()) else JSONObject() } catch (e: Exception) { JSONObject() }
         for (key in listOf("pending", "active", "persistent", "pendingOverrides", "activeOverrides")) {
             if (!state.has(key)) state.put(key, JSONArray())
+        }
+        for (key in listOf("pendingOverrides", "activeOverrides")) {
+            state.put(key, JSONArray(strings(state.optJSONArray(key)).map { if (it == LEGACY_FAST_PATH) FAST_PATH else it }.distinct()))
         }
         return state
     }

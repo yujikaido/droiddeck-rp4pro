@@ -48,14 +48,11 @@ static VkDescriptorSet allocSet(const ddfg::DeviceDispatch* dd, VkDevice dev,
                                 VkDescriptorPool pool, VkDescriptorSetLayout layout) {
     VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     ai.descriptorPool = pool; ai.descriptorSetCount = 1; ai.pSetLayouts = &layout;
-    VkDescriptorSet s = VK_NULL_HANDLE;
-    if (dd->AllocateDescriptorSets(dev, &ai, &s) != VK_SUCCESS) s = VK_NULL_HANDLE;
-    return s;
+    VkDescriptorSet s = VK_NULL_HANDLE; dd->AllocateDescriptorSets(dev, &ai, &s); return s;
 }
 
 static void wImg(const ddfg::DeviceDispatch* dd, VkDevice dev, VkDescriptorSet set, uint32_t binding,
                  VkDescriptorType type, VkImageView view, VkSampler samp, VkImageLayout layout) {
-    if (!set) return;  // a failed allocation: writing to it crashes Arm's driver
     VkDescriptorImageInfo ii{}; ii.imageView = view; ii.sampler = samp; ii.imageLayout = layout;
     VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     w.dstSet = set; w.dstBinding = binding; w.descriptorCount = 1; w.descriptorType = type; w.pImageInfo = &ii;
@@ -63,7 +60,6 @@ static void wImg(const ddfg::DeviceDispatch* dd, VkDevice dev, VkDescriptorSet s
 }
 static void wUbo(const ddfg::DeviceDispatch* dd, VkDevice dev, VkDescriptorSet set, uint32_t binding,
                  VkBuffer buf, VkDeviceSize range) {
-    if (!set || !buf) return;
     VkDescriptorBufferInfo bi{}; bi.buffer = buf; bi.range = range;
     VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     w.dstSet = set; w.dstBinding = binding; w.descriptorCount = 1;
@@ -72,7 +68,6 @@ static void wUbo(const ddfg::DeviceDispatch* dd, VkDevice dev, VkDescriptorSet s
 }
 static void wSsbo(const ddfg::DeviceDispatch* dd, VkDevice dev, VkDescriptorSet set, uint32_t binding,
                   VkBuffer buf, VkDeviceSize range) {
-    if (!set || !buf) return;
     VkDescriptorBufferInfo bi{}; bi.buffer = buf; bi.range = range;
     VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     w.dstSet = set; w.dstBinding = binding; w.descriptorCount = 1;
@@ -266,25 +261,12 @@ void FrameGen::record(VkCommandBuffer cmd, VkImageView prevView, VkImageView cur
     const Pipe& expandP = m4 ? pExpandM4_ : pExpand_;
 
     if (!g_scratch.built || g_scratch.builtFor.width != extent_.width || g_scratch.builtFor.height != extent_.height) {
-        if (g_scratch.built) {
-            // A size onResize did not see (it frees the scratch itself): free the old sets first.
-            dd_->DeviceWaitIdle(device_);
-            destroyScratch(dd_, device_, descPool_);
-        }
-        if (!ensureScratch(this, dd_, device_, memProps_, descPool_, linear_, extent_,
-                           pyrA_, pyrB_, pyrAs_, flowLvl_, flowExpA_, flowExpB_,
-                           pLuma_, pDown_, flowP, expandP, pSynth_, pGmReduce_, pGmPrewarp_,
-                           pFlowReg_, flowRegA_, flowRegB_, gmSsbo_, kLevels, cfg_)) {
-            DDFG_LOGE("framegen: the descriptor sets for %ux%u could not be made; frame generation stays off",
-                      extent_.width, extent_.height);
-            destroyScratch(dd_, device_, descPool_);
-            scratchFailed_ = true;
-            return;
-        }
+        ensureScratch(this, dd_, device_, memProps_, descPool_, linear_, extent_,
+                      pyrA_, pyrB_, pyrAs_, flowLvl_, flowExpA_, flowExpB_,
+                      pLuma_, pDown_, flowP, expandP, pSynth_, pGmReduce_, pGmPrewarp_,
+                      pFlowReg_, flowRegA_, flowRegB_, gmSsbo_, kLevels, cfg_);
     }
 
-    // Every generation of one real frame is recorded into the same command buffer, so the flow
-    // between prev and curr is computed once and each generation gets its own synth UBO and set.
     if (reuseFlow && !g_scratch.flowReady) return;
     if (!reuseFlow) {
         bool gmEngaged = updateGlobalMotion(gmSlot, extent_);
@@ -546,18 +528,6 @@ static bool ensureScratch(FrameGen* fg, const DeviceDispatch* dd, VkDevice dev,
         wImg(dd, dev, S.sSynth[s], 35, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, expB.view, samp, GEN);
     }
 
-    // Every set must exist: a failed allocation (a pool held to its sizes) is reported, not used.
-    bool complete = S.sLumaCurr && S.sLumaPrev && S.sFlowReg0 && S.sFlowRegAB && S.sFlowRegBA;
-    for (VkDescriptorSet s : S.sDownA) complete = complete && s;
-    for (VkDescriptorSet s : S.sDownB) complete = complete && s;
-    for (int l = fg->flowFinest(); l < kLevels; ++l) complete = complete && S.sFlow[l];
-    for (int s = 0; s < FrameGen::kSynthSlots; ++s) complete = complete && S.sSynth[s];
-    for (int s = 0; s < FrameGen::kGmSlots; ++s) {
-        complete = complete && S.sExpand[s];
-        if (gmSsbo && gmSsbo[s]) complete = complete && S.sGmReduce[s];
-        for (int l = fg->flowFinest(); l < kLevels; ++l) complete = complete && S.sGmPrewarp[s][l];
-    }
-    if (!complete) return false;
     S.builtFor = ext; S.built = true;
     return true;
 }

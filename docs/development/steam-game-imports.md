@@ -34,7 +34,8 @@ internal Steam library and writes an installed manifest with `Universe=1` and
 `StateFlags=4`. Steam ignores manifests without the universe field. A manifest without
 installed depots makes Steam verify every file, so the importer carries the build another
 client recorded: WinNative's `.winnative-steam/steamapps` manifest beside the game folder,
-or a completed download's `.DepotDownloader/depot.config` depot manifest IDs. Steam then
+or a completed download's depot manifest IDs from `.DepotDownloader/depot.config` or, when
+that file is gone, the `<depot>_<gid>.manifest` names in `.DepotDownloader/completed`. Steam then
 only downloads what changed since that build. Bare manifests from earlier imports are
 upgraded while Steam has not touched them. Without either record Steam still verifies.
 WinNative's manifest also identifies the folder without a store lookup. Steam updates and uninstall
@@ -51,11 +52,30 @@ again. A failed title lookup undoes nothing. The launcher likewise drops artwork
 fetched for the app the files named before and fetches it again; pictures the user chose
 are kept.
 
+A game that stays a shortcut but sits in a Steam install directory with a single matching
+manifest links its shortcut prefix to that app's existing `compatdata/<appid>`, so cloud
+saves the client downloaded are the ones the shortcut sees. A Steam library install only
+uses its own library's prefix. An existing shortcut prefix is never replaced, a link to a
+missing prefix is removed first, and nothing is copied.
+
 The account's `.droiddeck-routes.json` maps shortcut IDs to real Steam app IDs so the
 Android launcher uses the same title and Proton prefix as Steam. Other accounts do not
-inherit those routes. Managed shortcuts are replaced; user-created shortcuts and
+inherit those routes. A program chosen in DroidDeck other than the folder's default executable (for example a mod
+launcher beside the game's own executable) is never routed: it stays its own shortcut and tile.
+A target set in the Steam shortcut's properties keeps the route. Managed shortcuts are replaced; user-created shortcuts and
 unreadable shortcut files are preserved. Both routes use the existing ARM64 Proton
 registration.
+
+## Adopting shared library folders
+
+At every session start, `droiddeck-steam-library` looks through `steamapps/common` of each
+added library for non-empty folders no manifest names. A folder whose name is the
+`config.installdir` of exactly one playable app in `appcache/appinfo.vdf` (the `game`
+type wins over a demo; tools, DLC and ambiguous names are skipped) gets an
+`appmanifest_<id>.acf` with `Universe=1`, `StateFlags=4` and no build, so Steam verifies
+the existing files and downloads only what differs. Existing manifests are never
+rewritten, an app installed in another library is skipped, and only the added library is
+written to. Ownership is not read before the client runs; Steam enforces the license.
 
 ## Launcher artwork
 

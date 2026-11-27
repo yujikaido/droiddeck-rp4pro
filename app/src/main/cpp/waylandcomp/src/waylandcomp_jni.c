@@ -1,4 +1,3 @@
-#include "firstframe.h"
 #include <jni.h>
 #include <errno.h>
 #include <stdbool.h>
@@ -19,11 +18,13 @@
 #include "cardboard.h"
 #include "droiddeck_color.h"
 #include "gpu_clock_pin.h"
+#include "clock_domain.h"
 
 extern int droiddeck_wayland_run(void);
 extern void droiddeck_wayland_set_scale_mode(int mode, int alignment);
 extern void droiddeck_wayland_send_pointer(int action, int x, int y);
 extern void droiddeck_wayland_send_touch(int action, int pointer_id, int x, int y);
+extern void droiddeck_wayland_send_pen(int flags, int x, int y);
 extern int  droiddeck_cursor_snapshot(int *out, int cap);
 extern int  droiddeck_cursor_serial(void);
 extern int droiddeck_hud_frame_times(float *out, int len, int64_t *total);
@@ -31,19 +32,26 @@ extern void droiddeck_wayland_send_key(int evdev, int state);
 extern int  droiddeck_focus_takes_touch(void);
 extern int  droiddeck_cursor_input_pos(int *x, int *y);
 extern void droiddeck_wayland_send_scene_input(int type, int a, int b);
+extern void droiddeck_wayland_set_cursor_composite(int on);
 extern void droiddeck_wayland_vsync(int64_t frame_time_ns);
+extern void sc_layer_frame_timeline(int64_t present_ns, int64_t deadline_ns, int64_t period_ns);
 extern void droiddeck_stream_set(int on);
 extern void droiddeck_stream_frame(AHardwareBuffer *ahb);
 extern unsigned droiddeck_stream_frames(void);
 extern void droiddeck_wayland_output_resized(void);
 extern void droiddeck_wayland_set_output_refresh_rate(int mhz);
+extern void droiddeck_wayland_set_panel_rates(const int *rates, int count);
 extern volatile int g_fps_limit;
 extern volatile int g_release_unpaced;
 extern volatile int g_render_on_commit;
+extern volatile int g_bfi;
+extern volatile int g_bfi_picture_hold;
 extern volatile int g_hide_shell;
 extern volatile int g_zero_copy;
 extern volatile unsigned g_zero_copy_last;
 extern volatile int g_ubwc;
+extern volatile int g_display_buffer_driver;
+void droiddeck_dmabuf_formats_stale(void);
 extern volatile int g_no_render_node;
 extern volatile int g_output_w, g_output_h;
 
@@ -55,10 +63,14 @@ static jclass g_compositor_cls;
 static jmethodID g_on_first_frame;
 static jmethodID g_on_game_surface;
 static jmethodID g_on_game_frame;
+static jmethodID g_on_compositor_frame;
 static jmethodID g_on_game_program;
 static jmethodID g_on_pointer_lock;
 static jmethodID g_on_clipboard;
 static jmethodID g_on_text_input;
+static jmethodID g_on_overlay_planes;
+static jmethodID g_on_refresh_target;
+static jmethodID g_on_content_rate;
 
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
     (void)reserved;
@@ -73,6 +85,7 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
             g_on_game_surface = (*env)->GetStaticMethodID(env, g_compositor_cls, "onGameSurface",
                                                           "(Ljava/lang/String;Ljava/lang/String;)V");
             g_on_game_frame = (*env)->GetStaticMethodID(env, g_compositor_cls, "onGameFrame", "()V");
+            g_on_compositor_frame = (*env)->GetStaticMethodID(env, g_compositor_cls, "onCompositorFrame", "()V");
             g_on_game_program = (*env)->GetStaticMethodID(env, g_compositor_cls, "onGameProgram",
                                                           "(ILjava/lang/String;)V");
             if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); g_on_game_program = NULL; }
@@ -80,6 +93,9 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
             g_on_clipboard = (*env)->GetStaticMethodID(env, g_compositor_cls, "onClipboardText", "([B)V");
             g_on_text_input = (*env)->GetStaticMethodID(env, g_compositor_cls, "onTextInput",
                                                         "(ZLjava/lang/String;IIII)V");
+            g_on_overlay_planes = (*env)->GetStaticMethodID(env, g_compositor_cls, "onOverlayPlanes", "(I)V");
+            g_on_refresh_target = (*env)->GetStaticMethodID(env, g_compositor_cls, "onRefreshTarget", "(II)V");
+            g_on_content_rate = (*env)->GetStaticMethodID(env, g_compositor_cls, "onContentRate", "(I)V");
         }
     }
     return JNI_VERSION_1_6;
@@ -137,6 +153,34 @@ void droiddeck_on_game_frame(void) {
     JNIEnv *env;
     if (!g_compositor_cls || !g_on_game_frame || !(env = thread_env())) return;
     (*env)->CallStaticVoidMethod(env, g_compositor_cls, g_on_game_frame);
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+}
+
+void droiddeck_on_compositor_frame(void) {
+    JNIEnv *env;
+    if (!g_compositor_cls || !g_on_compositor_frame || !(env = thread_env())) return;
+    (*env)->CallStaticVoidMethod(env, g_compositor_cls, g_on_compositor_frame);
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+}
+
+void droiddeck_on_refresh_target(int refresh, int frame_rate) {
+    JNIEnv *env;
+    if (!g_compositor_cls || !g_on_refresh_target || !(env = thread_env())) return;
+    (*env)->CallStaticVoidMethod(env, g_compositor_cls, g_on_refresh_target, (jint)refresh, (jint)frame_rate);
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+}
+
+void droiddeck_on_content_rate(int fps) {
+    JNIEnv *env;
+    if (!g_compositor_cls || !g_on_content_rate || !(env = thread_env())) return;
+    (*env)->CallStaticVoidMethod(env, g_compositor_cls, g_on_content_rate, (jint)fps);
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+}
+
+void droiddeck_on_overlay_planes(int planes) {
+    JNIEnv *env;
+    if (!g_compositor_cls || !g_on_overlay_planes || !(env = thread_env())) return;
+    (*env)->CallStaticVoidMethod(env, g_compositor_cls, g_on_overlay_planes, (jint)planes);
     if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
 }
 
@@ -216,6 +260,24 @@ Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeCompositorTid(JNIEnv
     return (jint)g_comp_tid;
 }
 
+/* Why presenting failed ("" while it works), for the session-ended screen and the report. */
+JNIEXPORT jstring JNICALL
+Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeCompositorFault(JNIEnv *env, jclass clazz) {
+    (void)clazz;
+    extern const char *vkp_fault(void);
+    const char *f = vkp_fault();
+    return (*env)->NewStringUTF(env, f ? f : "");
+}
+
+/* The display driver as the driver itself reports it ("" before the compositor's device exists). */
+JNIEXPORT jstring JNICALL
+Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeDisplayDriver(JNIEnv *env, jclass clazz) {
+    (void)clazz;
+    extern const char *vkp_display_driver(void);
+    const char *d = vkp_display_driver();
+    return (*env)->NewStringUTF(env, d ? d : "");
+}
+
 JNIEXPORT void JNICALL
 Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeStart(JNIEnv *env, jclass clazz,
                                                              jstring xdgRuntimeDir) {
@@ -234,12 +296,13 @@ static char *dup_jstr(JNIEnv *env, jstring s) {
 JNIEXPORT void JNICALL
 Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeStartWithSurface(
         JNIEnv *env, jclass clazz, jobject surface, jstring xdgRuntimeDir,
-        jstring driverPath, jstring libraryName, jstring nativeLibDir) {
+        jstring driverPath, jstring libraryName, jstring nativeLibDir, jboolean allowDriverFallback) {
     set_runtime_dir(env, xdgRuntimeDir);
     char *dp = dup_jstr(env, driverPath);
     char *ln = dup_jstr(env, libraryName);
     char *nl = dup_jstr(env, nativeLibDir);
     vk_present_set_driver(dp, ln, nl);
+    vk_present_set_driver_fallback(allowDriverFallback == JNI_TRUE);
     free(dp); free(ln); free(nl);
     if (surface) {
         ANativeWindow *win = ANativeWindow_fromSurface(env, surface);
@@ -259,6 +322,12 @@ JNIEXPORT void JNICALL
 Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeSendTouch(
         JNIEnv *env, jclass clazz, jint action, jint pointer_id, jint x, jint y) {
     droiddeck_wayland_send_touch(action, pointer_id, x, y);
+}
+
+JNIEXPORT void JNICALL
+Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeSendPen(
+        JNIEnv *env, jclass clazz, jint flags, jint x, jint y) {
+    droiddeck_wayland_send_pen(flags, x, y);
 }
 
 JNIEXPORT jint JNICALL
@@ -291,6 +360,13 @@ JNIEXPORT jint JNICALL
 Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeCursorSerial(JNIEnv *env, jclass clazz) {
     (void)env; (void)clazz;
     return droiddeck_cursor_serial();
+}
+
+JNIEXPORT void JNICALL
+Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeSetCursorComposite(
+        JNIEnv *env, jclass clazz, jboolean on) {
+    (void)env; (void)clazz;
+    droiddeck_wayland_set_cursor_composite(on ? 1 : 0);
 }
 
 JNIEXPORT void JNICALL
@@ -330,6 +406,19 @@ Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeVsync(JNIEnv *env, j
 }
 
 JNIEXPORT void JNICALL
+Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeFrameTimeline(JNIEnv *env, jclass clazz, jlong presentNanos,
+                                                                          jlong deadlineNanos, jlong periodNanos) {
+    sc_layer_frame_timeline((int64_t)presentNanos, (int64_t)deadlineNanos, (int64_t)periodNanos);
+}
+
+JNIEXPORT void JNICALL
+Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeSetClockControl(JNIEnv *env, jclass clazz, jstring path) {
+    const char *value = path ? (*env)->GetStringUTFChars(env, path, NULL) : NULL;
+    droiddeck_clock_domain_set_control(value);
+    if (value) (*env)->ReleaseStringUTFChars(env, path, value);
+}
+
+JNIEXPORT void JNICALL
 Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeSetHideShell(JNIEnv *env, jclass clazz, jboolean hide) {
     g_hide_shell = hide ? 1 : 0;
 }
@@ -337,9 +426,16 @@ Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeSetHideShell(JNIEnv 
 JNIEXPORT void JNICALL
 Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeSetZeroCopy(JNIEnv *env, jclass clazz, jboolean on) {
     int live = droiddeck_get_display() != NULL;
-    if (!live) g_zero_copy = on ? 1 : 0;
+    if (!live) { g_zero_copy = on ? 1 : 0; droiddeck_dmabuf_formats_stale(); }
     droiddeck_host_zero_copy(on ? 1 : 0, live);
     __android_log_print(ANDROID_LOG_INFO, TAG, "zero-copy layer mode %s%s", on ? "on" : "off", live ? " (live)" : "");
+}
+
+JNIEXPORT void JNICALL
+Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeSetDisplayBufferDriver(JNIEnv *env, jclass clazz, jboolean on) {
+    g_display_buffer_driver = on ? 1 : 0;
+    droiddeck_dmabuf_formats_stale();
+    __android_log_print(ANDROID_LOG_INFO, TAG, "session driver %s for display buffers", on ? "asks" : "does not ask");
 }
 
 JNIEXPORT jint JNICALL
@@ -375,24 +471,21 @@ Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeSetOutputRefreshRate
     droiddeck_wayland_set_output_refresh_rate(hz > 1.0f ? (int)(hz * 1000.0f + 0.5f) : 0);
 }
 
+JNIEXPORT void JNICALL
+Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeSetPanelRates(JNIEnv *env, jclass clazz, jintArray rates) {
+    (void)clazz;
+    jint values[16];
+    jsize count = rates ? (*env)->GetArrayLength(env, rates) : 0;
+    if (count > 16) count = 16;
+    if (count > 0) (*env)->GetIntArrayRegion(env, rates, 0, count, values);
+    droiddeck_wayland_set_panel_rates((const int *)values, (int)count);
+}
+
 extern void vkp_reset_first_frame(void);
 JNIEXPORT void JNICALL
 Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeResetFirstFrame(JNIEnv *env, jclass clazz) {
     (void)env; (void)clazz;
     vkp_reset_first_frame();
-    ff_reset();
-}
-
-/* The first-frame watchdog's view of the compositor (firstframe.h, enum ff_counter order). */
-JNIEXPORT jint JNICALL
-Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeFirstFrameProbe(JNIEnv *env, jclass clazz, jintArray out) {
-    (void)clazz;
-    if (!out) return 0;
-    int v[FF_COUNT];
-    jsize n = (*env)->GetArrayLength(env, out);
-    int k = ff_probe(v, n < FF_COUNT ? (int)n : FF_COUNT);
-    (*env)->SetIntArrayRegion(env, out, 0, k, (const jint *)v);
-    return k;
 }
 
 JNIEXPORT void JNICALL
@@ -428,6 +521,18 @@ Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeGamePictureRect(JNIE
     return JNI_TRUE;
 }
 
+JNIEXPORT jboolean JNICALL
+Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeOutputSize(JNIEnv *env, jclass clazz, jintArray out) {
+    (void)clazz;
+    if (!out || (*env)->GetArrayLength(env, out) < 2) return JNI_FALSE;
+    int width = 0, height = 0;
+    vkp_output_size(&width, &height);
+    if (width <= 0 || height <= 0) return JNI_FALSE;
+    jint size[2] = {(jint)width, (jint)height};
+    (*env)->SetIntArrayRegion(env, out, 0, 2, size);
+    return JNI_TRUE;
+}
+
 JNIEXPORT void JNICALL
 Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeSetUpscaler(JNIEnv *env, jclass clazz, jint mode) {
     vkp_effects_set_scaling(mode);
@@ -455,8 +560,8 @@ Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeSetDeband(JNIEnv *en
 
 JNIEXPORT void JNICALL
 Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeSetScreenEffects(JNIEnv *env, jclass clazz, jfloat brightness,
-        jfloat contrast, jfloat gamma, jfloat saturation, jboolean fxaa, jboolean toon, jboolean crt, jboolean ntsc) {
-    vkp_effects_set_screen(brightness, contrast, gamma, saturation, fxaa ? 1 : 0, toon ? 1 : 0, crt ? 1 : 0, ntsc ? 1 : 0);
+        jfloat contrast, jfloat gamma, jfloat saturation, jint aa_mode, jboolean toon, jboolean crt, jboolean ntsc) {
+    vkp_effects_set_screen(brightness, contrast, gamma, saturation, aa_mode, toon ? 1 : 0, crt ? 1 : 0, ntsc ? 1 : 0);
 }
 
 JNIEXPORT void JNICALL
@@ -491,15 +596,6 @@ JNIEXPORT void JNICALL
 Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeLogDisplay(JNIEnv *env, jclass clazz, jstring message) {
     char *s = dup_jstr(env, message);
     if (s) droiddeck_log("display", "%s", s);
-    free(s);
-}
-
-void droiddeck_session_log_follow(const char *path);
-
-JNIEXPORT void JNICALL
-Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeSetSessionLog(JNIEnv *env, jclass clazz, jstring path) {
-    char *s = dup_jstr(env, path);
-    if (s) droiddeck_session_log_follow(s);
     free(s);
 }
 
@@ -639,6 +735,17 @@ Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeSetRenderOnCommit(JN
 }
 
 JNIEXPORT void JNICALL
+Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeSetBlackFrameInsertion(JNIEnv *env, jclass clazz, jboolean on) {
+    g_bfi = on ? 1 : 0;
+    __android_log_print(ANDROID_LOG_INFO, TAG, "black frame insertion %s", on ? "requested" : "off");
+}
+
+JNIEXPORT void JNICALL
+Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeSetPictureHold(JNIEnv *env, jclass clazz, jboolean on) {
+    g_bfi_picture_hold = on ? 1 : 0;
+}
+
+JNIEXPORT void JNICALL
 Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeSetFpsLimit(JNIEnv *env, jclass clazz, jint fps) {
     g_fps_limit = fps > 0 ? fps : 0;
     g_release_unpaced = fps < 0;
@@ -713,7 +820,6 @@ Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeSetGpuTurbo(JNIEnv *
         jclass error = (*env)->FindClass(env, "java/lang/IllegalStateException");
         if (error) (*env)->ThrowNew(env, error, strerror(saved_errno));
     }
-    // Clear a legacy global pin when recovering its marker after an app upgrade or crash.
     if (on != JNI_TRUE) adrenotools_set_turbo(false);
 }
 
@@ -740,7 +846,6 @@ Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeSetCardboardSpatialP
     vkp_cardboard_set_spatial_pose(m, p, live ? 1 : 0);
 }
 
-/* The Xbox Cloud Gaming native player: its decoded frames are the whole scene (no Wayland clients). */
 JNIEXPORT void JNICALL
 Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeStreamMode(JNIEnv *env, jclass clazz, jboolean on) {
     droiddeck_stream_set(on ? 1 : 0);

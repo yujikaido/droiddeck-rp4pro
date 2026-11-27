@@ -21,10 +21,6 @@ import java.io.File
 class ProtonExtrasTest {
     @get:Rule val temp = TemporaryFolder()
 
-    // The update mechanics are tested unpinned; the pin (VALIDATED_OWN) has its own tests below.
-    @org.junit.Before fun unpinned() { ProtonExtras.validatedOwn = null }
-    @org.junit.After fun pinned() { ProtonExtras.validatedOwn = ProtonExtras.VALIDATED_OWN }
-
     private fun tool(id: String) = ProtonExtras.tools.single { it.id == id }
 
     private fun asset(name: String, digest: String? = null) = JSONObject()
@@ -34,7 +30,7 @@ class ProtonExtrasTest {
         .apply { if (digest != null) put("digest", digest) }
 
     private fun release(tag: String, vararg assets: JSONObject, prerelease: Boolean = false, draft: Boolean = false) = JSONObject()
-        .put("tag_name", tag).put("prerelease", prerelease).put("draft", draft)
+        .put("tag_name", tag).put("prerelease", prerelease).put("draft", draft).put("published_at", "2026-11-12T00:00:00Z")
         .put("assets", JSONArray().apply { assets.forEach { put(it) } })
 
     private fun droiddeckRelease(ver: String, prerelease: Boolean = false) = release(
@@ -48,11 +44,41 @@ class ProtonExtrasTest {
     private fun installTool(parent: File, name: String) = File(parent, name).apply {
         mkdirs()
         File(this, "toolmanifest.vdf").writeText("\"manifest\" { \"commandline\" \"/proton %verb%\" }")
+        File(this, "compatibilitytool.vdf").writeText("\"from_oslist\" \"windows\"")
+        File(this, "proton").apply { writeText(""); setExecutable(true) }
     }
 
     @Test
-    fun theThreeSourcesInOrder() {
-        assertEquals(listOf("ge", "cachyos", "droiddeck"), ProtonExtras.tools.map { it.id })
+    fun experimentalRowsUseTheReleaseNameAndTagDetail() {
+        val current = release("DroidDeck-Bionic-12.8-r34", asset("DroidDeck-Bionic-12.8-r34-aarch64.tar.xz"), prerelease = true)
+            .put("name", "DroidDeck Bionic 12.8 r34")
+        val selectedAsset = ProtonExtras.assetOf(tool("droiddeck"), current, experimental = true)!!
+        val selected = ProtonExtras.assets(tool("droiddeck"), JSONArray().put(current), true).single()
+        assertEquals("DroidDeck-Bionic-12.8-r34-aarch64.tar.xz", selectedAsset.name)
+        assertEquals("DroidDeck Bionic 12.8 r34", selected.releaseName)
+        assertEquals("DroidDeck-Bionic-12.8-r34", selected.tag)
+    }
+
+    @Test
+    fun experimentalAssetsIgnoreChecksumSidecars() {
+        val sidecarOnly = release("DroidDeck-Bionic-12.8-r36", asset("DroidDeck-Bionic-12.8-r36-aarch64.tar.xz.sha512sum"))
+        assertEquals(null, ProtonExtras.assetOf(tool("droiddeck"), sidecarOnly, experimental = true))
+    }
+
+    @Test
+    fun experimentalAssetsSkipOtherArchitectures() {
+        val foreign = release("DroidDeck-Bionic-12.8-r37", asset("DroidDeck-Bionic-12.8-r37-x86_64.tar.xz"), asset("DroidDeck-Bionic-12.8-r37-amd64.tar.gz"), prerelease = true)
+        val mixed = release("DroidDeck-Bionic-12.8-r38", asset("DroidDeck-Bionic-12.8-r38-x86_64.tar.xz"), asset("DroidDeck-Bionic-12.8-r38.tar.xz"), prerelease = true)
+        val named = release("DroidDeck-Bionic-12.8-r39", asset("DroidDeck-Bionic-12.8-r39-aarch64.tar.xz"), asset("DroidDeck-Bionic-12.8-r39-x86_64.tar.xz"), prerelease = true)
+        assertEquals(null, ProtonExtras.assetOf(tool("droiddeck"), foreign, experimental = true))
+        assertEquals("DroidDeck-Bionic-12.8-r38.tar.xz", ProtonExtras.assetOf(tool("droiddeck"), mixed, experimental = true)!!.name)
+        assertEquals("DroidDeck-Bionic-12.8-r39-aarch64.tar.xz", ProtonExtras.assetOf(tool("droiddeck"), named, experimental = true)!!.name)
+        assertTrue(ProtonExtras.assets(tool("droiddeck"), JSONArray().put(foreign), true).isEmpty())
+    }
+
+    @Test
+    fun theSourcesInOrder() {
+        assertEquals(listOf("ge", "cachyos", "droiddeck", "bionic"), ProtonExtras.tools.map { it.id })
         val droiddeck = tool("droiddeck")
         assertEquals("DroidDeck-Proton", droiddeck.name)
         assertEquals("DroidDeck-Proton", droiddeck.prefix)
@@ -65,6 +91,29 @@ class ProtonExtrasTest {
     }
 
     @Test
+    fun bionicAndDroidDeckProtonShareTheReleasesButNotTheirArchives() {
+        val bionic = tool("bionic")
+        assertEquals("DroidDeck-Bionic", bionic.prefix)
+        assertEquals("Droid-Deck/DroidDeck-Proton", bionic.repo)
+        assertTrue(bionic.assetPattern.containsMatchIn("DroidDeck-Bionic-12.8-r3-aarch64.tar.xz"))
+        assertFalse(bionic.assetPattern.containsMatchIn("DroidDeck-Proton-11-12.8-aarch64.tar.gz"))
+        assertFalse(bionic.assetPattern.containsMatchIn("DroidDeck-Bionic-12.8-r3-aarch64.sha512sum"))
+        assertFalse(tool("droiddeck").assetPattern.containsMatchIn("DroidDeck-Bionic-12.8-r3-aarch64.tar.xz"))
+    }
+
+    @Test
+    fun bionicTakesItsPrereleaseAndDroidDeckProtonSkipsIt() {
+        val releases = JSONArray()
+            .put(release("DroidDeck-Bionic-12.8-r3", asset("DroidDeck-Bionic-12.8-r3-aarch64.sha512sum"),
+                asset("DroidDeck-Bionic-12.8-r3-aarch64.tar.xz"), prerelease = true))
+            .put(droiddeckRelease("11-12.8"))
+        val bionic = ProtonExtras.pickAsset(tool("bionic"), releases)!!
+        assertEquals("DroidDeck-Bionic-12.8-r3-aarch64.tar.xz", bionic.name)
+        assertTrue(bionic.sha512!!.endsWith("DroidDeck-Bionic-12.8-r3-aarch64.sha512sum"))
+        assertEquals("DroidDeck-Proton-11-12.8-aarch64.tar.gz", ProtonExtras.pickAsset(tool("droiddeck"), releases)!!.name)
+    }
+
+    @Test
     fun theTarballAndItsSha512FileArePicked() {
         val picked = ProtonExtras.pickAsset(tool("droiddeck"), JSONArray().put(droiddeckRelease("11-7.5")))!!
         assertEquals("DroidDeck-Proton-11-7.5", picked.tag)
@@ -72,6 +121,14 @@ class ProtonExtrasTest {
         assertEquals("https://github.com/o/r/releases/download/t/DroidDeck-Proton-11-7.5-aarch64.sha512sum", picked.sha512)
         assertEquals(625_775_670L, picked.size)
         assertNull(picked.sha256)
+    }
+
+    @Test
+    fun ownExperimentalReleaseUsesItsCurrentBionicTarballShape() {
+        val current = release("DroidDeck-Bionic-12.8-r34", asset("DroidDeck-Bionic-12.8-r34-aarch64.tar.xz"), asset("DroidDeck-Bionic-12.8-r34-aarch64.sha512sum"), prerelease = true)
+        val rows = ProtonExtras.assets(tool("droiddeck"), JSONArray().put(current), prerelease = true)
+        assertEquals(listOf("DroidDeck-Bionic-12.8-r34"), rows.map { it.tag })
+        assertTrue(ProtonExtras.assets(tool("droiddeck"), JSONArray().put(release("DroidDeck-Bionic-12.8-r35", asset("DroidDeck-Bionic-12.8-r35-aarch64.sha512sum"), prerelease = true)), true).isEmpty())
     }
 
     @Test
@@ -125,6 +182,17 @@ class ProtonExtrasTest {
     }
 
     @Test
+    fun interruptedBuildsAreNotReportedAsInstalled() {
+        val tools = temp.newFolder("compatibilitytools.d")
+        installTool(tools, "GE-Proton11-10")
+        File(tools, "GE-Proton11-11").apply {
+            mkdirs()
+            File(this, "toolmanifest.vdf").writeText("\"manifest\" { \"commandline\" \"/proton %verb%\" }")
+        }
+        assertEquals(listOf("GE-Proton11-10"), ProtonExtras.installedIn(tools, tool("ge")))
+    }
+
+    @Test
     fun anUpdateIsANewerReleaseThanTheNewestInstalledBuild() {
         assertEquals("DroidDeck-Proton-11-7.6", ProtonExtras.updateFor(listOf("DroidDeck-Proton 11-7.5"), "DroidDeck-Proton-11-7.6"))
         assertEquals("DroidDeck-Proton-11-7.10", ProtonExtras.updateFor(listOf("DroidDeck-Proton-11-7.9"), "DroidDeck-Proton-11-7.10"))
@@ -159,6 +227,22 @@ class ProtonExtrasTest {
         File(context.filesDir, "proton-extras.json").writeText(JSONObject().put("DroidDeck-Proton 11-7.5", "DroidDeck-Proton-11-7.6").toString())
         assertEquals(listOf("DroidDeck-Proton-11-7.6"), ProtonExtras.installedTags(context, tool("droiddeck")))
         assertNull(ProtonExtras.update(context, tool("droiddeck")))
+    }
+
+    @Test
+    fun removingDeletesLinksButNeverWhatTheyPointTo() {
+        val context = RuntimeEnvironment.getApplication()
+        val tools = File(LinuxRuntime.rootDir(context), "root/.local/share/Steam/compatibilitytools.d")
+        val outside = temp.newFolder("outside").apply { File(this, "keep.txt").writeText("x") }
+        for (name in listOf("DroidDeck-Bionic-12.8-r3", "DroidDeck-Bionic-12.8-r5")) {
+            val dosdevices = File(installTool(tools, name), "files/default_pfx/dosdevices").apply { mkdirs() }
+            java.nio.file.Files.createSymbolicLink(File(dosdevices, "z:").toPath(), outside.toPath())
+        }
+        ProtonExtras.removeOlder(context, tool("bionic"))
+        ProtonExtras.remove(context, tool("bionic"), "DroidDeck-Bionic-12.8-r5")
+        assertFalse(File(tools, "DroidDeck-Bionic-12.8-r3").exists())
+        assertFalse(File(tools, "DroidDeck-Bionic-12.8-r5").exists())
+        assertTrue(File(outside, "keep.txt").isFile)
     }
 
     @Test
@@ -199,134 +283,38 @@ class ProtonExtrasTest {
         assertFalse(state.getJSONObject("active").has("GE-Proton11-7"))
         assertFalse(state.getJSONObject("queued").has("GE-Proton11-7"))
         assertTrue(state.getJSONObject("active").has("GE-Proton11-8"))
-        ComponentsManager.forgetProton(context, kept.name)
+        assertTrue(ComponentsManager.forgetProton(context, kept.name))
         assertTrue(File(originals, "GE-Proton11-8/GE-Proton11-8/dxvk.wcp").isFile)
+        val published = File(LinuxRuntime.rootDir(context), "root/.local/share/droiddeck-components/desired.tsv")
+        published.appendText("*\tExperimental-Gone\t11\tdxvk\tfiles/lib/wine/dxvk/x86_64-windows/dxgi.dll\t-\t-\n")
+        File(originals, "Experimental-Gone/11/dxvk.wcp").apply { parentFile?.mkdirs(); writeText("x") }
+        assertTrue(ComponentsManager.forgetProton(context, "Experimental-Gone"))
+        assertFalse(published.readLines().any { "Experimental-Gone" in it })
+        assertFalse(File(originals, "Experimental-Gone").exists())
+
+        val store = File(LinuxRuntime.rootDir(context), "root/.local/share/droiddeck-components/store")
+        File(originals, "Experimental-Stale/11/dxvk.wcp").apply { parentFile?.mkdirs(); writeText("x") }
+        val stale = File(store, "original-Experimental-Stale-11-dxvk").apply { mkdirs(); File(this, ".complete").writeText("1\n") }
+        val other = File(store, "original-Experimental-Stale-2-11-dxvk").apply { mkdirs(); File(this, ".complete").writeText("1\n") }
+        File(originals, "Experimental-Stale/2-11/dxvk.wcp").apply { parentFile?.mkdirs(); writeText("x") }
+        published.appendText("*\tExperimental-Stale-2\t11\tdxvk\tfiles/a.dll\t0\t/root/.local/share/droiddeck-components/store/${other.name}/files/a.dll\n")
+        assertTrue(ComponentsManager.forgetProton(context, "Experimental-Stale"))
+        assertFalse(stale.exists())
+        assertTrue(File(other, ".complete").isFile)
+        assertFalse(File(originals, "Experimental-Stale").exists())
     }
 
     @Test
-    fun anInstallTakesTheUsersProtonSettingsFileAndRemovesOnlyUnusedBuilds() {
+    fun anUpdateKeepsTheUsersProtonSettingsFile() {
         val context = RuntimeEnvironment.getApplication()
         val tools = File(LinuxRuntime.rootDir(context), "root/.local/share/Steam/compatibilitytools.d")
         tools.deleteRecursively()
-        File(LinuxRuntime.rootDir(context), "root/.local/share/droiddeck-compat").deleteRecursively()
-        File(LinuxRuntime.rootDir(context), "root/.local/share/Steam/config").deleteRecursively()
         File(installTool(tools, "DroidDeck-Proton 11-11.1"), "user_settings.py").writeText("old")
         File(installTool(tools, "DroidDeck-Proton 11-11.4"), "user_settings.py").writeText("mine")
-        for (name in listOf("DroidDeck-Proton 11-11.1", "DroidDeck-Proton 11-11.4"))
-            File(tools, "$name/compatibilitytool.vdf").writeText(vdf(name.replace(' ', '-')))
         installTool(tools, "DroidDeck-Proton 11-11.5")
-        ProtonExtras.settleAfterInstall(context, tool("droiddeck"), "DroidDeck-Proton 11-11.5")
+        ProtonExtras.tidy(context)
         assertEquals(listOf("DroidDeck-Proton 11-11.5"), ProtonExtras.installedAll(context, tool("droiddeck")))
         assertEquals("mine", File(tools, "DroidDeck-Proton 11-11.5/user_settings.py").readText())
-    }
-
-    private fun vdf(internal: String) = "\"compatibilitytools\"\n{\n  \"compat_tools\"\n  {\n    \"$internal\" // Internal name\n    {\n    }\n  }\n}\n"
-
-    private fun mapping(vararg entries: Pair<String, String>) =
-        "\"InstallConfigStore\" { \"Software\" { \"Valve\" { \"Steam\" { \"CompatToolMapping\" { " +
-            entries.joinToString(" ") { (app, name) -> "\"$app\" { \"name\" \"$name\" \"config\" \"\" \"priority\" \"250\" }" } + " } } } } }"
-
-    // 11-04 golden: DroidDeck-Proton 11-12.1 appeared upstream; v0.5.5.2 moved the app's picks to it and deleted 11-11.x.
-    @Test
-    fun aBuildAGameOrAPickIsOnIsNeverRemovedAndNothingIsMoved() {
-        ProtonExtras.validatedOwn = listOf("DroidDeck-Proton-11-11.10", "DroidDeck-Proton-11-11.11")
-        val context = RuntimeEnvironment.getApplication()
-        val root = LinuxRuntime.rootDir(context)
-        val tools = File(root, "root/.local/share/Steam/compatibilitytools.d").apply { deleteRecursively() }
-        val compat = File(root, "root/.local/share/droiddeck-compat").apply { deleteRecursively(); mkdirs() }
-        for (v in listOf("11-11.8", "11-11.9", "11-11.10", "11-11.11", "11-12.1")) {
-            File(installTool(tools, "DroidDeck-Proton $v"), "compatibilitytool.vdf").writeText(vdf("DroidDeck-Proton-$v"))
-        }
-        File(root, "root/.local/share/Steam/config").mkdirs()
-        File(root, "root/.local/share/Steam/config/config.vdf").writeText(mapping("0" to "DroidDeck-Proton-11-11.10", "42" to "DroidDeck-Proton-11-11.10"))
-        val games = """{"version":1,"games":{"43":{"valve":false,"dir":"DroidDeck-Proton 11-11.9"}}}"""
-        File(compat, "games.json").writeText(games)
-        File(compat, "state.json").writeText("""{"default":"DroidDeck-Proton-11-11.10","tools":[{"name":"DroidDeck-Proton-11-11.8"}],"own_builds":["DroidDeck-Proton-11-11.8"]}""")
-        ProtonExtras.tidy(context)
-        // 11-11.8: nothing uses it (the catalog lists in state.json don't count). 11-11.9: the app's pick for 43. 11-11.10: game 42
-        // and the default. 11-11.11: the newest validated. 11-12.1: the newest installed.
-        assertEquals(listOf("DroidDeck-Proton 11-11.9", "DroidDeck-Proton 11-11.10", "DroidDeck-Proton 11-11.11", "DroidDeck-Proton 11-12.1"),
-            ProtonExtras.installedAll(context, tool("droiddeck")))
-        assertEquals(games, File(compat, "games.json").readText())
-        assertTrue(File(root, "root/.local/share/Steam/config/config.vdf").readText().contains("\"42\" { \"name\" \"DroidDeck-Proton-11-11.10\""))
-        // a state file that cannot be read keeps everything
-        File(compat, "state.json").writeText("{not json")
-        File(installTool(tools, "DroidDeck-Proton 11-11.7"), "compatibilitytool.vdf").writeText(vdf("DroidDeck-Proton-11-11.7"))
-        assertTrue(ProtonExtras.removable(context, tool("droiddeck")).isEmpty())
-    }
-
-    @Test
-    fun underThePinOnlyValidatedBuildsAreOfferedAndInstalled() {
-        val pin = listOf("DroidDeck-Proton-11-11.10", "DroidDeck-Proton-11-11.11")
-        ProtonExtras.validatedOwn = pin
-        val context = RuntimeEnvironment.getApplication()
-        assertEquals("DroidDeck-Proton-11-11.11", ProtonExtras.pinnedLatest())
-        assertEquals("DroidDeck-Proton-11-11.10", ProtonExtras.cachedLatest(context, tool("droiddeck")))
-        assertNull(ProtonExtras.pinnedUpdate(listOf("DroidDeck-Proton 11-11.11"), pin))
-        assertNull(ProtonExtras.pinnedUpdate(listOf("DroidDeck-Proton 11-11.11", "DroidDeck-Proton 11-12.1"), pin))
-        assertEquals("DroidDeck-Proton-11-11.11", ProtonExtras.pinnedUpdate(listOf("DroidDeck-Proton 11-11.10"), pin))
-        assertEquals("DroidDeck-Proton-11-11.10", ProtonExtras.pinnedUpdate(listOf("DroidDeck-Proton 11-12.1"), pin))
-        assertNull(ProtonExtras.pinnedUpdate(emptyList(), pin))
-        val feed = JSONArray().put(droiddeckRelease("11-12.1")).put(droiddeckRelease("11-11.11")).put(droiddeckRelease("11-11.10"))
-        assertEquals("DroidDeck-Proton-11-11.11", ProtonExtras.pickAsset(tool("droiddeck"), feed)?.tag)
-        assertNull(ProtonExtras.pickAsset(tool("droiddeck"), JSONArray().put(droiddeckRelease("11-12.1"))))
-        assertEquals("GE-Proton11-12", ProtonExtras.pickAsset(tool("ge"), JSONArray().put(
-            release("GE-Proton11-12", asset("GE-Proton11-12-aarch64.tar.gz"))))?.tag)
-        assertTrue(ProtonExtras.isValidated("DroidDeck-Proton 11-11.10"))
-        assertFalse(ProtonExtras.isValidated("DroidDeck-Proton 11-12.1"))
-        assertFalse("11-12.1 must not be in the shipped list", ProtonExtras.VALIDATED_OWN.any { it.endsWith("11-12.1") })
-    }
-
-    // Release prep T11 (owner decision 11-04): new installs get 11-11.10, the build our tablets ran, ahead of 11-11.11, which
-    // stays validated and selectable. Fails on t10 (84b4f1e32): the newest validated build (11-11.11) was what the app installed.
-    @Test
-    fun theDefaultIsTheTabletTestedBuildAndTheNewerOneStaysSelectable() {
-        // the shipped pin (the class's @Before turns it off for the older unpinned tests)
-        ProtonExtras.validatedOwn = ProtonExtras.VALIDATED_OWN
-        val context = RuntimeEnvironment.getApplication()
-        val own = tool("droiddeck")
-        assertEquals("DroidDeck-Proton-11-11.10", ProtonExtras.VALIDATED_OWN.first())
-        assertEquals("DroidDeck-Proton-11-11.10", ProtonExtras.pinnedDefault())
-        // a fresh install: what the Proton list offers to install, what the session install asks for
-        assertEquals("DroidDeck-Proton-11-11.10", ProtonExtras.cachedLatest(context, own))
-        val requests = File(LinuxRuntime.rootDir(context), "root/.bl-proton-extra").apply { delete() }
-        ProtonExtras.enqueue(context, own)
-        assertEquals("droiddeck --tag DroidDeck-Proton-11-11.10\n", requests.readText())
-        ProtonExtras.unqueue(context, own)
-        // the tags tried in turn: the default first; an update the player tapped first when it is validated
-        assertEquals(listOf("DroidDeck-Proton-11-11.10", "DroidDeck-Proton-11-11.11"), ProtonExtras.pinnedTries(null, ProtonExtras.VALIDATED_OWN))
-        assertEquals(listOf("DroidDeck-Proton-11-11.11", "DroidDeck-Proton-11-11.10"),
-            ProtonExtras.pinnedTries("DroidDeck-Proton-11-11.11", ProtonExtras.VALIDATED_OWN))
-        assertEquals(listOf("DroidDeck-Proton-11-11.10", "DroidDeck-Proton-11-11.11"),
-            ProtonExtras.pinnedTries("DroidDeck-Proton-11-12.1", ProtonExtras.VALIDATED_OWN))
-        // 11-11.11 stays validated and is offered (selectable) to a player on 11-11.10, never installed on its own
-        assertTrue(ProtonExtras.isValidated("DroidDeck-Proton 11-11.11"))
-        assertEquals("DroidDeck-Proton-11-11.11", ProtonExtras.pinnedUpdate(listOf("DroidDeck-Proton 11-11.10"), ProtonExtras.VALIDATED_OWN))
-        // a player v0.5.5.2 moved to 11-12.1 gets the default next to it
-        assertEquals("DroidDeck-Proton-11-11.10", ProtonExtras.pinnedUpdate(listOf("DroidDeck-Proton 11-12.1"), ProtonExtras.VALIDATED_OWN))
-    }
-
-    @Test
-    fun theGuestGetsTheValidatedList() {
-        val root = temp.newFolder("rootfs")
-        SessionFiles.writeValidatedProtons(root, ProtonExtras.VALIDATED_OWN)
-        assertEquals(ProtonExtras.VALIDATED_OWN, File(root, "etc/droiddeck/proton-validated").readLines())
-        SessionFiles.writeValidatedProtons(root, null)
-        assertFalse(File(root, "etc/droiddeck/proton-validated").exists())
-    }
-
-    @Test
-    fun aSessionInstallAsksForTheValidatedTag() {
-        ProtonExtras.validatedOwn = listOf("DroidDeck-Proton-11-11.10", "DroidDeck-Proton-11-11.11")
-        val context = RuntimeEnvironment.getApplication()
-        val requests = File(LinuxRuntime.rootDir(context), "root/.bl-proton-extra").apply { delete() }
-        ProtonExtras.enqueue(context, tool("droiddeck"))
-        assertEquals("droiddeck --tag DroidDeck-Proton-11-11.10\n", requests.readText())
-        assertTrue(ProtonExtras.queued(context, tool("droiddeck")))
-        ProtonExtras.enqueue(context, tool("droiddeck"))
-        assertEquals(1, requests.readText().lines().count { it.isNotBlank() })
-        ProtonExtras.unqueue(context, tool("droiddeck"))
-        assertFalse(requests.exists())
     }
 
     @Test
@@ -345,5 +333,77 @@ class ProtonExtrasTest {
         installTool(tools, "DroidDeck-Proton 11-11.2")
         assertNull(ProtonExtras.missing(context, tool("droiddeck")))
         assertEquals("DroidDeck-Proton-11-11.4", ProtonExtras.update(context, tool("droiddeck")))
+    }
+
+    @Test
+    fun laterPagesAreReadOnlyUntilAStableBaselineIsFound() {
+        val tool = tool("droiddeck")
+        val pages = mapOf(
+            1 to JSONArray().apply { repeat(15) { put(droiddeckRelease("11-12.${10 - it}", prerelease = true)) } },
+            2 to JSONArray().put(droiddeckRelease("11-12.8")),
+            3 to JSONArray().put(droiddeckRelease("11-12.7")),
+        )
+        val asked = mutableListOf<Int>()
+        val all = ProtonExtras.releases(tool) { asked += it; pages[it] ?: JSONArray() }!!
+        assertEquals(listOf(1, 2), asked)
+        assertEquals("DroidDeck-Proton-11-12.8", ProtonExtras.pickAsset(tool, all)!!.tag)
+
+        asked.clear()
+        ProtonExtras.releases(tool) { asked += it; pages.getValue(2) }
+        assertEquals(listOf(1), asked)
+
+        asked.clear()
+        assertEquals(0, ProtonExtras.releases(tool) { asked += it; JSONArray() }!!.length())
+        assertEquals(listOf(1), asked)
+        assertNull(ProtonExtras.releases(tool) { null })
+
+        asked.clear()
+        assertNull(ProtonExtras.releases(tool) { page ->
+            asked += page
+            if (page == 1) JSONArray().apply { repeat(15) { put(droiddeckRelease("11-12.${10 - it}", prerelease = true)) } } else null
+        })
+        assertEquals(listOf(1, 2), asked)
+    }
+
+    @Test
+    fun anOldTestButtonInstallRemainsAUsableInstalledBuild() {
+        val context = RuntimeEnvironment.getApplication()
+        val tools = File(LinuxRuntime.rootDir(context), "root/.local/share/Steam/compatibilitytools.d")
+        val installed = installTool(tools, "DroidDeck-Proton 11-12.9")
+        val releases = File(context.filesDir, "proton-extras.json")
+        releases.writeText(JSONObject().put(installed.name, "DroidDeck-Proton-11-12.9").toString())
+        assertEquals(listOf(installed.name), ProtonExtras.installedAll(context, tool("droiddeck")))
+        assertEquals(listOf("DroidDeck-Proton-11-12.9"), ProtonExtras.installedTags(context, tool("droiddeck")))
+    }
+
+    @Test
+    fun malformedReleaseEntriesAreSkipped() {
+        val releases = JSONArray("[null, 5, {\"tag_name\": \"x\", \"assets\": [null]}]").put(droiddeckRelease("11-12.8"))
+        assertEquals("DroidDeck-Proton-11-12.8", ProtonExtras.pickAsset(tool("droiddeck"), releases)!!.tag)
+        assertNull(ProtonExtras.pickAsset(tool("droiddeck"), JSONArray("[null]")))
+    }
+
+    @Test
+    fun failedOrPartialReleaseFetchDoesNotPretendMissingBuildsAreGone() {
+        val tool = tool("droiddeck")
+        assertNull(ProtonExtras.releasesForRemoval(tool) { null })
+        val asked = mutableListOf<Int>()
+        val result = ProtonExtras.releasesForRemoval(tool) { page ->
+            asked += page
+            if (page == 1) JSONArray().apply { repeat(15) { put(droiddeckRelease("11-12.${10 - it}", prerelease = true)) } } else null
+        }
+        assertNull(result)
+        assertEquals(listOf(1, 2), asked)
+    }
+
+    @Test
+    fun aShortReleasePageCompletesTheRemovalLookup() {
+        val asked = mutableListOf<Int>()
+        val result = ProtonExtras.releasesForRemoval(tool("droiddeck")) { page ->
+            asked += page
+            JSONArray().put(droiddeckRelease("11-12.8", prerelease = true))
+        }
+        assertTrue(result!!.complete)
+        assertEquals(listOf(1), asked)
     }
 }

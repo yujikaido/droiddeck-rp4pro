@@ -13,7 +13,7 @@ very high-resolution panels and on foldables?
 ## How the session is sized today (main @ c636eea3)
 
 - `droiddeck-session` starts gamescope with `-W/-H` (output) = `-w/-h` (nested, what games and the
-  client see) = `BL_WIDTH x BL_HEIGHT`, the per-mode "Resolution" setting. The default is
+  client see) = `DD_WIDTH x DD_HEIGHT`, the per-mode "Resolution" setting. The default is
   `1280x720` (`SessionDisplay.DEFAULT_RESOLUTION`). One Xwayland server holds both the Steam
   client and the games.
 - The Android compositor (`waylandcomp`) draws gamescope's output into a panel-sized swapchain
@@ -68,7 +68,7 @@ fullscreen off, with a spike build of `feat/steam-native-output`. Each run sets
 
 Steam UI idle: GPU 0%, gamescope 27 dma-bufs, Xwayland 39. Everything renders at 1920x1080.
 
-### Run 2: client height cap (`BL_STEAM_MAX_HEIGHT=720`)
+### Run 2: client height cap (`DD_STEAM_MAX_HEIGHT=720`)
 
 - Log: `== steam: the client's height capped at 720 (was unset)`. The client never wrote its own
   value during the run, so a one-time set would hold.
@@ -173,15 +173,15 @@ restored): the session starts at `size=1280x720` and the device report shows `72
 
 ### How runs 2 to 6 were driven
 
-Two temporary session-script hooks, not kept on this branch: `BL_STEAM_MAX_HEIGHT=N` wrote
-`GAMESCOPE_STEAM_MAX_HEIGHT` on the root window, and `BL_GAME_XWAYLAND_MODE=WxH` wrote
+Two temporary session-script hooks, not kept on this branch: `DD_STEAM_MAX_HEIGHT=N` wrote
+`GAMESCOPE_STEAM_MAX_HEIGHT` on the root window, and `DD_GAME_XWAYLAND_MODE=WxH` wrote
 `GAMESCOPE_XWAYLAND_MODE_CONTROL = 1,W,H,0` five seconds after `GAMESCOPE_FOCUSED_APP` showed a
 game. `--xwayland-count 2` and `STEAM_MULTIPLE_XWAYLANDS=1` went through `Download/droiddeck-env`.
 
 ## Two Xwayland servers by default (`feat/steam-dual-xwayland`)
 
 Steam sessions now start gamescope with `--xwayland-count 2` and `STEAM_MULTIPLE_XWAYLANDS=1`.
-`BL_XWAYLAND_COUNT=1` in `Android/data/com.droiddeck.launcher/files/droiddeck-env` goes back to one. The session script's
+`DD_XWAYLAND_COUNT=1` in `Android/data/com.droiddeck.launcher/files/droiddeck-env` goes back to one. The session script's
 root-window requests that are meant for the game (the drawer's live Force fullscreen,
 `GAMESCOPE_FORCE_WINDOWS_FULLSCREEN`, and the resume watcher's `GAMESCOPE_RESTORE_FOCUS_WINDOW`)
 go to both displays, `$DISPLAY` and `STEAM_GAME_DISPLAY_0`. gamescope reads both per server, so
@@ -215,14 +215,23 @@ Still to check by hand: pasting Android text into a game.
 Force fullscreen is still unsafe without a matching Game Resolution: with the default (native),
 a game drawing at another size fights it as in run 4. It stays off by default.
 
+## Stretch 16:9 with two Xwayland servers
+
+With "Stretch 16:9 to panel" the games' server starts at the 16:9 nested size, but the client sets it
+to the output size at every launch (run 7), so games saw a near-square screen and letterboxed
+themselves. While stretching, the session script rewrites a `GAMESCOPE_XWAYLAND_MODE_CONTROL` that
+sizes the game server (`1`) to exactly the output into the nested size with `allow_super_res` set,
+since gamescope otherwise clamps it to the output. A Game Resolution chosen in Steam is a different
+size and is kept.
+
 ## Force fullscreen removed (`feat/remove-force-fullscreen`)
 
 With games on their own Xwayland server, FlatOut 2 no longer shrinks under the QAM, which was the
 reason "Force game windows fullscreen" existed. What it still did was make any game whose Game
 Resolution differs from what it draws fight it (runs 4 and 5). The switch is gone from Steam
 settings (Games) and the session drawer (Display), along with its preference, the
-`BL_GAMESCOPE_FORCE_FULLSCREEN` flag, the `~/.droiddeck-fill` live watcher and the device report
-line. `BL_GAMESCOPE_ARGS=--force-windows-fullscreen` in `Android/data/com.droiddeck.launcher/files/droiddeck-env` still passes the
+`DD_GAMESCOPE_FORCE_FULLSCREEN` flag, the `~/.droiddeck-fill` live watcher and the device report
+line. `DD_GAMESCOPE_ARGS=--force-windows-fullscreen` in `Android/data/com.droiddeck.launcher/files/droiddeck-env` still passes the
 flag for an experiment.
 
 Device check (Thor): Alan Wake's American Nightmare with its 1280x720 Game Resolution runs on `:1`
@@ -236,3 +245,42 @@ The launcher's Execute Steam settings, under Display, offer Picture position: To
 Positioning keeps the selected resolution, fit scale, aspect ratio and full surface intact. It distributes outer letterboxing above or below the picture; it does not crop game-authored black bars inside the surface. A surface that already fills the panel has no vertical space to move. Use a 16:9 resolution for fixed-16:9 games when a separate controls area is desired.
 
 The compositor publishes actual bounds for touch mapping and ignores touches starting outside the picture. The mapping harness covers top, bottom and center across tall, 16:9 and wide surfaces, including inverse input mapping and legacy half-screen mode compatibility.
+
+## Upscaler input resolution with a native-size session
+
+A low-resolution game buffer can have a native-resolution Wayland viewport destination. For
+example, Gamescope can forward a 1280x720 game buffer into a 1920x1080 Steam session. Copying
+that buffer into a 1920x1080 intermediate before the effects chain makes spatial upscalers
+see equal input and output sizes, so FSR/GSR/NIS skip their upscaling pass.
+
+With a spatial upscaler selected, the renderer keeps an opaque, uncropped SDR fullscreen
+source at its buffer size. That source hides preceding draws, which are omitted. Foreground
+planes are drawn over the upscaled result in their original order, preserving the cursor's
+native size. Their coordinates use the actual result dimensions, including a source-sized
+fallback when the effects chain cannot allocate its output. Both swapchain presentation and
+the SurfaceControl effects path retain the logical scene size and input mapping.
+
+Additional whole-scene effects, such as CAS, color adjustment and CRT, keep full composition
+when foreground planes are present, so those effects still cover every plane. Spatial
+upscaling can therefore still be bypassed in that combination. Cropped, blended, HDR and
+larger-source fullscreen sources, and scenes without an eligible fullscreen source, retain
+the existing path. Off, linear, nearest and sharpen-only modes retain their behavior.
+
+To reproduce, start a 1920x1080 Steam session on a native 1080p panel, run a game that presents
+real 1280x720 buffers, and compare Linear with FSR in DroidDeck's session drawer. Show and hide
+the game's cursor. The `effects` log should keep 1280x720 input and 1920x1080 output with both
+the game alone and its foreground cursor plane.
+
+Odin 3 validation, 2026-10-22: Risk of Rain 2 at 1280x720 with fullscreen disabled, a 1920x1080
+session, FSR at 70%, CAS off and Look Off. The user confirms the updated build works. Captured
+logs show `input 1280x720 -> 1920x1080, logical scene 1920x1080` with both two draws (background
+and game) and three draws (including the blended 24x24 cursor), without a native-size fallback
+when the cursor appears. Twelve source-resolution tests and four effects-cache tests pass;
+an ARM64 debug APK builds and passes the asset, runtime-input and native-library checks.
+Other scaler modes, a 720p -> 1080p -> 720p game-resolution round trip, HDR, frame generation
+and the SurfaceControl path have not been independently validated on this device.
+
+This cannot recover a lower internal render resolution from an already-native backbuffer.
+Steam's per-game Properties -> Game Resolution can instead provide a lower-resolution virtual
+display. Changing the whole session's resolution through Steam's Display settings is separate:
+the nested Wayland backend does not expose physical output modes there.

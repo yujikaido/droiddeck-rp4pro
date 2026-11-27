@@ -12,10 +12,10 @@ import java.io.File
 
 object DesktopCatalog {
     private const val TAG = "DesktopCatalog"
-    // MaliBridge: both catalogs are the copies pinned in this build (CatalogPins), never DroidDeck-Components' main.
-    const val CATALOG_URL = com.droiddeck.launcher.core.CatalogPins.DESKTOP
-    const val STEAM_SEED_URL = com.droiddeck.launcher.core.CatalogPins.STEAM_SEED
+    const val CATALOG_URL = "https://raw.githubusercontent.com/Droid-Deck/DroidDeck-Components/main/desktop.json"
+    const val STEAM_SEED_URL = "https://raw.githubusercontent.com/Droid-Deck/DroidDeck-Components/main/steam-seed.json"
     const val PROTON_SEED_ID = "proton-arm64"
+    const val APPIMAGE_EXEC = "/usr/local/bin/droiddeck-appimage-exec"
 
     class Entry(
         val id: String, val name: String, val tier: Int, val version: String, val kind: String,
@@ -23,11 +23,8 @@ object DesktopCatalog {
         val icon: String, val category: String,
     )
 
-    /** The pinned catalog [name] (CATALOG_URL or STEAM_SEED_URL); nothing is read from the network. */
-    fun fetch(name: String = CATALOG_URL, cancelled: java.util.function.BooleanSupplier? = null): List<Entry>? {
-        if (cancelled?.asBoolean == true) return null
-        val body = runCatching { com.droiddeck.launcher.core.CatalogPins.text(name) }
-            .onFailure { Log.w(TAG, "catalog $name: $it") }.getOrNull() ?: return null
+    fun fetch(url: String = CATALOG_URL, cancelled: java.util.function.BooleanSupplier? = null): List<Entry>? {
+        val body = Downloader.downloadString(url, cancelled) ?: return null
         return try {
             val json = JSONObject(body)
             val arr = json.getJSONArray("packages")
@@ -55,7 +52,6 @@ object DesktopCatalog {
 
     private fun journal(root: File, id: String) = File(root, ".droiddeck-pkg-$id$JOURNAL_SUFFIX")
 
-    /** Packages whose extraction over the runtime started and never finished. */
     fun interrupted(context: Context): List<Entry> = interrupted(LinuxRuntime.rootDir(context))
 
     fun interrupted(root: File): List<Entry> =
@@ -67,7 +63,6 @@ object DesktopCatalog {
 
     private fun downloadFile(context: Context, entry: Entry) = File(context.cacheDir, "pkg-${entry.id}-${entry.sha256.take(12)}.download")
 
-    /** Drops downloads kept for installs that no longer need finishing, such as after the runtime was reinstalled. */
     fun pruneDownloads(context: Context) = synchronized(installLock) {
         val keep = interrupted(context).map { downloadFile(context, it).name }.toSet()
         context.cacheDir.listFiles { f -> f.name.startsWith("pkg-") && f.name.removeSuffix(".resume.properties").endsWith(".download") }
@@ -106,7 +101,6 @@ object DesktopCatalog {
         o.optString("icon", "applications-games"), o.optString("category", "Game"),
     )
 
-    /** A finished download is kept until its extraction completes, so resuming does not fetch it again. */
     private fun downloaded(file: File, entry: Entry): Boolean =
         file.isFile && file.length() > 0 && !File(file.path + ".resume.properties").exists() &&
             (entry.size <= 0 || file.length() == entry.size) && entry.sha256.equals(Hashes.sha256(file), ignoreCase = true)
@@ -132,10 +126,6 @@ object DesktopCatalog {
     }
 
     fun desktopInstalled(context: Context): Boolean = desktopInstalled(LinuxRuntime.rootDir(context))
-
-    /** False when the desktop that is installed (or would be) needs a runtime other than the installed one. */
-    fun desktopMatchesRuntime(context: Context): Boolean =
-        DesktopRuntimeMatch.matches(desktopEntry(context).version, LinuxRuntimeInstaller.installedVersion(context))
 
     fun desktopFromPack(root: File): Boolean = DesktopPack.info(root) != null
 
@@ -185,9 +175,6 @@ object DesktopCatalog {
                               listener: LinuxRuntimeInstaller.ProgressListener?): String? {
         val root = LinuxRuntime.rootDir(context)
         if (!root.isDirectory) return context.getString(R.string.deskpkg_runtime_missing)
-        if (entry.id == DESKTOP_ID && !DesktopRuntimeMatch.matches(entry.version, LinuxRuntimeInstaller.installedVersion(context))) {
-            return context.getString(R.string.deskpkg_needs_runtime)
-        }
         if (entry.id == EMULATORS_ID && desktopFromPack(root)) return installEmulators(context, entry, cancelled, listener)
         if (entry.sha256.isEmpty()) return context.getString(R.string.deskpkg_no_checksum, entry.name)
         val download = downloadFile(context, entry)
@@ -230,7 +217,7 @@ object DesktopCatalog {
                     target.setExecutable(true, false)
                     FileUtils.writeString(File(root, "usr/share/applications/droiddeck-${entry.id}.desktop"),
                         "[Desktop Entry]\nType=Application\nName=${entry.name}\n" +
-                        "Exec=env APPIMAGE_EXTRACT_AND_RUN=1 /opt/appimages/${entry.id}.AppImage\n" +
+                        "Exec=$APPIMAGE_EXEC /opt/appimages/${entry.id}.AppImage\n" +
                         "Icon=${entry.icon}\nTerminal=false\nCategories=${entry.category};\n")
                 }
                 else -> {

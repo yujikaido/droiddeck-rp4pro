@@ -1,7 +1,7 @@
 package com.droiddeck.launcher.session
 
+import com.droiddeck.launcher.assumeFilePermissionsEnforced
 import com.droiddeck.launcher.core.LogRedactor
-import com.droiddeck.launcher.runtime.LinuxRuntime
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -9,6 +9,8 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
+import org.junit.After
+import org.junit.Before
 import org.junit.rules.TemporaryFolder
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -24,6 +26,10 @@ import java.util.zip.ZipFile
 @Config(sdk = [28], manifest = Config.NONE)
 class SessionLogShareTest {
     @get:Rule val tmp = TemporaryFolder()
+
+    @Before fun installSecureSourceOpener() = installJvmSecureSourceOpener()
+
+    @After fun resetSourceOpener() = resetSecureSourceOpener()
 
     private val secret = "GET /x?sessionid=abcdef123456 200"
     private val leaked = "abcdef123456"
@@ -87,8 +93,9 @@ class SessionLogShareTest {
         File(folder, "events.jsonl").writeText("$secret\n")
 
         val out = zip(folder)
-        for (name in listOf("app.log", "session.log", "steam/deep/nested.txt", ".hidden.txt", "events.jsonl"))
+        for (name in listOf("app.log", "session.log", "events.jsonl"))
             assertFalse(name, out.getValue(name).contains(leaked))
+        assertTrue(out.values.none { it.contains(leaked) })
     }
 
     @Test fun aRecordUnderOtherRedactorRulesVouchesForNothing() {
@@ -141,6 +148,7 @@ class SessionLogShareTest {
         val folder = tmp.newFolder("2026-10-06-06-steam")
         File(folder, "session.log").writeText("$secret\n")
         org.junit.Assume.assumeFalse(System.getProperty("os.name").startsWith("Windows"))
+        assumeFilePermissionsEnforced()
         folder.setWritable(false)
         try {
             SessionArtifacts.scrubAndMark(folder)
@@ -188,7 +196,7 @@ class SessionLogShareTest {
         assertFalse(File(folder, ".scrubbed-r${LogRedactor.RULES_VERSION}").exists())
     }
 
-    @Test fun steamLogsPastTheSizeLimitStayOut() {
+    @Test fun steamLogsPastTheSizeLimitAreBoundedAndDeclared() {
         val folder = tmp.newFolder("2026-10-06-07-steam")
         File(folder, "session.log").writeText("ok\n")
         File(folder, "steam").mkdirs()
@@ -197,9 +205,11 @@ class SessionLogShareTest {
             val line = ByteArray(1024) { 'x'.code.toByte() }.also { it[it.size - 1] = '\n'.code.toByte() }
             repeat(9 * 1024) { out.write(line) }
         }
-        val names = zip(folder).keys
-        assertTrue("steam/console_log.txt" in names)
-        assertFalse("steam/cef_log.previous.txt" in names)
+        val output = zip(folder)
+        assertTrue("steam/console_log.txt" in output)
+        assertTrue("steam/cef_log.previous.txt" in output)
+        assertTrue(output.getValue("steam/cef_log.previous.txt").contains("diagnostic file truncated"))
+        assertTrue(output.getValue("diagnostics-manifest.json").contains("\"status\": \"truncated\""))
     }
 
     @Test fun streamingComparisonPreservesUnchangedFileAndReplacesChangedFile() {
@@ -517,42 +527,6 @@ class SessionLogShareTest {
         } finally {
             SessionState.running = previousRunning
             folder.deleteRecursively()
-        }
-    }
-
-    @Test fun gameLogsComeFromMyGamesUnrealCrashesAndInstallFolders() {
-        val app = RuntimeEnvironment.getApplication()
-        val folder = tmp.newFolder("2026-10-25-01-steam")
-        File(folder, "session.log").apply { writeText("ok\n"); setLastModified(System.currentTimeMillis() - 60_000) }
-        val steam = File(LinuxRuntime.rootDir(app), "root/.local/share/Steam")
-        val user = File(steam, "steamapps/compatdata/57300/pfx/drive_c/users/steamuser")
-        fun put(f: File, text: String = "log $secret\n") = f.apply { parentFile!!.mkdirs(); writeText(text) }
-        put(File(user, "Documents/My Games/Soma/76561190000000000/hpl.log"))
-        put(File(user, "AppData/Local/Stray/Saved/Crashes/UE4CC-Windows-1/Stray.log"))
-        put(File(user, "AppData/Local/Stray/Saved/Crashes/UE4CC-Windows-1/CrashContext.runtime-xml"))
-        put(File(user, "AppData/Local/Stray/Saved/Crashes/UE4CC-Windows-1/UE4Minidump.dmp"))
-        put(File(user, "Documents/My Games/Soma/old.log")).setLastModified(1_000_000L)
-        java.nio.file.Files.createSymbolicLink(File(user, "My Documents").toPath(), File("Documents").toPath())
-        put(File(steam, "steamapps/appmanifest_2358720.acf"), "\"AppState\"\n{\n\t\"appid\"\t\t\"2358720\"\n\t\"installdir\"\t\t\"BlackMythWukong\"\n}\n")
-        put(File(steam, "steamapps/common/BlackMythWukong/b1/Saved/Logs/b1.log"))
-        put(File(steam, "steamapps/common/BlackMythWukong/b1/Saved/Crashes/c1/b1.log"))
-        put(File(steam, "steamapps/common/BlackMythWukong/b1/Content/Saved/Logs/deep.log"))
-        try {
-            val out = zip(folder)
-            for (name in listOf(
-                "game/57300/Documents/My Games/Soma/76561190000000000/hpl.log",
-                "game/57300/Local/Stray/Saved/Crashes/UE4CC-Windows-1/Stray.log",
-                "game/57300/Local/Stray/Saved/Crashes/UE4CC-Windows-1/CrashContext.runtime-xml",
-                "game/2358720/BlackMythWukong/b1/Saved/Logs/b1.log",
-                "game/2358720/BlackMythWukong/b1/Saved/Crashes/c1/b1.log",
-            )) {
-                assertTrue(name + " in " + out.keys, name in out)
-                assertFalse(name, out.getValue(name).contains(leaked))
-            }
-            assertTrue(out.keys.none { it.endsWith(".dmp") || it.endsWith("old.log") || it.endsWith("deep.log") })
-            assertTrue(out.keys.none { it.contains("My Documents") })
-        } finally {
-            LinuxRuntime.rootDir(app).deleteRecursively()
         }
     }
 }

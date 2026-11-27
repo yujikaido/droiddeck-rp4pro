@@ -4,9 +4,6 @@ import android.content.Context
 import com.droiddeck.launcher.core.Hashes
 import com.droiddeck.launcher.runtime.LinuxRuntime
 import com.github.luben.zstd.ZstdOutputStream
-import org.apache.commons.compress.compressors.gzip.GzipCompressorOutputStream
-import org.apache.commons.compress.compressors.xz.XZCompressorOutputStream
-import java.io.OutputStream
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry
 import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream
 import org.json.JSONObject
@@ -111,26 +108,7 @@ class ComponentImportTest {
         )
     }
 
-    // Offir 11-06: Winlator-style .wcp packages are tar.xz (some tar.gz); the import read only zstd and failed
-    // with zstd's "Unknown frame descriptor".
-    @Test fun importsXzCompressedPackage() {
-        val wcp = createWcp("sarek.wcp", "sarek-xz") { XZCompressorOutputStream(it) }
-        val p = ComponentsManager.importPackage(context, wcp, "dxvk-sarek.wcp")
-        assertEquals("sarek-xz", p.version)
-    }
-
-    @Test fun importsGzipCompressedPackage() {
-        val wcp = createWcp("gz.wcp", "gz-1") { GzipCompressorOutputStream(it) }
-        assertEquals("gz-1", ComponentsManager.importPackage(context, wcp, "dxvk-gz.wcp").version)
-    }
-
-    @Test fun refusesUnknownFormatWithClearMessage() {
-        val junk = File(context.cacheDir, "junk.wcp").apply { writeBytes(ByteArray(64) { 0x50 }) }
-        val e = assertThrows(java.io.IOException::class.java) { ComponentsManager.importPackage(context, junk, "junk.wcp") }
-        assertTrue(e.message ?: "", (e.message ?: "").contains("not a .wcp package"))
-    }
-
-    private fun createWcp(fileName: String, version: String, wrap: (OutputStream) -> OutputStream = { ZstdOutputStream(it) }): File {
+    private fun createWcp(fileName: String, version: String): File {
         val out = File(context.cacheDir, fileName)
         val profile = JSONObject()
             .put("type", "DXVK-Linux")
@@ -140,7 +118,7 @@ class ComponentImportTest {
             .toByteArray(Charsets.UTF_8)
         val dll = "dxvk-dll-$version".toByteArray(Charsets.UTF_8)
 
-        TarArchiveOutputStream(wrap(BufferedOutputStream(FileOutputStream(out)))).use { tar ->
+        TarArchiveOutputStream(ZstdOutputStream(BufferedOutputStream(FileOutputStream(out)))).use { tar ->
             tar.setLongFileMode(TarArchiveOutputStream.LONGFILE_POSIX)
             val profEntry = TarArchiveEntry("profile.json").apply { size = profile.size.toLong() }
             tar.putArchiveEntry(profEntry)

@@ -26,9 +26,14 @@ object AgentGuest {
         private set
     var keyboardRequests by mutableIntStateOf(0)
         private set
+    var gameTextField by mutableStateOf(false)
+        private set
+    var gameProgram by mutableStateOf<String?>(null)
+        private set
     var keyboardDismissals by mutableIntStateOf(0)
         private set
     @Volatile private var keyboardRoute = false
+    @Volatile var readyListener: (() -> Unit)? = null
     @Volatile private var routeDir: File? = null
     private const val TAG = "AgentGuest"
     private const val POLL_MS = 50L
@@ -43,7 +48,7 @@ object AgentGuest {
             observer?.stopWatching()
             observer = null
             lastFocusKey = null
-            main.post { steamKeyboard = false; desktopTextField = false }
+            main.post { steamKeyboard = false; desktopTextField = false; gameTextField = false; gameProgram = null }
             val dir = dir(context)
             dir.deleteRecursively()
             dir.mkdirs()
@@ -55,10 +60,12 @@ object AgentGuest {
                     when (path) {
                         "hello.json" -> readJson(File(dir, path))?.let {
                             SessionEvents.record("agent.ready", mapOf("pid" to it.optInt("pid"), "focus" to it.optBoolean("focus")))
+                            readyListener?.invoke()
                         }
                         "focus.json" -> readJson(File(dir, path))?.let(::recordFocus)
                         "keyboard.json" -> readJson(File(dir, path))?.let { recordKeyboard(this, it) }
                         "ime.json" -> readJson(File(dir, path))?.let { recordTextField(this, it) }
+                        "wine-ime.json" -> readJson(File(dir, path))?.let { recordGameTextField(this, it) }
                         "keyboard-request.json" -> readJson(File(dir, path))?.let { recordKeyboardRequest(this) }
                         "keyboard-dismiss.json" -> readJson(File(dir, path))?.let { recordKeyboardDismiss(this) }
                     }
@@ -71,7 +78,7 @@ object AgentGuest {
         synchronized(lock) {
             observer?.stopWatching()
             observer = null
-            main.post { steamKeyboard = false; desktopTextField = false }
+            main.post { steamKeyboard = false; desktopTextField = false; gameTextField = false; gameProgram = null }
         }
     }
 
@@ -129,6 +136,16 @@ object AgentGuest {
         SessionEvents.record("ime.changed", mapOf("textField" to focused, "seq" to snapshot.optInt("seq")))
     }
 
+    private fun recordGameTextField(source: FileObserver, snapshot: JSONObject) {
+        val focused = snapshot.optBoolean("textField")
+        val program = snapshot.optString("program").takeIf { it.isNotEmpty() }
+        synchronized(lock) {
+            if (source !== observer) return
+            main.post { gameProgram = program; gameTextField = focused }
+        }
+        SessionEvents.record("game.ime.changed", mapOf("textField" to focused, "program" to program, "seq" to snapshot.optInt("seq")))
+    }
+
     private fun recordFocus(snapshot: JSONObject) {
         val fields = linkedMapOf<String, Any?>(
             "focusedApp" to snapshot.opt("focusedApp"),
@@ -153,14 +170,6 @@ object AgentGuest {
 
     fun focus(context: Context): JSONObject? =
         if (SessionState.running) readJson(File(dir(context), "focus.json")) else null
-
-    /** Whether the focus snapshot says the Steam client, not a game, has focus. No snapshot yet: not. */
-    fun steamClientFocused(snapshot: JSONObject?): Boolean {
-        if (snapshot == null) return false
-        val focused = snapshot.optLong("focusedApp").takeIf { snapshot.has("focusedApp") && !snapshot.isNull("focusedApp") }
-        val windows = snapshot.optJSONArray("focusableApps")?.let { apps -> List(apps.length()) { apps.optLong(it) } }.orEmpty()
-        return com.droiddeck.launcher.gpu.FrameGen.steamClientFocused(focused, windows)
-    }
 
     fun selectedSteamAppId(context: Context): Long? {
         val result = call(context, JSONObject().put("kind", "steam-selection"), 6_000)
@@ -220,6 +229,20 @@ object AgentGuest {
     fun steamEval(context: Context, expression: String, timeoutMs: Long): JSONObject =
         call(context, JSONObject().put("kind", "cdp").put("expression", expression).put("timeout", timeoutMs / 1000.0),
             timeoutMs + 2_000, trusted = true)
+
+    fun setGamescopeConvar(context: Context, name: String, value: Int): Boolean {
+        val request = JSONObject()
+            .put("kind", "exec")
+            .put("argv", org.json.JSONArray(listOf("gamescopectl", name, value.toString())))
+            .put("timeout", 5.0)
+        val result = runCatching { call(context, request, 8_000, trusted = true) }
+        val answer = result.getOrNull()
+        val applied = answer?.optBoolean("ok") == true
+            && answer.optInt("exitCode", -1) == 0
+            && !answer.optBoolean("timedOut")
+        if (!applied) Log.w(TAG, "gamescope did not take $name $value: ${result.exceptionOrNull() ?: answer}")
+        return applied
+    }
 
     fun call(context: Context, request: JSONObject, timeoutMs: Long, trusted: Boolean = false): JSONObject {
         if (!trusted && request.optString("kind") in setOf("exec", "cdp")) AgentAccess.requireCommands(context)

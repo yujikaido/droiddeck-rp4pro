@@ -135,8 +135,6 @@ void Engine::generateInto(VkCommandBuffer cmd, uint32_t generation, uint32_t cou
 
     fg_.record(cmd, prev.view, curr.view, targetView, alphaFor(generation, count), gmSlot_,
                generation, generation > 0);
-    // Its descriptor sets could not be made: off like any other build failure (the bridge logs it).
-    if (fg_.scratchFailed()) { unavailable_ = true; return; }
     if (generation + 1 == count) gmSlot_ = (gmSlot_ + 1) % (uint32_t)FrameGen::kGmSlots;
 
     (void)w; (void)h;

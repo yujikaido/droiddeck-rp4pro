@@ -1,7 +1,6 @@
 package com.droiddeck.launcher.session
 
 import android.content.Context
-import android.content.ContextWrapper
 import android.net.LocalServerSocket
 import android.net.LocalSocket
 import android.os.Build
@@ -37,7 +36,12 @@ class RumbleComponentTest {
         vibrator = if (Build.VERSION.SDK_INT >= 31) context.getSystemService(VibratorManager::class.java).defaultVibrator
             else context.getSystemService(Vibrator::class.java)
         shadowOf(vibrator).setHasVibrator(true)
-        rumble = RumbleComponent().also { it.motorLooper = Looper.getMainLooper(); it.attach(context); it.start() }
+        rumble = RumbleComponent().also {
+            it.motorLooper = Looper.getMainLooper()
+            it.gameRunning = { false }
+            it.attach(context)
+            it.start()
+        }
     }
 
     @After fun stopListener() { rumble.stop() }
@@ -69,15 +73,6 @@ class RumbleComponentTest {
         shadowOf(Looper.getMainLooper()).idle()
         effect()
         assertTrue(shadowOf(vibrator).isVibrating)
-    }
-
-    @Test fun sideBySideBuildsListenOnTheirOwnSocket() {
-        val names = listOf("com.droiddeck.launcher", "com.droiddeck.launcher.mali", "com.tencent.ig").map { name ->
-            RumbleComponent.socketName(object : ContextWrapper(context) {
-                override fun getPackageName() = name
-            })
-        }
-        assertEquals(listOf("droiddeck-rumble", "com.droiddeck.launcher.mali.rumble", "com.tencent.ig.rumble"), names)
     }
 
     @Test fun aControllerWithMotorsGetsTheEffectInsteadOfThePhone() {
@@ -123,6 +118,143 @@ class RumbleComponentTest {
         idle(RumbleComponent.KEEPALIVE_MS * 4 + 100)
         assertEquals("the keepalive restarted the motors after a stop", 5, pad.played.size)
         assertFalse(pad.vibrating)
+    }
+
+    @Test fun aHeldEffectStopsWhenTheProcessThatStartedItIsGone() {
+        val pad = FakeMotors()
+        var alive = true
+        rumble.controllerMotors = { pad }
+        rumble.processStart = { pid -> if (pid == SENDER && alive) "1234" else null }
+        rumble.gameRunning = { false }
+        activeController(PAD_ID)
+        effectFrom(SENDER, ms = RumbleComponent.HOLD_MS)
+        idle(RumbleComponent.KEEPALIVE_MS * 2 + 100)
+        assertTrue(pad.vibrating)
+        alive = false
+        idle(RumbleComponent.KEEPALIVE_MS * 2 + 100)
+        assertFalse("a crashed game's rumble kept going", pad.vibrating)
+        val played = pad.played.size
+        idle(RumbleComponent.KEEPALIVE_MS * 4)
+        assertEquals("the keepalive restarted the motors", played, pad.played.size)
+    }
+
+    @Test fun aHeldEffectStopsWhenTheGameItStartedInExits() {
+        val pad = FakeMotors()
+        var game = true
+        rumble.controllerMotors = { pad }
+        rumble.processStart = { "1234" }
+        rumble.gameRunning = { game }
+        activeController(PAD_ID)
+        effectFrom(SENDER, ms = RumbleComponent.HOLD_MS)
+        idle(RumbleComponent.KEEPALIVE_MS * 2 + 100)
+        assertTrue(pad.vibrating)
+        game = false
+        idle(RumbleComponent.KEEPALIVE_MS + 100)
+        assertFalse("rumble outlived the game", pad.vibrating)
+        game = true
+        effectFrom(SENDER, ms = RumbleComponent.HOLD_MS)
+        assertTrue("the next game's rumble was dropped", pad.vibrating)
+    }
+
+    @Test fun aProcessStartTimeIsReadForALiveProcessOnly() {
+        val self = java.io.File("/proc/self").canonicalFile.name.toInt()
+        val start = RumbleComponent.readProcessStart(self)
+        assertNotNull(start)
+        assertNotEquals(RumbleComponent.UNKNOWN_START, start)
+        assertEquals("the start time changed for the same process", start, RumbleComponent.readProcessStart(self))
+        assertNull(RumbleComponent.readProcessStart(Int.MAX_VALUE))
+    }
+
+    @Test fun aGameThatExitsBeforeTheFirstKeepaliveStillStopsItsRumble() {
+        val pad = FakeMotors()
+        var game = true
+        rumble.controllerMotors = { pad }
+        rumble.processStart = { "1234" }
+        rumble.gameRunning = { game }
+        activeController(PAD_ID)
+        effectFrom(SENDER, ms = RumbleComponent.HOLD_MS)
+        game = false
+        idle(RumbleComponent.KEEPALIVE_MS + 100)
+        assertFalse("rumble outlived a game that exited right away", pad.vibrating)
+    }
+
+    @Test fun aGameStartingRightAfterAnotherHoldIsStillWatched() {
+        val pad = FakeMotors()
+        var game = false
+        rumble.controllerMotors = { pad }
+        rumble.processStart = { "1234" }
+        rumble.gameRunning = { game }
+        activeController(PAD_ID)
+        effectFrom(SENDER, ms = RumbleComponent.HOLD_MS)
+        effectFrom(SENDER, strong = 0, weak = 0)
+        game = true
+        idle(RumbleComponent.MIN_GAP_MS)
+        effectFrom(SENDER, ms = RumbleComponent.HOLD_MS)
+        assertTrue(pad.vibrating)
+        game = false
+        idle(RumbleComponent.KEEPALIVE_MS + 100)
+        assertFalse("a stale no-game result left the hold unwatched", pad.vibrating)
+    }
+
+    @Test fun anotherProcessClosingItsOlderRumbleLeavesTheNewerOneOnTheSlot() {
+        val pad = FakeMotors()
+        rumble.controllerMotors = { pad }
+        rumble.processStart = { "1234" }
+        activeController(PAD_ID)
+        effectFrom(SENDER, ms = RumbleComponent.HOLD_MS)
+        idle(RumbleComponent.MIN_GAP_MS)
+        effectFrom(OTHER_SENDER, strong = 30000, ms = RumbleComponent.HOLD_MS)
+        effectFrom(SENDER, strong = 0, weak = 0)
+        assertTrue("an older process's stop cancelled newer rumble", pad.vibrating)
+        effectFrom(OTHER_SENDER, strong = 0, weak = 0)
+        assertFalse(pad.vibrating)
+    }
+
+    @Test fun aSenderOfOurOwnUserThatExitedBeforeItsFirstLookupStopsItsRumble() {
+        val pad = FakeMotors()
+        rumble.controllerMotors = { pad }
+        rumble.processStart = { null }
+        activeController(PAD_ID)
+        effectFrom(SENDER, ms = RumbleComponent.HOLD_MS, ownUser = true)
+        assertTrue(pad.vibrating)
+        idle(RumbleComponent.KEEPALIVE_MS + 100)
+        assertFalse("rumble outlived a sender that was already gone", pad.vibrating)
+    }
+
+    @Test fun anUnseenSenderOfAnotherUserKeepsItsRumble() {
+        val pad = FakeMotors()
+        rumble.controllerMotors = { pad }
+        rumble.processStart = { null }
+        activeController(PAD_ID)
+        effectFrom(SENDER, ms = RumbleComponent.HOLD_MS, ownUser = false)
+        idle(RumbleComponent.KEEPALIVE_MS * 3 + 100)
+        assertTrue("a sender the app can't see lost its rumble", pad.vibrating)
+    }
+
+    @Test fun aSenderFirstReadAsUnknownStillStopsItsRumbleWhenItExits() {
+        val pad = FakeMotors()
+        var start: String? = RumbleComponent.UNKNOWN_START
+        rumble.controllerMotors = { pad }
+        rumble.processStart = { start }
+        activeController(PAD_ID)
+        effectFrom(SENDER, ms = RumbleComponent.HOLD_MS)
+        idle(RumbleComponent.KEEPALIVE_MS * 2 + 100)
+        assertTrue(pad.vibrating)
+        start = null
+        idle(RumbleComponent.KEEPALIVE_MS + 100)
+        assertFalse("rumble outlived its sender", pad.vibrating)
+    }
+
+    @Test fun anUnreadableButLiveProcessKeepsItsRumble() {
+        val pad = FakeMotors()
+        var start: String? = "1234"
+        rumble.controllerMotors = { pad }
+        rumble.processStart = { start }
+        activeController(PAD_ID)
+        effectFrom(SENDER, ms = RumbleComponent.HOLD_MS)
+        start = RumbleComponent.UNKNOWN_START
+        idle(RumbleComponent.KEEPALIVE_MS * 3 + 100)
+        assertTrue("a passing /proc read error cut the rumble", pad.vibrating)
     }
 
     @Test fun quietingStopsAHeldEffectAndDropsEffectsUntilLifted() {
@@ -290,6 +422,12 @@ class RumbleComponentTest {
             .apply { isAccessible = true }.invoke(rumble, strong, weak, ms, slot)
     }
 
+    private fun effectFrom(sender: Int, strong: Int = 40000, weak: Int = 20000, slot: Int = 0, ms: Int = 5000, ownUser: Boolean = false) {
+        val int = Int::class.javaPrimitiveType
+        RumbleComponent::class.java.getDeclaredMethod("buzz", int, int, int, int, int, Boolean::class.javaPrimitiveType)
+            .apply { isAccessible = true }.invoke(rumble, strong, weak, ms, slot, sender, ownUser)
+    }
+
     private fun idle(ms: Long) = shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofMillis(ms))
 
     private class FakeMotors : RumbleComponent.Motors {
@@ -303,81 +441,8 @@ class RumbleComponentTest {
     private companion object {
         const val PAD_ID = 7
         const val SECOND_PAD_ID = 8
-    }
-
-    /** Models Linux: close() alone does not wake a blocked accept(), and the name stays bound until that thread leaves. */
-    private class LinuxNames {
-        val bound = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
-        val listeners = java.util.concurrent.ConcurrentHashMap<String, Fake>()
-        inner class Fake(val name: String) : RumbleComponent.Listener {
-            val wake = java.util.concurrent.LinkedBlockingQueue<Boolean>()
-            val inAccept = java.util.concurrent.CountDownLatch(1)
-            private var blocked = false
-            private var closed = false
-            override fun accept(): LocalSocket {
-                synchronized(this) {
-                    if (closed) { bound.remove(name); throw IOException("closed") }
-                    blocked = true
-                }
-                inAccept.countDown()
-                wake.take()
-                bound.remove(name)
-                throw IOException("listener gone")
-            }
-            // Linux: the name is released at once only when no thread is blocked in accept().
-            override fun close() = synchronized(this) { closed = true; if (!blocked) bound.remove(name); Unit }
-        }
-        fun open(name: String): RumbleComponent.Listener {
-            if (!bound.add(name)) throw IOException("Address already in use")
-            return Fake(name).also { listeners[name] = it }
-        }
-        fun awaitBlocked(name: String) = assertTrue(listeners[name]!!.inAccept.await(5, java.util.concurrent.TimeUnit.SECONDS))
-        fun wake(name: String) { listeners[name]?.wake?.put(true) }
-    }
-
-    private fun component(names: LinuxNames, wake: Boolean = true) = RumbleComponent().also {
-        it.motorLooper = Looper.getMainLooper(); it.attach(context)
-        it.openListener = names::open
-        it.wakeListener = if (wake) names::wake else { _ -> }
-    }
-
-    @Test fun stopFreesTheSocketNameSoTheNextSessionCanListen() {
-        rumble.stop()
-        val names = LinuxNames()
-        val first = component(names).also { it.start() }
-        names.awaitBlocked(RumbleComponent.socketName(context))
-        assertEquals(1, names.bound.size)
-        first.stop()
-        assertTrue("name still bound after stop()", names.bound.isEmpty())
-        val second = component(names).also { it.start() }
-        assertEquals("second session has no listener", 1, names.bound.size)
-        second.stop()
-        assertTrue(names.bound.isEmpty())
-    }
-
-    @Test fun withoutTheWakeUpTheOldListenerKeepsTheNameAndStartGivesUp() {
-        rumble.stop()
-        val names = LinuxNames()
-        val first = component(names, wake = false).also { it.start() }
-        names.awaitBlocked(RumbleComponent.socketName(context))
-        first.stop()
-        assertEquals(1, names.bound.size)
-        val second = component(names, wake = false).also { it.start() }
-        assertEquals("start() must not have bound a second listener", 1, names.bound.size)
-        names.wake(RumbleComponent.socketName(context))
-        second.stop()
-    }
-
-    @Test fun startRetriesTheBindWhileTheOldListenerLeaves() {
-        rumble.stop()
-        val names = LinuxNames()
-        val first = component(names, wake = false).also { it.start() }
-        names.awaitBlocked(RumbleComponent.socketName(context))
-        first.stop()
-        Thread { Thread.sleep(150); names.wake(RumbleComponent.socketName(context)) }.start()
-        val second = component(names).also { it.start() }
-        assertEquals(1, names.bound.size)
-        second.stop()
+        const val SENDER = 4242
+        const val OTHER_SENDER = 4343
     }
 
     @Implements(LocalServerSocket::class)

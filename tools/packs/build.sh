@@ -1,13 +1,4 @@
 #!/usr/bin/env bash
-# Builds the add-on packs the app downloads on first use instead of shipping in the APK:
-#   proot.tar.zst     the patched proot and its loader (built by tools/proot)
-#   directaudio.tar.zst  the Wine DirectAudio drivers (fetched by tools/directaudio/fetch.sh)
-#   tracking.tar.zst  hand-tracking models and the OpenCV/MediaPipe native libraries
-#   xbox.tar.zst      the Xbox backend (built by tools/xbox) for /usr/local/lib/droiddeck-xbox
-#   comet.tar.zst     the GOG Galaxy companion (built by tools/comet) for /usr/local/lib/droiddeck-comet
-# Only CI publishes these (.github/workflows/publish-packs.yml); the APK built from the same
-# directory pins each pack's SHA-256.
-# Usage: tools/packs/build.sh <out-dir>
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -20,6 +11,8 @@ linuxfs="$repo/app/src/main/assets/linuxfs/usr/local/lib"
 source "$here/tracking/release.env"
 # shellcheck source=butler/release.env
 source "$here/butler/release.env"
+# shellcheck source=zstd/release.env
+source "$here/zstd/release.env"
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
@@ -29,6 +22,22 @@ sha256() { if command -v sha256sum >/dev/null; then sha256sum "$1" | cut -d' ' -
 fetch() {
     bash "$here/fetch-verified.sh" "$@"
 }
+
+zstd_version() { "$1" -V 2>/dev/null | sed -n 's/.* v\([0-9][0-9.]*\),.*/\1/p'; }
+zstd=$(command -v zstd || true)
+if [ -z "$zstd" ] || [ "$(zstd_version "$zstd")" != "$ZSTD_VERSION" ]; then
+    zstd="${DROIDDECK_PACK_CACHE:-"$HOME/.cache/droiddeck-pack-inputs"}/zstd-$ZSTD_VERSION/zstd"
+    if [ ! -x "$zstd" ] || [ "$(zstd_version "$zstd")" != "$ZSTD_VERSION" ]; then
+        fetch "https://github.com/facebook/zstd/releases/download/v$ZSTD_VERSION/zstd-$ZSTD_VERSION.tar.gz" \
+            "$ZSTD_SHA256" "$work/zstd.tar.gz"
+        tar -xzf "$work/zstd.tar.gz" -C "$work"
+        make -s -C "$work/zstd-$ZSTD_VERSION" -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)" zstd-release >/dev/null
+        mkdir -p "$(dirname "$zstd")"
+        install -m755 "$work/zstd-$ZSTD_VERSION/programs/zstd" "$zstd.part.$$"
+        mv -f "$zstd.part.$$" "$zstd"
+    fi
+fi
+[ "$(zstd_version "$zstd")" = "$ZSTD_VERSION" ] || { echo "packs need zstd $ZSTD_VERSION, $zstd is not it" >&2; exit 1; }
 
 pack() {
     local name=$1 src=$2
@@ -56,7 +65,7 @@ with tarfile.open(dest, "w", format=tarfile.USTAR_FORMAT) as tar:
         with open(path, "rb") as f:
             tar.addfile(info, f)
 EOF
-    zstd -q -19 -f "$work/$name.tar" -o "$out/$name.tar.zst"
+    "$zstd" -q -19 -f "$work/$name.tar" -o "$out/$name.tar.zst"
     echo "$name $(sha256 "$out/$name.tar.zst") $(wc -c < "$out/$name.tar.zst" | tr -d ' ')"
 }
 
@@ -85,6 +94,11 @@ pack tracking "$work/tracking" hand_landmarker.task hand_landmarker_lite.task po
     libopencv_java4.so libmediapipe_tasks_jni.so
 pack xbox "$linuxfs/droiddeck-xbox" version xodus-cli xodus-service
 pack comet "$linuxfs/droiddeck-comet" version comet
+pack powervr "$repo/app/src/main/assets/hybris" runtime.tzst version.txt
+[ ! -f "$linuxfs/droiddeck-ubisoft/droiddeck-upc.exe" ] || pack ubisoft "$linuxfs/droiddeck-ubisoft" droiddeck-upc.exe
+[ ! -f "$linuxfs/droiddeck-rockstar/Launcher64.exe" ] || pack rockstar "$linuxfs/droiddeck-rockstar" Launcher32.exe Launcher64.exe
+[ ! -f "$linuxfs/droiddeck-dirt/ws2_32.dll" ] || pack dirt "$linuxfs/droiddeck-dirt" ws2_32.dll
+[ ! -f "$linuxfs/droiddeck-epic/EpicGamesLauncher.exe" ] || pack epic "$linuxfs/droiddeck-epic" EpicGamesLauncher.exe
 
 mkdir "$work/butler"
 fetch "https://broth.itch.zone/butler/linux-arm64/${BUTLER_VERSION}/archive/default" \

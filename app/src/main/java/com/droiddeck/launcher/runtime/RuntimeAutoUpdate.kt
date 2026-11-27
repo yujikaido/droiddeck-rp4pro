@@ -8,16 +8,11 @@ object RuntimeAutoUpdate {
     const val MAX_ATTEMPTS = 3
     const val RETRY_MS = 10 * 60_000L
 
-    fun due(installed: String?, release: String?, attempts: Int, lastAt: Long = 0L, now: Long = lastAt + RETRY_MS): Boolean =
-        installed != null && !release.isNullOrEmpty() && release != installed && attempts < MAX_ATTEMPTS &&
-            (attempts == 0 || now - lastAt !in 0 until RETRY_MS)
+    private const val SEEDED = "seeded"
 
-    /** MaliBridge: an installed runtime is never swapped by itself, on any GPU. The catalog is the one pinned in
-     *  this build (CatalogPins); a runtime that differs from it is offered by the Update button (on the bridge it
-     *  first says the download size and free space, RuntimeUpdateNotice), and the player decides. A swap replaces
-     *  the whole tree, so doing it unasked could break a working install (DroidDeck's 10-29 runtime). */
-    @Suppress("UNUSED_PARAMETER")
-    fun allowed(bridge: Boolean) = false
+    fun due(installed: String?, release: String?, attempts: Int, lastAt: Long = 0L, now: Long = lastAt + RETRY_MS, first: Boolean = false): Boolean =
+        (installed != null || first) && !release.isNullOrEmpty() && release != installed && attempts < MAX_ATTEMPTS &&
+            (attempts == 0 || now - lastAt !in 0 until RETRY_MS)
 
     fun key(appVersion: Int, release: String) = "$appVersion:$release"
 
@@ -27,11 +22,17 @@ object RuntimeAutoUpdate {
         val key = key(BuildConfig.VERSION_CODE, release)
         synchronized(this) {
             val attempts = prefs.getInt(key, 0)
-            if (!due(installed, release, attempts, prefs.getLong("$key@at", 0L), now)) return false
+            val first = installed == null && !prefs.getBoolean(SEEDED, false)
+            if (!due(installed, release, attempts, prefs.getLong("$key@at", 0L), now, first)) return false
             val edit = prefs.edit()
-            prefs.all.keys.filterNot { it.startsWith("${BuildConfig.VERSION_CODE}:") }.forEach { edit.remove(it) }
+            prefs.all.keys.filterNot { it.startsWith("${BuildConfig.VERSION_CODE}:") || it == SEEDED }.forEach { edit.remove(it) }
             edit.putInt(key, attempts + 1).putLong("$key@at", now).apply()
             return true
         }
+    }
+
+    fun seed(context: Context) {
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        if (!prefs.getBoolean(SEEDED, false)) prefs.edit().putBoolean(SEEDED, true).apply()
     }
 }

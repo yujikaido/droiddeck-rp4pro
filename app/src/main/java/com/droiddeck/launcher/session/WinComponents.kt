@@ -21,8 +21,7 @@ import java.util.zip.ZipInputStream
 
 object WinComponents {
     private const val TAG = "WinComponents"
-    // MaliBridge: the copy pinned in this build (CatalogPins), never DroidDeck-Components' main.
-    const val CATALOG_URL = com.droiddeck.launcher.core.CatalogPins.WIN_COMPONENTS
+    const val CATALOG_URL = "https://raw.githubusercontent.com/Droid-Deck/DroidDeck-Components/main/components.json"
     private const val SELECTION = "wincomponents.json"
     private const val GUEST_SELECTION = "root/.config/droiddeck/wincomponents.json"
     private const val STORE = "opt/droiddeck/wincomponents"
@@ -39,6 +38,7 @@ object WinComponents {
     private const val MSI_CACHE = "$STORE/.packages"
     private val PROTON_PROVIDES = setOf("gecko", "mono", "cjkfonts", "powershell", "VulkanRT")
     private val NESTED_KEYS = setOf("url", "file_name", "file_checksum", "file_size")
+    private val installLock = Any()
 
     fun validId(id: String): Boolean = ID.matches(id) && ".." !in id
 
@@ -62,7 +62,7 @@ object WinComponents {
     class Component(
         val name: String, val description: String, val provider: String, val status: String,
         val dependencies: List<String>, val steps: List<Step>,
-        val snapshot: String = "",
+        val snapshot: String = "", val revision: Int = 0,
     )
 
     enum class Support { READY, NEEDS_INSTALLER, UNSUPPORTED }
@@ -87,38 +87,23 @@ object WinComponents {
 
     private val SNAPSHOT_COVERS = INSTALLER_STEPS + setOf("download_archive", "archive_extract", "copy_dll", "copy_file") + OFFLINE_STEPS
 
-    private val pinned: List<Component>? by lazy {
-        runCatching { parse(com.droiddeck.launcher.core.CatalogPins.text(CATALOG_URL)) }
-            .onFailure { Log.w(TAG, "catalog: $it") }.getOrNull()
+    fun fetch(): List<Component>? = Downloader.downloadString(CATALOG_URL)?.let { parse(it) }
+
+    private const val CATALOG_CACHE = "wincomponents-catalog.json"
+
+    fun fetch(context: Context): List<Component>? {
+        val cache = File(context.filesDir, CATALOG_CACHE)
+        Downloader.downloadString(CATALOG_URL)?.let { body ->
+            parse(body)?.let { runCatching { write(cache, body) }; return it }
+        }
+        return runCatching { parse(cache.readText()) }.getOrNull()
     }
 
-    /** The pinned catalog; nothing is read from the network (an older build's cached live copy is not used either). */
-    fun fetch(): List<Component>? = pinned
-
-    @Suppress("UNUSED_PARAMETER")
-    fun fetch(context: Context): List<Component>? = pinned
-
-    @Suppress("UNUSED_PARAMETER")
-    fun cached(context: Context): List<Component>? = pinned
-
-    /** The sha256 a download must have: the pinned digest of a DroidDeck-Components asset the catalog names without one. */
-    internal fun pinnedSha256(url: String): String? = com.droiddeck.launcher.core.CatalogPins.assetSha256(url)
-
-    /** Downloads [url], checked against its pinned sha256 when there is one. */
-    private fun fetchChecked(url: String, file: File, onProgress: (Float) -> Unit): String? {
-        val sha = pinnedSha256(url)
-        if (!Downloader.downloadFile(url, file, false, sha) { f -> onProgress(f) }) return "download failed"
-        if (sha != null && !digest(file, "SHA-256").equals(sha, ignoreCase = true)) return "checksum mismatch"
-        return null
-    }
+    fun cached(context: Context): List<Component>? =
+        runCatching { parse(File(context.filesDir, CATALOG_CACHE).readText()) }.getOrNull()
 
     const val VCREDIST_ARM64 = "vcredist2022_arm64"
 
-    /**
-     * The ARM64 Visual C++ 2015-2022 runtime as registry values only (the version a 14.44.35211 installer writes, in both
-     * registry views). Xbox games' launchers running as ARM64EC check for it; Wine's own CRT does the work. Same approach as
-     * MGamer404's Bannerlator #627. Used until the catalog carries a component of this name.
-     */
     internal fun builtInArm64Runtime(): Component {
         fun value(view: String, name: String, type: String, data: String) = Step("set_register_key", JSONObject()
             .put("action", "set_register_key").put("key", "HKLM\\Software\\${view}Microsoft\\VisualStudio\\14.0\\VC\\Runtimes\\arm64")
@@ -143,7 +128,7 @@ object WinComponents {
                     name, o.optString("description"), o.optString("provider"), o.optString("status"),
                     (0 until deps.length()).map { deps.getString(it) }.filter { validId(it) },
                     (0 until steps.length()).map { steps.getJSONObject(it).let { s -> Step(s.optString("action"), s) } },
-                    o.optString("snapshot"),
+                    o.optString("snapshot"), o.optInt("revision", 0).coerceAtLeast(0),
                 )
             }
             if (listed.any { it.name == VCREDIST_ARM64 }) listed else listed + builtInArm64Runtime()
@@ -186,15 +171,31 @@ object WinComponents {
         else -> true
     }
 
-    fun installed(context: Context, id: String): String? = runCatching {
-        JSONObject(File(LinuxRuntime.rootDir(context), "$STORE/$id/component.json").readText()).optString("version", "?")
+    internal fun installedVersion(directory: File, revision: Int): String? = runCatching {
+        val meta = JSONObject(File(directory, "component.json").readText())
+        if (meta.optInt("revision", 0) < revision) null else meta.optString("version", "?")
     }.getOrNull()
 
-    fun installedIds(context: Context): List<String> =
-        File(LinuxRuntime.rootDir(context), STORE).listFiles { f -> f.isDirectory && validId(f.name) }
-            .orEmpty().map { it.name }.filter { installed(context, it) != null }.sorted()
+    fun installed(context: Context, id: String): String? = installedVersion(
+        File(LinuxRuntime.rootDir(context), "$STORE/$id"), cached(context)?.firstOrNull { it.name == id }?.revision ?: 0,
+    )
 
-    fun install(context: Context, c: Component, all: Map<String, Component>, onProgress: (Progress) -> Unit): String? {
+    internal fun downloadedIds(store: File): List<String> =
+        store.listFiles { f -> f.isDirectory && validId(f.name) }.orEmpty()
+            .filter { installedVersion(it, 0) != null }.map { it.name }.sorted()
+
+    fun downloadedIds(context: Context): List<String> = downloadedIds(File(LinuxRuntime.rootDir(context), STORE))
+
+    fun installedIds(context: Context): List<String> {
+        val revisions = cached(context).orEmpty().associate { it.name to it.revision }
+        return File(LinuxRuntime.rootDir(context), STORE).listFiles { f -> f.isDirectory && validId(f.name) }
+            .orEmpty().filter { installedVersion(it, revisions[it.name] ?: 0) != null }.map { it.name }.sorted()
+    }
+
+    fun install(context: Context, c: Component, all: Map<String, Component>, onProgress: (Progress) -> Unit): String? =
+        synchronized(installLock) { installLocked(context, c, all, onProgress) }
+
+    private fun installLocked(context: Context, c: Component, all: Map<String, Component>, onProgress: (Progress) -> Unit): String? {
         if (support(c, all) != Support.READY) return "${c.name} cannot be installed here yet"
         val order = ArrayList<Component>()
         fun visit(x: Component, depth: Int) {
@@ -257,8 +258,8 @@ object WinComponents {
                     val byRuntime = name.lowercase().let { it.endsWith(".exe") || it.endsWith(".cab") }
                     val file = if (byRuntime) File(root, "$MSI_CACHE/${archives.size}-$name").apply { parentFile?.mkdirs() }
                         else File(work, "${archives.size}-$name")
-                    fetchChecked(url, file) { f -> onProgress(Progress(c.name, name, Phase.DOWNLOAD, if (f < 0) -1 else Math.round(f * 100f))) }
-                        ?.let { return "$it: $name" }
+                    val ok = Downloader.downloadFile(url, file, false) { f -> onProgress(Progress(c.name, name, Phase.DOWNLOAD, if (f < 0) -1 else Math.round(f * 100f))) }
+                    if (!ok) return "download failed: $name"
                     step.str("file_checksum").takeIf { it.length == 32 }?.let { md5 ->
                         if (!digest(file, "MD5").equals(md5, ignoreCase = true)) return "checksum mismatch: $name"
                     }
@@ -369,7 +370,7 @@ object WinComponents {
         val version = msi?.optString("version")?.takeIf { it.isNotEmpty() }
             ?: Regex("""\b(\d+\.\d+(\.\d+)*)\b""").find(c.description)?.value ?: "catalog"
         val meta = JSONObject()
-            .put("id", c.name).put("version", version)
+            .put("id", c.name).put("version", version).put("revision", c.revision)
             .put("overrides", JSONArray(overrides.distinct()))
             .put("requires", JSONArray(c.dependencies))
         msi?.let { meta.put("kind", it.optString("kind", "msi")).put("product", it.optString("product")).put("notes", it.optJSONArray("notes") ?: JSONArray()) }
@@ -384,8 +385,9 @@ object WinComponents {
         val root = LinuxRuntime.rootDir(context)
         val name = c.snapshot.substringAfterLast('/')
         val json = File(work, "${c.name}.snapshot.json")
-        fetchChecked(c.snapshot, json) { f -> onProgress(Progress(c.name, name, Phase.DOWNLOAD, if (f < 0) -1 else Math.round(f * 100f))) }
-            ?.let { return null to "$it: $name" }
+        if (!Downloader.downloadFile(c.snapshot, json, false) { f -> onProgress(Progress(c.name, name, Phase.DOWNLOAD, if (f < 0) -1 else Math.round(f * 100f))) }) {
+            return null to "download failed: $name"
+        }
         val snapshot = runCatching { JSONObject(json.readText()) }.getOrNull() ?: return null to "the recording could not be read"
         if (snapshot.optInt("schema") != 1) return null to "the recording is of a newer kind than this app reads"
         val files = snapshot.optJSONArray("files") ?: JSONArray()
@@ -398,7 +400,6 @@ object WinComponents {
             val archiveName = archive.optString("name")
             val url = c.snapshot.substringBeforeLast('/') + "/" + archiveName
             val file = File(work, "${c.name}.files.tar.xz")
-            // The snapshot came straight from github.com, so its digest may vouch for a mirror's copy of the archive.
             val sha = archive.optString("sha256").takeIf { it.matches(Regex("(?i)[0-9a-f]{64}")) }
             if (!Downloader.downloadFile(url, file, false, sha) { f -> onProgress(Progress(c.name, archiveName, Phase.DOWNLOAD, if (f < 0) -1 else Math.round(f * 100f))) }) {
                 return null to "download failed: $archiveName"
@@ -419,8 +420,9 @@ object WinComponents {
             val installer = File(cache, "${c.name}-snapshot-src.bin")
             var unpacked: File? = null
             try {
-                fetchChecked(url, installer) { f -> onProgress(Progress(c.name, installerName, Phase.DOWNLOAD, if (f < 0) -1 else Math.round(f * 100f))) }
-                    ?.let { return null to "$it: $installerName" }
+                if (!Downloader.downloadFile(url, installer, false) { f -> onProgress(Progress(c.name, installerName, Phase.DOWNLOAD, if (f < 0) -1 else Math.round(f * 100f))) }) {
+                    return null to "download failed: $installerName"
+                }
                 unpacked = unpackInRuntime(context, c, installer, "snapshot", onProgress) ?: return null to "could not open $installerName"
                 var missing = 0
                 for (i in 0 until files.length()) {
@@ -494,8 +496,9 @@ object WinComponents {
         val ext = if (listOf(step.str("file_name"), name).any { it.endsWith(".exe", ignoreCase = true) }) "exe" else "msi"
         val file = File(cache, "${c.name}-${c.steps.indexOf(step)}.$ext")
         try {
-            fetchChecked(url, file) { f -> onProgress(Progress(c.name, name, Phase.DOWNLOAD, if (f < 0) -1 else Math.round(f * 100f))) }
-                ?.let { return null to "$it: $name" }
+            if (!Downloader.downloadFile(url, file, false) { f -> onProgress(Progress(c.name, name, Phase.DOWNLOAD, if (f < 0) -1 else Math.round(f * 100f))) }) {
+                return null to "download failed: $name"
+            }
             step.str("file_checksum").takeIf { it.length == 32 }?.let { md5 ->
                 if (!digest(file, "MD5").equals(md5, ignoreCase = true)) return null to "checksum mismatch: $name"
             }
@@ -570,8 +573,7 @@ object WinComponents {
         matches.forEach { f -> f.copyTo(File(dest, f.name.lowercase()), overwrite = true) }
     }
 
-    @Synchronized
-    fun uninstall(context: Context, id: String) {
+    fun uninstall(context: Context, id: String) = synchronized(installLock) {
         require(validId(id))
         FileUtils.delete(File(LinuxRuntime.rootDir(context), "$STORE/$id"))
         save(context, selections(context).mapValues { (_, sel) -> Selection(sel.auto - id, sel.user - id) })

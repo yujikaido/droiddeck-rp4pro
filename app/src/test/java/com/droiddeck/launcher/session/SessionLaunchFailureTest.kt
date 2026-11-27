@@ -51,43 +51,4 @@ class SessionLaunchFailureTest {
             "== droiddeck-session Fri Oct 23 12:01:00 mode=steam",
         ))
     }
-
-    @Test fun desktopOnTheWrongRuntimeHasARuntimeHint() {
-        assertEquals(SessionLaunchFailure.DESKTOP_RUNTIME_MISMATCH, find(
-            "== droiddeck-desktop 2026-11-02 06:30:58 UTC 1280x720",
-            "kwriteconfig6: /usr/lib/libQt6Core.so.6: version `Qt_6.12' not found (required by kwriteconfig6)",
-            "startplasma-wayland: /usr/lib/libQt6Core.so.6: version `Qt_6.12' not found (required by startplasma-wayland)",
-        ))
-    }
-
-    @Test fun otherLoaderLinesAreNotBlamedOnTheRuntime() {
-        assertNull(find("foo: /usr/lib/libc.so.6: version `GLIBC_2.43' not found (required by foo)"))
-        assertNull(find("Qt_6.12 is a version string"))
-    }
-
-    @Test fun aNewerSessionStartClearsAnOldRuntimeMismatch() {
-        assertNull(find(
-            "foo: version `Qt_6.12' not found",
-            "== droiddeck-session start",
-        ))
-    }
-
-    @Test fun aSteamSessionEndedForAMissingBridgeServerSaysSo() {
-        // droiddeck-session's own lines when the Mali bridge server never opened its socket.
-        assertEquals(SessionLaunchFailure.BRIDGE_NOT_USABLE, find(
-            "== droiddeck-session Wed Nov  4 21:00:00 UTC 2026 mode=steam",
-            "== vkbridge: no server socket after 10000 ms at /data/x/server.sock (gave up at 10000 ms)",
-            "== vulkan driver: Mali bridge requested but NOT usable (icd /usr/local/share/vkbridge/droidbridge_icd.json, socket /data/x/server.sock; missing: socket)",
-            "== vulkan driver: the Steam session cannot start without the Mali bridge; ending it",
-        ))
-        // The desktop goes on without the bridge: no hint from the "NOT usable" line alone.
-        assertNull(find(
-            "== droiddeck-session Wed Nov  4 21:00:00 UTC 2026 mode=lxqt",
-            "== vulkan driver: Mali bridge requested but NOT usable (icd x, socket y; missing: socket)",
-        ))
-        assertNull(find(
-            "== vulkan driver: the Steam session cannot start without the Mali bridge; ending it",
-            "== droiddeck-session Wed Nov  4 21:01:00 UTC 2026 mode=steam",
-        ))
-    }
 }

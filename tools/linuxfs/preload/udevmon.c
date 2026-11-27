@@ -14,6 +14,7 @@
 #include <sys/stat.h>
 #include <endian.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
 
 struct stand_in {
@@ -38,6 +39,19 @@ __attribute__((constructor)) static void init_udevmon(void) {
 static ino_t socket_inode(int fd) {
   struct stat st;
   return fstat(fd, &st) == 0 ? st.st_ino : 0;
+}
+
+static struct stand_in *available_stand_in(void) {
+  for (size_t i = 0; i < sizeof(stand_ins) / sizeof(stand_ins[0]); i++) {
+    struct stand_in *entry = &stand_ins[i];
+    if (entry->fd == -1) return entry;
+    if (entry->inode != socket_inode(entry->fd)) {
+      close(entry->peer);
+      entry->fd = -1;
+      return entry;
+    }
+  }
+  return NULL;
 }
 
 static int is_stand_in(int fd) {
@@ -86,14 +100,11 @@ static int make_stand_in(int type) {
   }
   fcntl(sv[1], F_SETFD, FD_CLOEXEC);
   pthread_mutex_lock(&lock);
-  for (size_t i = 0; i < sizeof(stand_ins) / sizeof(stand_ins[0]); i++) {
-    if (stand_ins[i].fd == -1) {
-      stand_ins[i].fd = sv[0];
-      stand_ins[i].peer = sv[1];
-      stand_ins[i].inode = socket_inode(sv[0]);
-      pthread_mutex_unlock(&lock);
-      return sv[0];
-    }
+  struct stand_in *entry = available_stand_in();
+  if (entry != NULL) {
+    *entry = (struct stand_in){.fd = sv[0], .peer = sv[1], .inode = socket_inode(sv[0])};
+    pthread_mutex_unlock(&lock);
+    return sv[0];
   }
   pthread_mutex_unlock(&lock);
   close(sv[0]);
@@ -101,6 +112,21 @@ static int make_stand_in(int type) {
   errno = saved;
   return -1;
 }
+
+__attribute__((visibility("hidden"))) int dd_nl_socket(int type, int *fd);
+__attribute__((visibility("hidden"))) int dd_nl_owns(int fd);
+__attribute__((visibility("hidden"))) int dd_nl_getsockname(int fd, struct sockaddr *addr,
+                                                            socklen_t *len, int *rc);
+__attribute__((visibility("hidden"))) int dd_nl_getpeername(int fd, struct sockaddr *addr,
+                                                            socklen_t *len, int *rc);
+__attribute__((visibility("hidden"))) int dd_nl_setsockopt(int fd, int level, int option,
+                                                          const void *value, socklen_t len,
+                                                          int (*real)(int, int, int, const void *, socklen_t),
+                                                          int *rc);
+__attribute__((visibility("hidden"))) int dd_nl_getsockopt(int fd, int level, int option,
+                                                          void *value, socklen_t *len,
+                                                          int (*real)(int, int, int, void *, socklen_t *),
+                                                          int *rc);
 
 int socket(int domain, int type, int protocol) {
   static int (*real_socket)(int, int, int);
@@ -110,6 +136,11 @@ int socket(int domain, int type, int protocol) {
   if (real_socket == NULL) {
     errno = ENOSYS;
     return -1;
+  }
+  if (domain == AF_NETLINK && protocol == NETLINK_ROUTE) {
+    int route_fd;
+    dd_nl_socket(type, &route_fd);
+    return route_fd;
   }
   fd = real_socket(domain, type, protocol);
   if (fd >= 0 || domain != AF_NETLINK || protocol != NETLINK_KOBJECT_UEVENT)
@@ -122,14 +153,68 @@ int socket(int domain, int type, int protocol) {
   return make_stand_in(type);
 }
 
-__attribute__((visibility("hidden"))) int bl_udevmon_stand_in(int fd) {
+__attribute__((visibility("hidden"))) int dd_udevmon_stand_in(int fd) {
   return is_stand_in(fd);
+}
+
+static int subscribed(int fd) {
+#ifdef UDEVMON_TEST
+  if (getenv("DD_UDEVMON_REFUSE") != NULL) return 0;
+#endif
+  struct sockaddr_nl nl;
+  socklen_t len = sizeof(nl);
+  memset(&nl, 0, sizeof(nl));
+  return getsockname(fd, (struct sockaddr *)&nl, &len) == 0 && nl.nl_groups != 0;
+}
+
+/* Android lets an app open a uevent socket but not join its multicast groups, and libudev joins none
+   when no udev daemon runs, so a monitor bound there hears nothing. Such a socket is replaced, under
+   the same descriptor, by a stand-in. */
+__attribute__((visibility("hidden"))) int dd_udevmon_bind(int fd, const struct sockaddr *addr, socklen_t len,
+                                                          int (*real_bind)(int, const struct sockaddr *, socklen_t),
+                                                          int *rc) {
+  int protocol = -1;
+  socklen_t protocol_len = sizeof(protocol);
+  if (addr == NULL || len < sizeof(struct sockaddr_nl) || addr->sa_family != AF_NETLINK) return 0;
+  if (is_stand_in(fd) || is_wine_process()) return 0;
+  if (getsockopt(fd, SOL_SOCKET, SO_PROTOCOL, &protocol, &protocol_len) != 0 || protocol != NETLINK_KOBJECT_UEVENT)
+    return 0;
+  *rc = real_bind(fd, addr, len);
+  int refused = errno;
+  if (subscribed(fd)) {
+    errno = refused;
+    return 1;
+  }
+  int status = fcntl(fd, F_GETFL);
+  int descriptor = fcntl(fd, F_GETFD);
+  int sv[2];
+  if (status < 0 || descriptor < 0 || socketpair(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0, sv) != 0) {
+    errno = refused;
+    return 1;
+  }
+  pthread_mutex_lock(&lock);
+  struct stand_in *entry = available_stand_in();
+  if (entry == NULL || dup3(sv[0], fd, (descriptor & FD_CLOEXEC) ? O_CLOEXEC : 0) < 0) {
+    pthread_mutex_unlock(&lock);
+    close(sv[0]);
+    close(sv[1]);
+    errno = refused;
+    return 1;
+  }
+  close(sv[0]);
+  if (status & O_NONBLOCK) fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+  *entry = (struct stand_in){.fd = fd, .peer = sv[1], .inode = socket_inode(fd)};
+  pthread_mutex_unlock(&lock);
+  *rc = 0;
+  return 1;
 }
 
 int getsockname(int fd, struct sockaddr *addr, socklen_t *len) {
   static int (*real_getsockname)(int, struct sockaddr *, socklen_t *);
   struct sockaddr_nl nl;
+  int route_rc;
 
+  if (dd_nl_getsockname(fd, addr, len, &route_rc)) return route_rc;
   if (is_stand_in(fd)) {
     if (addr == NULL || len == NULL) {
       errno = EFAULT;
@@ -150,21 +235,43 @@ int getsockname(int fd, struct sockaddr *addr, socklen_t *len) {
   return real_getsockname(fd, addr, len);
 }
 
+int getpeername(int fd, struct sockaddr *addr, socklen_t *len) {
+  static int (*real)(int, struct sockaddr *, socklen_t *);
+  int route_rc;
+  if (dd_nl_getpeername(fd, addr, len, &route_rc)) return route_rc;
+  if (real == NULL) real = dlsym(RTLD_NEXT, "getpeername");
+  return real(fd, addr, len);
+}
+
 int setsockopt(int fd, int level, int optname, const void *optval, socklen_t optlen) {
   static int (*real_setsockopt)(int, int, int, const void *, socklen_t);
+  int route_rc;
 
+  if (real_setsockopt == NULL) real_setsockopt = dlsym(RTLD_NEXT, "setsockopt");
+  if (real_setsockopt == NULL) {
+    errno = ENOSYS;
+    return -1;
+  }
+  if (dd_nl_setsockopt(fd, level, optname, optval, optlen, real_setsockopt, &route_rc)) return route_rc;
   if (is_stand_in(fd)) {
     if (level == SOL_NETLINK)
       return 0;
     if (level == SOL_SOCKET && (optname == SO_ATTACH_FILTER || optname == SO_DETACH_FILTER))
       return 0;
   }
-  if (real_setsockopt == NULL) real_setsockopt = dlsym(RTLD_NEXT, "setsockopt");
-  if (real_setsockopt == NULL) {
+  return real_setsockopt(fd, level, optname, optval, optlen);
+}
+
+int getsockopt(int fd, int level, int option, void *value, socklen_t *len) {
+  static int (*real)(int, int, int, void *, socklen_t *);
+  int route_rc;
+  if (real == NULL) real = dlsym(RTLD_NEXT, "getsockopt");
+  if (real == NULL) {
     errno = ENOSYS;
     return -1;
   }
-  return real_setsockopt(fd, level, optname, optval, optlen);
+  if (dd_nl_getsockopt(fd, level, option, value, len, real, &route_rc)) return route_rc;
+  return real(fd, level, option, value, len);
 }
 
 struct monitor_netlink_header {
@@ -195,8 +302,8 @@ static unsigned murmur_hash2(const char *key, size_t len) {
     len -= 4;
   }
   switch (len) {
-  case 3: h ^= data[2] << 16; /* fallthrough */
-  case 2: h ^= data[1] << 8; /* fallthrough */
+  case 3: h ^= data[2] << 16; __attribute__((fallthrough));
+  case 2: h ^= data[1] << 8; __attribute__((fallthrough));
   case 1: h ^= data[0]; h *= m;
   }
   h ^= h >> 13;
@@ -205,7 +312,7 @@ static unsigned murmur_hash2(const char *key, size_t len) {
   return h;
 }
 
-__attribute__((visibility("default"))) int bl_udevmon_inject(const char *action, const char *devpath,
+__attribute__((visibility("default"))) int dd_udevmon_inject(const char *action, const char *devpath,
                                                              const char *subsystem, const char *devname,
                                                              unsigned major, unsigned minor) {
   static unsigned long long seqnum = 900000;
@@ -236,7 +343,7 @@ __attribute__((visibility("default"))) int bl_udevmon_inject(const char *action,
   return sent;
 }
 
-__attribute__((visibility("hidden"))) int bl_udevmon_recvmsg(int fd, struct msghdr *msg, int flags,
+__attribute__((visibility("hidden"))) int dd_udevmon_recvmsg(int fd, struct msghdr *msg, int flags,
                                                              ssize_t (*real_recvmsg)(int, struct msghdr *, int),
                                                              ssize_t *result) {
   if (!is_stand_in(fd)) return 0;

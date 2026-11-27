@@ -22,13 +22,6 @@ object CpuCores {
     fun gameLaunchList(list: String, clientPinned: Boolean): String =
         restrictionOrEmpty(list).ifEmpty { if (clientPinned) listOrAll("") else "" }
 
-    /** A saved game-core list (even one naming every core) or the client override: the player chose. */
-    fun playerPicked(gameList: String, clientPinned: Boolean): Boolean = clientPinned || gameList.isNotBlank()
-
-    /** Each core's cpu_capacity (1024 = the fastest core at its top clock), null where the kernel gives none. */
-    fun capacity(core: Int): Int? =
-        FileUtils.readString(File("/sys/devices/system/cpu/cpu$core/cpu_capacity"))?.trim()?.toIntOrNull()
-
     fun restrictionOrEmpty(list: String): String {
         val cores = parse(list)
         return if (cores.isEmpty() || cores.size >= all.size) "" else format(cores)

@@ -37,9 +37,9 @@ class FexSelectTest(unittest.TestCase):
                     .replace("/usr/local/bin/FEX", "$ROOT/FEX"))
             script = HARNESS + body + 'if fex_ready; then echo "NOW $FEX_NOW|$FEX_FROM"; else echo FAILED; fi\n'
             env = dict(os.environ, ROOT=root, LOADS="1" if loads else "0", INSTALLABLE=" ".join(installable))
-            env.pop("BL_FEX_TAG", None)
+            env.pop("DD_FEX_TAG", None)
             if catalog:
-                env.update(BL_FEX_TAG=catalog, BL_FEX_SHA256="catsha", BL_FEX_URLS="a b")
+                env.update(DD_FEX_TAG=catalog, DD_FEX_SHA256="catsha", DD_FEX_URLS="a b")
             out = subprocess.run(["bash", "-c", script], env=env, text=True, capture_output=True, timeout=10)
             self.assertEqual(0, out.returncode, out.stderr)
             lines = out.stdout.splitlines()
@@ -79,98 +79,6 @@ class FexSelectTest(unittest.TestCase):
         installs, now = self.run_select(catalog="fex-2610-r6")
         self.assertEqual(2, len(installs))
         self.assertEqual("FAILED", now)
-
-
-def function(name):
-    start = SOURCE.index(name + "() {")
-    return SOURCE[start:SOURCE.index("\n}\n", start) + 3]
-
-
-class FexHoldTest(unittest.TestCase):
-    """MaliBridge: a build put back with --previous is held; the pinned build does not replace it until --unhold."""
-
-    def run_held(self, installed, hold, catalog, installable=()):
-        with tempfile.TemporaryDirectory() as root:
-            Path(root, "tag").write_text(installed + "\n")
-            Path(root, "hold").write_text(hold + "\n")
-            Path(root, "FEX").write_text("")
-            Path(root, "FEX").chmod(0o755)
-            body = (X64_FEX.replace("/usr/local/share/fex-emu/.droiddeck-tag", "$ROOT/tag")
-                    .replace("/usr/local/share/fex-emu/.droiddeck-hold", "$ROOT/hold")
-                    .replace("/usr/local/bin/FEX", "$ROOT/FEX"))
-            script = HARNESS + body + 'if fex_ready; then echo "NOW $FEX_NOW|$FEX_FROM"; else echo FAILED; fi\n'
-            env = dict(os.environ, ROOT=root, LOADS="1", INSTALLABLE=" ".join(installable),
-                       BL_FEX_TAG=catalog, BL_FEX_SHA256="catsha", BL_FEX_URLS="a b")
-            out = subprocess.run(["bash", "-c", script], env=env, text=True, capture_output=True, timeout=10)
-            self.assertEqual(0, out.returncode, out.stderr)
-            lines = out.stdout.splitlines()
-            return [l for l in lines if l.startswith("INSTALL")], lines[-1]
-
-    def test_a_held_build_is_kept_over_the_pinned_one(self):
-        installs, now = self.run_held("fex-2610-r8", "fex-2610-r8", "fex-2610-r9", installable=["fex-2610-r9"])
-        self.assertEqual([], installs)
-        self.assertTrue(now.startswith("NOW fex-2610-r8|held"), now)
-
-    def test_a_hold_for_another_build_does_not_stop_the_pinned_one(self):
-        installs, now = self.run_held("fex-2610-r8", "fex-2610-r7", "fex-2610-r9", installable=["fex-2610-r9"])
-        self.assertEqual(["INSTALL fex-2610-r9 catsha a b"], installs)
-        self.assertEqual("NOW fex-2610-r9|catalog", now)
-
-
-class FexPreviousTest(unittest.TestCase):
-    """MaliBridge: the FEX build a replacement took out is kept so --previous can put it back."""
-
-    def keep(self, before, tag, with_files=True):
-        with tempfile.TemporaryDirectory() as root:
-            files = Path(root, "old")
-            if with_files:
-                (files / "usr/local/bin").mkdir(parents=True)
-                (files / "usr/local/bin/FEX").write_text("old fex\n")
-            script = ('set -eu\nFEX_PREVIOUS="$ROOT/previous"\n' + function("fex_keep_previous") +
-                      f'fex_keep_previous "{before}" "{tag}" "$ROOT/old"\n')
-            out = subprocess.run(["bash", "-c", script], env=dict(os.environ, ROOT=root), text=True, capture_output=True, timeout=20)
-            self.assertEqual(0, out.returncode, out.stderr)
-            prev = Path(root, "previous")
-            if not (prev / "fex.tzst").is_file():
-                return None
-            listing = subprocess.run(["bash", "-c", f'zstd -dc "{prev}/fex.tzst" | tar -t'], text=True, capture_output=True).stdout
-            sha = subprocess.run(["sha256sum", str(prev / "fex.tzst")], text=True, capture_output=True).stdout.split()[0]
-            return (prev / "tag").read_text().strip(), (prev / "sha256").read_text().strip() == sha, listing
-
-    def test_the_replaced_build_is_kept_with_its_tag_and_digest(self):
-        tag, sha_ok, listing = self.keep("fex-2610-r8", "fex-2610-r9")
-        self.assertEqual("fex-2610-r8", tag)
-        self.assertTrue(sha_ok)
-        self.assertIn("./usr/local/bin/FEX", listing)
-
-    def test_nothing_is_kept_without_a_different_previous_build(self):
-        self.assertIsNone(self.keep("", "fex-2610-r9"))
-        self.assertIsNone(self.keep("fex-2610-r9", "fex-2610-r9"))
-        self.assertIsNone(self.keep("fex-2610-r8", "fex-2610-r9", with_files=False))
-
-    def test_previous_reinstalls_the_kept_build_checked_and_holds_it(self):
-        with tempfile.TemporaryDirectory() as root:
-            prev = Path(root, "previous")
-            prev.mkdir()
-            (prev / "fex.tzst").write_text("archive")
-            (prev / "tag").write_text("fex-2610-r8\n")
-            (prev / "sha256").write_text("abc\n")
-            script = ('set -eu\nFEX_PREVIOUS="$ROOT/previous"\nFEX_HOLD="$ROOT/hold"\n'
-                      'fex_install() { echo "INSTALL $1 $2 $3"; [ -s "${3#file://}" ]; }\n' +
-                      function("fex_previous") + 'fex_previous\n')
-            out = subprocess.run(["bash", "-c", script], env=dict(os.environ, ROOT=root), text=True, capture_output=True, timeout=10)
-            self.assertEqual(0, out.returncode, out.stderr)
-            self.assertEqual(f"INSTALL fex-2610-r8 abc file://{prev}/restore.tzst", out.stdout.strip())
-            self.assertEqual("fex-2610-r8", Path(root, "hold").read_text().strip())
-            self.assertFalse((prev / "restore.tzst").exists())
-
-    def test_previous_without_a_kept_build_fails_and_holds_nothing(self):
-        with tempfile.TemporaryDirectory() as root:
-            script = ('set -eu\nFEX_PREVIOUS="$ROOT/previous"\nFEX_HOLD="$ROOT/hold"\n'
-                      'fex_install() { echo INSTALL; }\n' + function("fex_previous") + 'fex_previous || echo FAILED\n')
-            out = subprocess.run(["bash", "-c", script], env=dict(os.environ, ROOT=root), text=True, capture_output=True, timeout=10)
-            self.assertEqual("FAILED", out.stdout.strip())
-            self.assertFalse(Path(root, "hold").exists())
 
 
 if __name__ == "__main__":

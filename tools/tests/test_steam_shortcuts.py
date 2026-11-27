@@ -21,7 +21,15 @@ def load(name):
 shortcuts = load('droiddeck-steam-shortcuts')
 
 APPID = 0x87654321
-GUEST = '/root/Games/PC/Example'
+GUEST = os.path.join(tempfile.mkdtemp(prefix='droiddeck-shortcuts-'), 'Games/PC/Example')
+
+
+def installed(*paths):
+    """Creates the files the writer checks, so a Steam edit to one of them is kept."""
+    for path in paths:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).touch()
+    return paths[0]
 
 
 class ShortcutsTest(unittest.TestCase):
@@ -35,7 +43,7 @@ class ShortcutsTest(unittest.TestCase):
         self.listing = self.root / 'added-games.json'
 
     def game(self, exe='Example.exe', seen=0, appid=APPID, name='Example'):
-        path = GUEST + '/' + exe
+        path = installed(GUEST + '/' + exe)
         return dict(name=name, exe=path, folder=GUEST, dir=path.rsplit('/', 1)[0], appid=appid, seen=seen)
 
     def run_writer(self, *games):
@@ -55,9 +63,31 @@ class ShortcutsTest(unittest.TestCase):
             if value['appid'] & 0xFFFFFFFF == appid:
                 value.update(fields)
         path.write_bytes(shortcuts.write({'shortcuts': data}))
+        if fields.get('Exe'):
+            target = Path(shortcuts.unquoted(fields['Exe']))
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.touch()
 
     def record(self):
         return json.loads((self.config / shortcuts.RECORD).read_text())
+
+    def patched(self, **constants):
+        for name, value in constants.items():
+            old = getattr(shortcuts, name)
+            setattr(shortcuts, name, value)
+            self.addCleanup(setattr, shortcuts, name, old)
+
+    def merge_target(self, exe, **edits):
+        """Runs merge against a Steam-edited target, with the app's exe recorded as the base."""
+        fresh = shortcuts.shortcut(self.game())
+        current = dict(fresh, Exe=exe, **edits)
+        state = {
+            'app': {field: fresh[field] for field in shortcuts.FIELDS},
+            'steam': {field: current.get(field, '') for field in ('AppName', 'Exe', 'StartDir', 'LaunchOptions')},
+            'rev': 1,
+        }
+        entry, _ = shortcuts.merge(fresh, current, state, 0)
+        return entry
 
     def test_settings_changed_in_steam_survive_its_restart(self):
         self.run_writer(self.game())
@@ -82,6 +112,68 @@ class ShortcutsTest(unittest.TestCase):
         self.assertEqual(1, state['rev'])
         self.run_writer(self.game())
         self.assertEqual(1, self.record()['games'][str(APPID)]['rev'])
+
+    def test_a_steam_target_whose_file_is_gone_goes_back_to_the_apps(self):
+        self.run_writer(self.game())
+        self.steam_edits(Exe='"%s/bin/Other.exe"' % GUEST, StartDir='"%s/data"' % GUEST)
+        Path(shortcuts.unquoted('"%s/bin/Other.exe"' % GUEST)).unlink()
+        entry = self.run_writer(self.game())[APPID]
+        self.assertEqual('"%s/Example.exe"' % GUEST, entry['Exe'])
+        self.assertEqual('"%s"' % GUEST, entry['StartDir'])
+        self.assertEqual('"%s/Example.exe"' % GUEST, self.record()['games'][str(APPID)]['steam']['Exe'])
+
+    def test_a_steam_target_whose_internal_folder_is_gone_goes_back_to_the_apps(self):
+        games = self.root / 'games'
+        (games / 'Stores').mkdir(parents=True)
+        self.patched(INTERNAL_ROOTS=(str(games / 'Stores'),))
+        entry = self.merge_target('"%s/old-version/Other.exe"' % (games / 'Stores'), StartDir='"%s/data"' % GUEST)
+        self.assertEqual('"%s/Example.exe"' % GUEST, entry['Exe'])
+        self.assertEqual('"%s"' % GUEST, entry['StartDir'])
+
+    def test_a_steam_target_on_an_unmounted_card_is_kept(self):
+        card = self.root / 'card'
+        card.mkdir()
+        self.patched(REMOVABLE_ROOTS=(str(card),))
+        entry = self.merge_target('"%s/steamapps/common/Other.exe"' % card)
+        self.assertEqual('"%s/steamapps/common/Other.exe"' % card, entry['Exe'])
+        self.assertEqual('"%s"' % GUEST, entry['StartDir'])
+
+    def test_a_steam_target_under_a_bare_card_mountpoint_is_kept(self):
+        card = self.root / 'card'
+        card.mkdir()
+        self.patched(REMOVABLE_ROOTS=(str(card),))
+        entry = self.merge_target('"%s/Other.exe"' % card, StartDir='"%s/data"' % GUEST)
+        self.assertEqual('"%s/Other.exe"' % card, entry['Exe'])
+        self.assertEqual('"%s/data"' % GUEST, entry['StartDir'])
+
+    def test_a_steam_target_is_classified_by_its_resolved_path(self):
+        games = self.root / 'games'
+        stores = games / 'Stores'
+        stores.mkdir(parents=True)
+        card = self.root / 'card'
+        card.mkdir()
+        self.patched(INTERNAL_ROOTS=(str(stores),), REMOVABLE_ROOTS=(str(card),))
+        target = '"%s/../../card/Other.exe"' % stores
+        entry = self.merge_target(target, StartDir='"%s/data"' % GUEST)
+        self.assertEqual(target, entry['Exe'])
+        self.assertEqual('"%s/data"' % GUEST, entry['StartDir'])
+
+    def test_a_steam_target_under_a_bare_store_mountpoint_is_kept(self):
+        stores = self.root / 'stores'
+        mount = stores / 'abcd1234'
+        mount.mkdir(parents=True)
+        self.patched(REMOVABLE_FAMILIES=(str(stores),))
+        entry = self.merge_target('"%s/Other.exe"' % mount, StartDir='"%s/data"' % GUEST)
+        self.assertEqual('"%s/Other.exe"' % mount, entry['Exe'])
+        self.assertEqual('"%s/data"' % GUEST, entry['StartDir'])
+
+    def test_a_steam_target_under_a_mounted_card_goes_back_to_the_apps(self):
+        card = self.root / 'card'
+        (card / 'steamapps').mkdir(parents=True)
+        self.patched(REMOVABLE_ROOTS=(str(card),))
+        entry = self.merge_target('"%s/Other.exe"' % card, StartDir='"%s/data"' % GUEST)
+        self.assertEqual('"%s/Example.exe"' % GUEST, entry['Exe'])
+        self.assertEqual('"%s"' % GUEST, entry['StartDir'])
 
     def test_the_app_taking_steams_target_keeps_steams_start_in(self):
         self.run_writer(self.game())
@@ -227,63 +319,6 @@ class ShortcutsTest(unittest.TestCase):
     def test_two_accounts_without_any_mark_write_nothing(self):
         self.users((123, dict(AccountName='a')), (456, dict(AccountName='b')))
         self.assertIsNone(shortcuts.account_dir(str(self.steam)))
-    # Lenovo tablet, 2026-10-29, anonymised: two accounts signed in on two days, neither
-    # marked MostRecent, keys as Steam writes them; "no signed-in account yet" at both runs.
-    def login_users(self, *accounts):
-        body = ''.join('\t"%d"\n\t{\n%s\t}\n' % (76561197960265728 + acct, ''.join('\t\t"%s"\t\t"%s"\n' % kv for kv in keys.items()))
-                       for acct, keys in accounts)
-        (self.steam / 'config').mkdir(exist_ok=True)
-        (self.steam / 'config/loginusers.vdf').write_text('"users"\n{\n%s}\n' % body)
-
-    def account(self, acct, localconfig_age=None):
-        config = self.steam / ('userdata/%d/config' % acct)
-        config.mkdir(parents=True, exist_ok=True)
-        if localconfig_age is not None:
-            path = config / 'localconfig.vdf'
-            path.write_text('"UserLocalConfigStore"\n{\n}\n')
-            stamp = 1793230000 - localconfig_age
-            os.utime(path, (stamp, stamp))
-
-    def keys(self, name, recent='0', auto='0', stamp='0'):
-        return {'AccountName': name, 'PersonaName': name, 'RememberPassword': '1', 'WantsOfflineMode': '0',
-                'SkipOfflineModeWarning': '0', 'AllowAutoLogin': auto, 'MostRecent': recent, 'Timestamp': stamp}
-
-    def test_two_accounts_without_most_recent_the_newest_timestamp_is_used(self):
-        self.account(9993761)
-        self.account(9990668)
-        self.login_users((9993761, self.keys('first', stamp='1793150000')), (9990668, self.keys('second', stamp='1793237926')))
-        self.assertEqual(str(self.steam / 'userdata/9990668'), shortcuts.account_dir(str(self.steam)))
-        self.config = self.steam / 'userdata/9990668/config'
-        self.assertIn(APPID, self.run_writer(self.game()))
-
-    def test_the_account_marked_most_recent_wins(self):
-        self.login_users((9993761, self.keys('first', recent='1', stamp='100')), (9990668, self.keys('second', auto='1', stamp='200')))
-        self.assertEqual(str(self.steam / 'userdata/9993761'), shortcuts.account_dir(str(self.steam)))
-
-    def test_without_most_recent_the_account_that_signs_in_by_itself_wins(self):
-        self.login_users((9993761, self.keys('first', auto='1', stamp='100')), (9990668, self.keys('second', stamp='200')))
-        self.assertEqual(str(self.steam / 'userdata/9993761'), shortcuts.account_dir(str(self.steam)))
-
-    def test_lower_case_keys_count_too(self):
-        self.login_users((9993761, {'mostrecent': '1'}), (9990668, {'timestamp': '200'}))
-        self.assertEqual(str(self.steam / 'userdata/9993761'), shortcuts.account_dir(str(self.steam)))
-
-    def test_no_marks_the_userdata_folder_written_last_is_used(self):
-        self.account(9993761, localconfig_age=86400)
-        self.account(9990668, localconfig_age=60)
-        self.login_users((9993761, {'AccountName': 'first'}), (9990668, {'AccountName': 'second'}))
-        self.assertEqual(str(self.steam / 'userdata/9990668'), shortcuts.account_dir(str(self.steam)))
-        (self.steam / 'config/loginusers.vdf').unlink()
-        self.assertEqual(str(self.steam / 'userdata/9990668'), shortcuts.account_dir(str(self.steam)))
-
-    def test_two_folders_and_nothing_else_write_nothing(self):
-        self.account(9993761)
-        self.account(9990668)
-        self.assertIsNone(shortcuts.account_dir(str(self.steam)))
-        self.listing.write_text(json.dumps([self.game()]))
-        out = subprocess.run(['python3', str(BIN / 'droiddeck-steam-shortcuts'), str(self.steam), str(self.listing)],
-                             check=True, capture_output=True, text=True).stdout
-        self.assertIn('no signed-in account yet', out)
 
     def test_an_older_record_without_launch_options_still_takes_the_apps(self):
         self.run_writer(self.game())

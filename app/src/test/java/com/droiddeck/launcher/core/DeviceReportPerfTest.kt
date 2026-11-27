@@ -26,13 +26,3 @@ class DeviceReportPerfTest {
         assertEquals("", DeviceReport.refreshModesSummary(emptyList()))
     }
 }
-
-class DeviceReportLinuxDriverTest {
-    @Test fun aBridgeSessionSaysItRunsOnThePhonesOwnDriver() {
-        assertEquals("Runs through the Mali bridge, on the phone's own Vulkan driver", DeviceReport.defaultLinuxDriverLabel(true))
-    }
-
-    @Test fun anAdrenoSessionStillNamesTheRuntimeTurnip() {
-        assertEquals("runtime default (the Turnip built into the runtime)", DeviceReport.defaultLinuxDriverLabel(false))
-    }
-}

@@ -64,37 +64,3 @@ class MemoryReadoutTest {
         assertTrue(MemoryLog.line(device, split.copy(gpuKb = null)).endsWith("gpu ? MB"))
     }
 }
-
-class MemoryReadoutSplitTest {
-    @get:org.junit.Rule val tmp = org.junit.rules.TemporaryFolder()
-
-    private fun proc(dir: java.io.File, pid: Int, ppid: Int, rssKb: Long, cmdline: String = "x", environ: String = "") {
-        val d = java.io.File(dir, "$pid").apply { mkdirs() }
-        java.io.File(d, "stat").writeText("$pid (p q) S $ppid 1 1 0")
-        java.io.File(d, "status").writeText("Name:\tp\nRssAnon:\t $rssKb kB\nRssShmem:\t 0 kB\n")
-        java.io.File(d, "cmdline").writeBytes(cmdline.replace(' ', '\u0000').toByteArray())
-        java.io.File(d, "environ").writeBytes(environ.toByteArray())
-    }
-
-    @Test fun aNativeLinuxSteamGameUnderFexCountsAsGame() {
-        val p = tmp.newFolder("proc1")
-        proc(p, 100, 1, 1000)                                             // root: the app
-        proc(p, 200, 100, 50, "proot steam")                              // steam client
-        proc(p, 300, 200, 20, "reaper SteamLaunch AppId=2868840 -- x")    // game launcher
-        proc(p, 400, 300, 3000, "FEXInterpreter StS2")                    // native game, no WINEPREFIX
-        proc(p, 500, 400, 500, "StS2 child")
-        val s = MemoryReadout.split(100, p)
-        assertEquals(3520L, s.gameKb)
-        assertEquals(1050L, s.droiddeckKb)
-    }
-
-    @Test fun aNonSteamWineLaunchStillCountsByItsPrefix() {
-        val p = tmp.newFolder("proc2")
-        proc(p, 100, 1, 1000)
-        proc(p, 200, 100, 40, "bash run.sh")
-        proc(p, 300, 200, 2000, "wine game.exe", "HOME=/root\u0000WINEPREFIX=/pfx\u0000")
-        val s = MemoryReadout.split(100, p)
-        assertEquals(2000L, s.gameKb)
-        assertEquals(1040L, s.droiddeckKb)
-    }
-}

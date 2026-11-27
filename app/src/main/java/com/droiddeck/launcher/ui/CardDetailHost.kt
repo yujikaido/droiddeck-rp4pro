@@ -26,6 +26,7 @@ import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onGloballyPositioned
@@ -40,10 +41,8 @@ import kotlinx.coroutines.delay
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.getValue
 
-/** A grid of cards with a game page that floods out of the opened card and drains back into it. */
 internal val LocalDetailFloor = compositionLocalOf<() -> Float> { { Float.MAX_VALUE } }
 
-/** How far the host reaches past the page's padding, so a game page can paint to the screen edge and still inset its content. */
 internal class DetailInset(val horizontal: Dp, val top: Dp)
 internal val LocalDetailInset = compositionLocalOf { DetailInset(0.dp, 0.dp) }
 
@@ -78,6 +77,7 @@ internal fun CardDetailHost(
     var leaving by remember { mutableStateOf(false) }
     var from by remember { mutableStateOf<Origin?>(null) }
     var art by remember { mutableStateOf<String?>(null) }
+    var hero by remember { mutableStateOf<String?>(null) }
     var viewportAt by remember { mutableStateOf(Offset.Zero) }
     var viewportH by remember { mutableStateOf(0) }
     LaunchedEffect(open) {
@@ -85,6 +85,7 @@ internal fun CardDetailHost(
             val mark = StoresMotion.takeCard(open)
             from = mark?.let { Origin(it.bounds.translate(-viewportAt), it.corner) }
             art = mark?.art
+            hero = mark?.hero
             StoresMotion.heroLands = mark != null
             leaving = false
             shown = open
@@ -154,7 +155,12 @@ internal fun CardDetailHost(
                             },
                         )
                     }
-                    PageFlood(origin, leaving, painter, onto = { StoresMotion.heroAt }, ontoCorner = 16.dp) { body() }
+                    val light = androidx.compose.material3.MaterialTheme.colorScheme.background.luminance() > 0.5f
+                    val heroPainter = hero?.takeIf { it != art }?.let { url ->
+                        coil.compose.rememberAsyncImagePainter(remember(url) { coil.request.ImageRequest.Builder(ctx).data(url).size(1280, 720).placeholderMemoryCacheKey(url).build() })
+                    } ?: painter
+                    val look = HeroLook(rememberArtBrightness(hero ?: art), light, androidx.compose.material3.MaterialTheme.colorScheme.background)
+                    PageFlood(origin, leaving, painter, onto = { StoresMotion.heroAt }, ontoCorner = 0.dp, ontoLook = look, ontoArt = heroPainter) { body() }
                 }
             }
         }

@@ -26,6 +26,7 @@ public final class WaylandCompositor {
     public interface GameListener {
         void onGameSurface(String window, String gpuName);
         void onGameFrame();
+        default void onCompositorFrame() {}
         default void onGameProgram(int pid, String program) {}
     }
 
@@ -45,9 +46,8 @@ public final class WaylandCompositor {
 
     private static volatile long lastFrameNanos;
     private static volatile long frameIntervalNanos;
-    private static volatile long gameFrames; // written by the compositor thread only
+    private static volatile long gameFrames;
 
-    /** Frames the game has presented since the app started; the rate is the difference over time. */
     public static long gameFrameCount() { return gameFrames; }
 
     public static long recentFrameIntervalMs() {
@@ -72,6 +72,12 @@ public final class WaylandCompositor {
     }
 
     @SuppressWarnings("unused")
+    static void onCompositorFrame() {
+        GameListener l = gameListener;
+        if (l != null) l.onCompositorFrame();
+    }
+
+    @SuppressWarnings("unused")
     static void onGameProgram(int pid, String program) {
         GameListener l = gameListener;
         if (l != null) l.onGameProgram(pid, program != null ? program : "");
@@ -93,6 +99,73 @@ public final class WaylandCompositor {
     static void onPointerLock(boolean locked, int x, int y) {
         PointerLockListener l = pointerLockListener;
         if (l != null) l.onPointerLock(locked, x, y);
+    }
+
+    public interface OverlayPlanesListener {
+        void onOverlayPlanes(int planes);
+    }
+
+    private static volatile OverlayPlanesListener overlayPlanesListener;
+    private static volatile int overlayPlanes = -1;
+
+    public static synchronized void setOverlayPlanesListener(OverlayPlanesListener l) {
+        overlayPlanesListener = l;
+        if (l != null) l.onOverlayPlanes(overlayPlanes);
+    }
+
+    public static synchronized void clearOverlayPlanesListener(OverlayPlanesListener l) {
+        if (overlayPlanesListener == l) overlayPlanesListener = null;
+    }
+
+    @SuppressWarnings("unused")
+    static synchronized void onOverlayPlanes(int planes) {
+        overlayPlanes = planes;
+        OverlayPlanesListener l = overlayPlanesListener;
+        if (l != null) l.onOverlayPlanes(planes);
+    }
+
+    public interface RefreshTargetListener {
+        void onRefreshTarget(int refresh, int frameRate);
+    }
+
+    private static volatile RefreshTargetListener refreshTargetListener;
+    private static volatile long refreshTarget;
+
+    public static void setRefreshTargetListener(RefreshTargetListener l) {
+        refreshTargetListener = l;
+        long target = refreshTarget;
+        if (l != null) l.onRefreshTarget((int) (target >> 32), (int) target);
+    }
+
+    public static void clearRefreshTargetListener(RefreshTargetListener l) {
+        if (refreshTargetListener == l) refreshTargetListener = null;
+    }
+
+    public interface ContentRateListener {
+        void onContentRate(int fps);
+    }
+
+    private static volatile ContentRateListener contentRateListener;
+
+    public static void setContentRateListener(ContentRateListener l) {
+        contentRateListener = l;
+    }
+
+    public static void clearContentRateListener(ContentRateListener l) {
+        if (contentRateListener == l) contentRateListener = null;
+    }
+
+    @SuppressWarnings("unused")
+    static void onContentRate(int fps) {
+        ContentRateListener l = contentRateListener;
+        if (l != null) l.onContentRate(fps);
+    }
+
+    @SuppressWarnings("unused")
+    static void onRefreshTarget(int refresh, int frameRate) {
+        refreshTarget = ((long) refresh << 32) | (frameRate & 0xffffffffL);
+        RefreshTargetListener l = refreshTargetListener;
+        if (l != null) l.onRefreshTarget(refresh, frameRate);
     }
 
     public interface ClipboardListener {
@@ -148,9 +221,13 @@ public final class WaylandCompositor {
 
     public static native void nativeStart(String xdgRuntimeDir);
 
+    /** Nanoseconds of the compositor's own GPU work while timing is on, or -1 when it is not timed. */
+    public static native long nativeGpuBusyNs();
+    public static native void nativeSetGpuTiming(boolean on);
+
     public static native void nativeStartWithSurface(Surface surface, String xdgRuntimeDir,
                                                      String driverPath, String libraryName,
-                                                     String nativeLibDir);
+                                                     String nativeLibDir, boolean allowDriverFallback);
 
     public static native void nativeSetSurface(Surface surface);
     public static native boolean nativeWaitSurface(int timeoutMs);
@@ -159,9 +236,13 @@ public final class WaylandCompositor {
 
     public static native void nativeSendTouch(int action, int pointerId, int x, int y);
 
+    public static native void nativeSendPen(int flags, int x, int y);
+
     public static native int nativeCursorSnapshot(int[] out);
 
     public static native int nativeCursorSerial();
+
+    public static native void nativeSetCursorComposite(boolean on);
 
     public static final int CURSOR_BUF_INTS = 6 + 256 * 256;
 
@@ -173,13 +254,43 @@ public final class WaylandCompositor {
 
     public static native void nativeVsync(long frameTimeNanos);
 
+    public static native void nativeFrameTimeline(long presentNanos, long deadlineNanos, long periodNanos);
+
+    public static native void nativeSetClockControl(String path);
+
     public static native int nativeCompositorTid();
+
+    private static native String nativeCompositorFault();
+
+    private static native String nativeDisplayDriver();
+
+    /** Why the compositor cannot present, or "" while it can (or before the library is loaded). */
+    public static String compositorFault() {
+        try {
+            return nativeCompositorFault();
+        } catch (Throwable t) {
+            return "";
+        }
+    }
+
+    /** The driver that answered for the display, as it reports itself; "" when not known yet. */
+    public static String displayDriver() {
+        try {
+            return nativeDisplayDriver();
+        } catch (Throwable t) {
+            return "";
+        }
+    }
 
     public static native void nativeSetHideShell(boolean hide);
 
     public static native void nativeSetOutputRefreshRate(float hz);
 
+    public static native void nativeSetPanelRates(int[] rates);
+
     public static native void nativeSetZeroCopy(boolean on);
+
+    public static native void nativeSetDisplayBufferDriver(boolean on);
 
     public static native int nativeZeroCopyFrames();
 
@@ -193,14 +304,9 @@ public final class WaylandCompositor {
 
     private static volatile java.io.File sessionLogFile;
 
-    /** The session's wayland.log. The compositor outlives a session (it starts once per app process), so a
-     *  later session moves its log there too; before the compositor starts this only sets BL_WAYLAND_LOG's file. */
     public static void setSessionLogFile(java.io.File file) {
         sessionLogFile = file;
-        if (file != null) nativeSetSessionLog(file.getPath());
     }
-
-    private static native void nativeSetSessionLog(String path);
 
     public static java.io.File currentLogFile() {
         return sessionLogFile;
@@ -214,16 +320,14 @@ public final class WaylandCompositor {
 
     public static native boolean nativeGamePictureRect(float[] out);
 
+    public static native boolean nativeOutputSize(int[] out);
+
     public static native void nativeResizeOutput(int width, int height);
 
     public static native void nativeResetFirstFrame();
 
-    /** What the compositor has seen towards the first frame: gamescope clients connected, GPU frames, frames its
-     *  driver refused (no CPU copy), CPU copies, frames on screen, window redraws. Returns how many were filled. */
-    public static native int nativeFirstFrameProbe(int[] out);
 
-
-    public static final int HDR_MODE_OFF = 0, HDR_MODE_ON = 1, HDR_MODE_FORCE = 2;
+    public static final int HDR_MODE_OFF = 0, HDR_MODE_ON = 1, HDR_MODE_FORCE = 2, HDR_MODE_TONEMAP = 3;
 
     public static native void nativeSetHdrRequest(int mode, String source, boolean dxvkHdr, boolean zeroCopyForced);
 
@@ -280,7 +384,7 @@ public final class WaylandCompositor {
     public static native void nativeSetDeband(boolean enabled, int strength);
 
     public static native void nativeSetScreenEffects(float brightness, float contrast, float gamma, float saturation,
-                                                     boolean fxaa, boolean toon, boolean crt, boolean ntsc);
+                                                     int aaMode, boolean toon, boolean crt, boolean ntsc);
 
     public static native void nativeSetLookName(String name);
 
@@ -297,6 +401,10 @@ public final class WaylandCompositor {
 
     public static native void nativeSetFpsLimit(int fps);
 
+    public static native void nativeSetBlackFrameInsertion(boolean on);
+
+    public static native void nativeSetPictureHold(boolean on);
+
     public static native void nativeSetRenderOnCommit(boolean on);
 
     public static native void nativeSetGpuTurbo(boolean on);
@@ -304,6 +412,9 @@ public final class WaylandCompositor {
     public static native int nativeRaisePriority(int tid, int nice);
 
     public static native void nativeSendSceneInput(int type, int a, int b);
+
+    public static final int SCENE_BUTTON = 3, SCENE_WHEEL = 4, SCENE_POINTER_DELTA = 6, SCENE_AXIS = 11, SCENE_AXIS_FINGER = 12;
+    public static final int WHEEL_STEP_UNITS = 120, POINTER_DELTA_SCALE = 256;
 
     public static final int FG_ENGINE_LSFG = 0, FG_ENGINE_DDFG = 1;
 
@@ -320,11 +431,11 @@ public final class WaylandCompositor {
     public static native int nativeFrameGenProblem();
     public static native String nativeFrameGenCapsReason();
 
+    public static native boolean nativeFrameGenActive();
     public static native float[] nativeFrameGenStats();
 
     public static native long nativeHudFrameTimes(float[] out);
 
-    /** Stream mode: the scene is the Xbox Cloud Gaming native player's picture, handed over frame by frame. */
     public static native void nativeStreamMode(boolean on);
 
     public static native void nativeStreamFrame(android.hardware.HardwareBuffer buffer);
@@ -333,20 +444,19 @@ public final class WaylandCompositor {
 
     public static void sendPointerDelta(int dx, int dy) {
         if (dx == 0 && dy == 0) return;
-        nativeSendSceneInput(6, dx * 256, dy * 256);
+        nativeSendSceneInput(SCENE_POINTER_DELTA, dx * POINTER_DELTA_SCALE, dy * POINTER_DELTA_SCALE);
     }
 
     private static float pendingDeltaX, pendingDeltaY;
 
     public static void sendPointerDelta(float dx, float dy) {
-        // Round-to-zero per event would drop slow motion entirely; carry the remainder.
-        pendingDeltaX += dx * 256f;
-        pendingDeltaY += dy * 256f;
+        pendingDeltaX += dx * POINTER_DELTA_SCALE;
+        pendingDeltaY += dy * POINTER_DELTA_SCALE;
         int x = (int) Math.floor(pendingDeltaX);
         int y = (int) Math.floor(pendingDeltaY);
         if (x == 0 && y == 0) return;
         pendingDeltaX -= x;
         pendingDeltaY -= y;
-        nativeSendSceneInput(6, x, y);
+        nativeSendSceneInput(SCENE_POINTER_DELTA, x, y);
     }
 }

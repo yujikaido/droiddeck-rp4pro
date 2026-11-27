@@ -8,66 +8,54 @@ import android.util.Log
 import com.droiddeck.launcher.core.Downloader
 import com.droiddeck.launcher.core.FileUtils
 import com.droiddeck.launcher.runtime.LinuxRuntime
+import com.droiddeck.launcher.runtime.NativeGuest
 import java.io.File
+import java.util.Locale
 import org.json.JSONArray
 import org.json.JSONObject
 
 object ProtonExtras {
     private const val TAG = "ProtonExtras"
     private const val NEED_BYTES = 4L * 1024 * 1024 * 1024
-    private const val RELEASES = "https://api.github.com/repos/%s/releases?per_page=15"
+    private const val RELEASE_PAGE_SIZE = 15
+    private const val RELEASES = "https://api.github.com/repos/%s/releases?per_page=$RELEASE_PAGE_SIZE&page=%d"
+    private const val RELEASE_PAGES = 5
     private const val RELEASE_TAG = "https://api.github.com/repos/%s/releases/tags/%s"
     const val CHECK_EVERY_MS = 60L * 60 * 1000
     @Volatile
     var installInProgress = false
+    @Volatile var prefetching = false
         private set
+    @Volatile private var checkedArchive: Triple<String, Long, Long>? = null
+    @Volatile private var checkedDigest: String? = null
+
+    private fun fingerprint(archive: File) = Triple(archive.path, archive.length(), archive.lastModified())
     @Volatile
     private var replacing = false
 
-    class Tool(val id: String, val name: String, val prefix: String, val repo: String, val assetPattern: Regex)
+    class Tool(val id: String, val name: String, val prefix: String, val repo: String, val assetPattern: Regex,
+               val prereleases: Boolean = false)
 
     internal data class Asset(val tag: String, val name: String, val url: String, val sha512: String?, val size: Long,
-                             val sha256: String? = null)
+                             val sha256: String? = null, val releaseName: String = tag)
+    internal data class ReleaseFetch(val releases: JSONArray, val complete: Boolean)
 
     const val OWN = "droiddeck"
-
-    /**
-     * The DroidDeck-Proton builds MaliBridge validated on Mali, IN PREFERENCE ORDER: the first is the default, the build the app
-     * installs on its own (a fresh install, a player with no validated build) and the guest starts new titles and moves
-     * titles on; the others stay validated and selectable (offered as an update in the Proton list, installed when the player
-     * asks, never moved to on their own). 11-04: 11-11.10 first, the build our tablets ran (owner decision, release prep
-     * T11); 11-11.11 second (player logs only). The app downloads, installs and updates to these
-     * only; a newer upstream build is never fetched on its own (11-04: 11-12.1 appeared upstream on 11-03, v0.5.5.2 put every
-     * player's games on it and deleted 11-11.x, and the first player who got it lost most of his games). Written to the guest
-     * (/etc/droiddeck/proton-validated, see SessionFiles) for steam-compatibility and droiddeck-proton-extra, which carry the
-     * same list as a fallback (tools/tests/test_proton_pin.py checks all three). 11-11.10: Tab S11 Ultra 11-04; 11-11.11: 11-11.10
-     * plus one 32-bit loader fix, same GE-Proton11-11 base and prefix version, player logs on Mali run games on it.
-     */
-    val VALIDATED_OWN = listOf("DroidDeck-Proton-11-11.10", "DroidDeck-Proton-11-11.11")
-    const val VALIDATED_GUEST_FILE = "etc/droiddeck/proton-validated"
-
-    /** The list in force; null = no pin (the newest upstream build, as before). Tests replace it. */
-    @Volatile
-    internal var validatedOwn: List<String>? = VALIDATED_OWN
-
-    internal fun isValidated(name: String, validated: List<String>? = validatedOwn): Boolean =
-        validated == null || validated.any { versionKey(it) == versionKey(name) }
-
-    /** The newest validated tag, or null when there is no pin. */
-    internal fun pinnedLatest(validated: List<String>? = validatedOwn): String? =
-        validated?.maxWithOrNull { a, b -> compareVersions(a, b) }
-
-    /** The default validated tag (the first of the list), or null when there is no pin: what the app installs on its own. */
-    internal fun pinnedDefault(validated: List<String>? = validatedOwn): String? = validated?.firstOrNull()
+    const val BIONIC = "bionic"
 
     val tools = listOf(
         Tool("ge", "GE-Proton", "GE-Proton", "GloriousEggroll/proton-ge-custom", Regex("aarch64\\.tar\\.(gz|xz)$")),
         Tool("cachyos", "proton-cachyos", "proton-cachyos", "CachyOS/proton-cachyos", Regex("arm64\\.tar\\.(gz|xz)$")),
-        Tool("droiddeck", "DroidDeck-Proton", "DroidDeck-Proton", "Droid-Deck/DroidDeck-Proton", Regex("aarch64\\.tar\\.(gz|xz)$")),
+        Tool("droiddeck", "DroidDeck-Proton", "DroidDeck-Proton", "Droid-Deck/DroidDeck-Proton", Regex("^DroidDeck-Proton-.*aarch64\\.tar\\.(gz|xz)$")),
+        // Bionic (Android libc) Proton started outside the Linux userland; test builds are prereleases. No-proot only.
+        Tool(BIONIC, "DroidDeck-Bionic", "DroidDeck-Bionic", "Droid-Deck/DroidDeck-Proton", Regex("^DroidDeck-Bionic-.*aarch64\\.tar\\.(gz|xz)$"), prereleases = true),
     )
 
+    /** The sources offered on this device: DroidDeck-Bionic only with Run without proot on. */
+    fun offered(context: Context): List<Tool> = tools.filter { it.id != BIONIC || NativeGuest.enabled(context) }
+
     private fun home(context: Context) = File(LinuxRuntime.rootDir(context), "root")
-    private fun requests(context: Context) = File(home(context), ".bl-proton-extra")
+    private fun requests(context: Context) = File(home(context), ".dd-proton-extra")
     private fun toolsDir(context: Context) = File(home(context), ".local/share/Steam/compatibilitytools.d")
     private fun releasesFile(context: Context) = File(context.filesDir, "proton-extras.json")
     private fun latestFile(context: Context) = File(context.filesDir, "proton-latest.json")
@@ -78,10 +66,18 @@ object ProtonExtras {
 
     internal fun installedIn(dir: File, tool: Tool): List<String> =
         dir.listFiles()
-            ?.filter { it.isDirectory && it.name.startsWith(tool.prefix) && File(it, "toolmanifest.vdf").isFile }
+            ?.filter { it.isDirectory && it.name.startsWith(tool.prefix) && usable(it) }
             ?.map { it.name }
             ?.sortedWith { a, b -> compareVersions(a, b) }
             ?: emptyList()
+
+    private fun usable(dir: File): Boolean {
+        val manifest = runCatching { File(dir, "toolmanifest.vdf").readText() }.getOrNull() ?: return false
+        val command = Regex("\\\"commandline\\\"\\s+\\\"/?([^\\\" ]+)").find(manifest)?.groupValues?.getOrNull(1) ?: return false
+        val compat = runCatching { File(dir, "compatibilitytool.vdf").readText() }.getOrNull() ?: return false
+        return Regex("\\\"from_oslist\\\"\\s+\\\"[^\\\"]*windows", RegexOption.IGNORE_CASE).containsMatchIn(compat) &&
+            File(dir, command).isFile && File(dir, command).canExecute()
+    }
 
     private val ARCH = Regex("(?i)aarch64|arm64|x86_64|x86-64|amd64")
     private val NUMBER = Regex("\\d+")
@@ -110,31 +106,7 @@ object ProtonExtras {
         return installedAll(context, tool).map { recorded.optString(it).ifEmpty { it } }
     }
 
-    fun update(context: Context, tool: Tool): String? {
-        val installed = installedTags(context, tool)
-        if (tool.id == OWN && validatedOwn != null) return pinnedUpdate(installed)
-        return updateFor(installed, cachedLatest(context, tool))
-    }
-
-    /** What the app installs on its own. Under the pin, for DroidDeck-Proton only a validated build for a player who has
-     *  DroidDeck-Proton builds but none validated (players v0.5.5.2 moved to 11-12.1); a newer validated build is offered in
-     *  the Proton list ([update]) and installed when the player asks, next to the one his games are on. */
-    fun autoUpdate(context: Context, tool: Tool): String? {
-        if (tool.id != OWN || validatedOwn == null) return update(context, tool)
-        val installed = installedTags(context, tool)
-        return if (installed.isNotEmpty() && installed.none { isValidated(it) }) pinnedDefault() else null
-    }
-
-    /** Under the pin: the newest validated build when it is newer than every validated build installed, or the default validated
-     *  build when the player has DroidDeck-Proton builds but none of them is validated (it is installed NEXT to them; nothing is
-     *  moved or removed). */
-    internal fun pinnedUpdate(installed: List<String>, validated: List<String>? = validatedOwn): String? {
-        val latest = pinnedLatest(validated) ?: return null
-        if (installed.isEmpty()) return null
-        val good = installed.filter { isValidated(it, validated) }
-        if (good.isEmpty()) return pinnedDefault(validated)
-        return updateFor(good, latest)
-    }
+    fun update(context: Context, tool: Tool): String? = updateFor(installedTags(context, tool), cachedLatest(context, tool))
 
     fun missing(context: Context, tool: Tool): String? =
         if (tool.id == OWN && !declined(context) && installedAll(context, tool).isEmpty()) cachedLatest(context, tool) else null
@@ -148,8 +120,7 @@ object ProtonExtras {
     }
 
     fun cachedLatest(context: Context, tool: Tool): String? =
-        if (tool.id == OWN && validatedOwn != null) pinnedDefault()
-        else readJson(latestFile(context)).optJSONObject(tool.id)?.optString("tag")?.ifEmpty { null }
+        readJson(latestFile(context)).optJSONObject(tool.id)?.optString("tag")?.ifEmpty { null }
 
     private val checkLock = Any()
     private const val RETRY_MS = 15L * 60 * 1000
@@ -157,33 +128,36 @@ object ProtonExtras {
     private var lastAttempt = 0L
 
     fun checkLatest(context: Context, force: Boolean = false, now: Long = System.currentTimeMillis()): Boolean {
+        keepBionicCurrent(context)
         synchronized(checkLock) {
             val file = latestFile(context)
             val cache = readJson(file)
-            val due = tools.filter { tool ->
-                if (tool.id == OWN && validatedOwn != null) return@filter false
+            val due = offered(context).filter { tool ->
                 val at = cache.optJSONObject(tool.id)?.optLong("at", 0L) ?: 0L
                 force || (now - at) !in 0 until CHECK_EVERY_MS
             }
             if (due.isEmpty() || !force && (now - lastAttempt) in 0 until RETRY_MS) return false
             lastAttempt = now
             for (tool in due) {
-                val tag = findLatestAsset(tool)?.tag ?: continue
-                cache.put(tool.id, JSONObject().put("tag", tag).put("at", now))
+                updateLatest(cache, tool, releases(tool), now)
             }
             runCatching { file.writeText(cache.toString()) }
             return true
         }
     }
 
+    internal fun recordLatest(latest: JSONObject, tool: Tool, tag: String, now: Long): Boolean {
+        val entry = latest.optJSONObject(tool.id)
+        val known = entry?.optString("tag")
+        if (!known.isNullOrEmpty() && compareVersions(tag, known) < 0) return false
+        latest.put(tool.id, JSONObject().put("tag", tag).put("at", now))
+        return true
+    }
+
     private fun record(context: Context, tool: Tool, dir: String?, tag: String) {
         runCatching {
             val latest = readJson(latestFile(context))
-            val known = latest.optJSONObject(tool.id)?.optString("tag")
-            if (known.isNullOrEmpty() || compareVersions(tag, known) >= 0) {
-                latest.put(tool.id, JSONObject().put("tag", tag).put("at", System.currentTimeMillis()))
-                latestFile(context).writeText(latest.toString())
-            }
+            if (recordLatest(latest, tool, tag, System.currentTimeMillis())) latestFile(context).writeText(latest.toString())
             if (dir != null) {
                 val releases = readJson(releasesFile(context))
                 val present = toolsDir(context).list()?.toSet() ?: emptySet()
@@ -199,15 +173,6 @@ object ProtonExtras {
     fun queued(context: Context, tool: Tool): Boolean =
         requestLines(context).any { it.trim() == tool.id || it.trim().startsWith(tool.id + " ") }
 
-    /** Asks for [tool] through the request file the session script reads at the next session start (droiddeck-proton-extra). */
-    fun enqueue(context: Context, tool: Tool) {
-        if (queued(context, tool)) return
-        val file = requests(context)
-        file.parentFile?.mkdirs()
-        val line = if (tool.id == OWN) pinnedDefault()?.let { "${tool.id} --tag $it" } ?: tool.id else tool.id
-        file.writeText((requestLines(context) + line).joinToString("\n") + "\n")
-    }
-
     fun unqueue(context: Context, tool: Tool) {
         val lines = requestLines(context).filterNot { it.trim() == tool.id || it.trim().startsWith(tool.id + " ") }
         val file = requests(context)
@@ -217,87 +182,51 @@ object ProtonExtras {
 
     fun remove(context: Context, tool: Tool, dir: String? = null) {
         val name = if (dir != null) dir.takeIf { it in installedAll(context, tool) } ?: return else installed(context, tool) ?: return
-        if (File(toolsDir(context), name).deleteRecursively()) ComponentsManager.forgetProton(context, name)
+        if (deleteTool(context, name)) ComponentsManager.forgetProton(context, name)
+    }
+
+    // A tool folder can hold links that point out of it (a prefix template's dosdevices/z: -> /), and
+    // File.deleteRecursively() follows links into directories: remove each link itself, never what it points to.
+    private fun deleteTool(context: Context, name: String): Boolean {
+        val dir = File(toolsDir(context), name)
+        FileUtils.delete(dir)
+        return !dir.exists() && !java.nio.file.Files.isSymbolicLink(dir.toPath())
     }
 
     fun removeOlder(context: Context, tool: Tool) {
         installedAll(context, tool).dropLast(1).forEach {
-            if (File(toolsDir(context), it).deleteRecursively()) ComponentsManager.forgetProton(context, it)
+            if (deleteTool(context, it)) ComponentsManager.forgetProton(context, it)
         }
     }
 
-    /**
-     * After DroidDeck-Proton build [placed] was installed: it takes the DXVK/VKD3D picks and user_settings.py of the build the
-     * player used last (when it has none of its own), and older builds that nothing uses any more are removed. Nothing is moved:
-     * a game, the default and the app's per-game picks stay on the build they are on (11-04: moving them to a new build broke
-     * most of a player's games, and Proton cannot take a prefix back once a newer build upgraded it).
-     */
-    internal fun settleAfterInstall(context: Context, tool: Tool, placed: String?) {
+    // DroidDeck-Bionic: the default and the game picks name the installed build, also when they were left on one an
+    // older app deleted without moving them.
+    private fun keepBionicCurrent(context: Context) {
+        if (SessionState.running) return
+        val tool = tools.firstOrNull { it.id == BIONIC } ?: return
+        val newest = installedAll(context, tool).lastOrNull() ?: return
+        runCatching { ProtonDefault.keepBionicCurrent(context, tool.prefix, newest) }.onFailure { Log.w(TAG, "bionic default and picks", it) }
+    }
+
+    private fun replaceOlder(context: Context, tool: Tool) {
         val all = installedAll(context, tool)
-        val target = placed?.takeIf { it in all } ?: return
-        val previous = all.filter { it != target }.maxWithOrNull { a, b -> compareVersions(a, b) }
-        if (previous != null) {
-            runCatching { ComponentsManager.carryOver(context, previous, target) }.onFailure { Log.w(TAG, "components of $previous", it) }
-            runCatching { keepUserSettings(context, previous, target) }.onFailure { Log.w(TAG, "user settings of $previous", it) }
-        }
-        tidy(context)
-    }
-
-    /** Builds of [tool] that may go: not the newest installed, not the newest validated one, not the default one, and used by nothing. */
-    internal fun removable(context: Context, tool: Tool): List<String> {
-        val all = installedAll(context, tool)
-        if (all.size < 2) return emptyList()
-        val default = pinnedDefault()
-        val keep = setOfNotNull(all.lastOrNull(), all.filter { isValidated(it) }.lastOrNull(),
-            default?.let { d -> all.lastOrNull { versionKey(it) == versionKey(d) } })
-        val used = BuildUse.read(LinuxRuntime.rootDir(context))
-        return all.filter { it !in keep && !used.uses(it, internalName(File(toolsDir(context), it))) }
-    }
-
-    private val INTERNAL_NAME = Regex("\"compat_tools\"\\s*\\{\\s*\"([^\"]+)\"")
-
-    /** The name Steam knows the tool by (compatibilitytool.vdf's key), or null when it cannot be read. */
-    internal fun internalName(dir: File): String? =
-        runCatching { INTERNAL_NAME.find(File(dir, "compatibilitytool.vdf").readText())?.groupValues?.get(1) }.getOrNull()
-
-    /** What uses a Proton build: Steam's mapping (config.vdf, every game and the default), steam-compatibility's default and
-     *  moves, and the app's own picks (request.json, games.json). Anything that cannot be read counts as "in use". */
-    internal class BuildUse(private val texts: List<String>, private val unreadable: Boolean) {
-        fun uses(dir: String, internal: String?): Boolean {
-            if (unreadable || internal == null) return true
-            return texts.any { text -> text.contains("\"$internal\"") || text.contains("\"$dir\"") }
-        }
-
-        companion object {
-            fun read(root: File): BuildUse {
-                val home = File(root, "root")
-                val config = File(home, ".local/share/Steam/config/config.vdf")
-                val compat = File(home, ".local/share/droiddeck-compat")
-                val texts = mutableListOf<String>()
-                var unreadable = false
-                if (config.exists()) {
-                    val text = runCatching { config.readText() }.getOrNull()
-                    if (text == null) unreadable = true
-                    else Regex("\"CompatToolMapping\"[\\s\\S]*").find(text)?.value?.let { texts.add(it) }
-                }
-                for (name in listOf("request.json", "games.json", "known-games.json")) {
-                    val file = File(compat, name)
-                    if (!file.exists()) continue
-                    val text = runCatching { file.readText() }.getOrNull()
-                    if (text == null) unreadable = true else texts.add(text)
-                }
-                File(compat, "state.json").takeIf { it.exists() }?.let { file ->
-                    val state = runCatching { JSONObject(file.readText()) }.getOrNull()
-                    if (state == null) unreadable = true
-                    else {
-                        // "tools" lists every installed tool and "own_builds" every build ever seen: those say nothing about use.
-                        for (key in listOf("default", "auto", "fallbacks", "pending_fallbacks", "new_title_tools", "chosen")) {
-                            state.opt(key)?.let { texts.add(JSONObject().put(key, it).toString()) }
-                        }
-                    }
-                }
-                return BuildUse(texts, unreadable)
+        val newest = all.lastOrNull() ?: return
+        val older = all.dropLast(1)
+        if (older.isEmpty()) return
+        replacing = true
+        try {
+            for (old in older.asReversed()) {
+                if (SessionState.running) break
+                if (runCatching { ComponentsManager.carryOver(context, old, newest) }.onFailure { Log.w(TAG, "components of $old", it) }.isFailure) continue
+                if (runCatching { keepUserSettings(context, old, newest) }.onFailure { Log.w(TAG, "user settings of $old", it) }.isFailure) continue
+                if (runCatching { ProtonDefault.moveGames(context, setOf(old), newest) }.onFailure { Log.w(TAG, "per-game picks of $old", it) }.isFailure) continue
+                // DroidDeck-Bionic only: the guest finds no default for a deleted Bionic build and falls back to DroidDeck-Proton
+                if (tool.id == BIONIC && runCatching { ProtonDefault.moveDefault(context, setOf(old), newest) }.onFailure { Log.w(TAG, "default pick of $old", it) }.isFailure) continue
+                if (deleteTool(context, old)) ComponentsManager.forgetProton(context, old)
+                else Log.w(TAG, "could not remove $old")
             }
+        } finally {
+            replacing = false
         }
     }
 
@@ -307,23 +236,10 @@ object ProtonExtras {
         if (from.isFile && !to.exists()) from.copyTo(to)
     }
 
-    /** Removes DroidDeck-Proton builds that nothing uses (see [removable]); a build a game, the default or a pick is on stays. */
     fun tidy(context: Context) {
         val tool = tools.firstOrNull { it.id == OWN } ?: return
-        val gone = removable(context, tool).takeIf { it.isNotEmpty() } ?: return
-        replacing = true
-        try {
-            for (old in gone) {
-                if (SessionState.running) break
-                if (File(toolsDir(context), old).deleteRecursively()) ComponentsManager.forgetProton(context, old)
-                else Log.w(TAG, "could not remove $old")
-            }
-        } finally {
-            replacing = false
-        }
+        if (installedAll(context, tool).size > 1) replaceOlder(context, tool)
     }
-
-    fun tidyNeeded(context: Context): Boolean = tools.firstOrNull { it.id == OWN }?.let { removable(context, it).isNotEmpty() } ?: false
 
     fun awaitReplacement(timeoutMs: Long) {
         val until = System.currentTimeMillis() + timeoutMs
@@ -333,27 +249,13 @@ object ProtonExtras {
     }
 
     @Synchronized
-    /** [want]: the tag to install (an update the player tapped, or what [autoUpdate] / [missing] named); under the pin a tag
-     *  that is not validated is ignored. Null: the default validated build first. */
-    fun install(context: Context, tool: Tool, onProgress: (String, Int) -> Unit, want: String? = null): String? {
-        if (installInProgress) return context.getString(R.string.pextra_busy)
+    fun install(context: Context, tool: Tool, onProgress: (String, Int) -> Unit): String? {
+        if (installInProgress || prefetching) return context.getString(R.string.pextra_busy)
         installInProgress = true
-        return try { installNow(context, tool, onProgress, want) } finally { installInProgress = false }
+        return try { installNow(context, tool, onProgress) } finally { installInProgress = false }
     }
 
-    private fun installNow(context: Context, tool: Tool, onProgress: (String, Int) -> Unit, want: String?): String? {
-        if (SessionState.running) return context.getString(R.string.pextra_stop_session)
-        if (!LinuxRuntime.isInstalled(context)) return context.getString(R.string.user_apps_runtime_required)
-
-        val asset = findLatestAsset(tool, want) ?: return context.getString(R.string.pextra_no_release, tool.name)
-        val downloads = File(context.filesDir, "proton-downloads").apply { mkdirs() }
-        val archive = File(downloads, "${tool.id}-${asset.name}")
-        if (asset.size > 0 && archive.length() > asset.size) archive.delete()
-        val missing = (asset.size - archive.length()).coerceAtLeast(0L)
-        if (StatFs(LinuxRuntime.rootDir(context).path).availableBytes < NEED_BYTES + missing) {
-            return context.getString(R.string.pextra_no_space, tool.name)
-        }
-
+    private fun fetchArchive(context: Context, tool: Tool, asset: Asset, archive: File, onProgress: (String, Int) -> Unit): String? {
         val downloading = context.getString(R.string.pextra_downloading, tool.name, asset.tag)
         onProgress(downloading, 0)
         var downloaded = false
@@ -371,6 +273,46 @@ object ProtonExtras {
             }
         }
         if (!downloaded) return context.getString(R.string.pextra_download_failed)
+        return null
+    }
+
+    /** Downloads the newest build of [tool] ahead of the runtime it installs into; [install] verifies and unpacks it later. */
+    @Synchronized
+    fun prefetch(context: Context, tool: Tool, onProgress: (String, Int) -> Unit): String? {
+        if (installInProgress) return context.getString(R.string.pextra_busy)
+        prefetching = true
+        try { return prefetchNow(context, tool, onProgress) } finally { prefetching = false }
+    }
+
+    private fun prefetchNow(context: Context, tool: Tool, onProgress: (String, Int) -> Unit): String? {
+        val asset = releases(tool)?.let { pickAsset(tool, it) } ?: return context.getString(R.string.pextra_no_release, tool.name)
+        val downloads = File(context.filesDir, "proton-downloads").apply { mkdirs() }
+        val archive = File(downloads, "${tool.id}-${asset.name}")
+        if (asset.size > 0 && archive.length() > asset.size) archive.delete()
+        val missing = (asset.size - archive.length()).coerceAtLeast(0L)
+        if (StatFs(context.filesDir.path).availableBytes < NEED_BYTES + missing) return context.getString(R.string.pextra_no_space, tool.name)
+        val problem = fetchArchive(context, tool, asset, archive, onProgress)
+        checkedArchive = if (problem == null && asset.sha256 != null && asset.size > 0 && archive.length() == asset.size) fingerprint(archive) else null
+        checkedDigest = if (checkedArchive != null) asset.sha256 else null
+        return problem
+    }
+
+    private fun installNow(context: Context, tool: Tool, onProgress: (String, Int) -> Unit): String? {
+        if (SessionState.running) return context.getString(R.string.pextra_stop_session)
+        if (!LinuxRuntime.isInstalled(context)) return context.getString(R.string.user_apps_runtime_required)
+
+        val asset = releases(tool)?.let { pickAsset(tool, it) } ?: return context.getString(R.string.pextra_no_release, tool.name)
+        val downloads = File(context.filesDir, "proton-downloads").apply { mkdirs() }
+        val archive = File(downloads, "${tool.id}-${asset.name}")
+        if (asset.size > 0 && archive.length() > asset.size) archive.delete()
+        val missing = (asset.size - archive.length()).coerceAtLeast(0L)
+        if (StatFs(LinuxRuntime.rootDir(context).path).availableBytes < NEED_BYTES + missing) {
+            return context.getString(R.string.pextra_no_space, tool.name)
+        }
+
+        val checked = asset.sha256 != null && asset.size > 0 && checkedArchive == fingerprint(archive) &&
+            checkedDigest.equals(asset.sha256, ignoreCase = true)
+        if (!checked) fetchArchive(context, tool, asset, archive, onProgress)?.let { return it }
         if (asset.size > 0 && archive.length() != asset.size) {
             if (archive.length() > asset.size) {
                 archive.delete()
@@ -381,6 +323,7 @@ object ProtonExtras {
 
         onProgress(context.getString(R.string.pextra_verifying), -1)
         val verified = when {
+            checked -> true
             asset.sha256 != null -> asset.sha256.equals(Hashes.sha256(archive), ignoreCase = true)
             asset.sha512 != null -> {
                 val expected = Downloader.downloadDirect(asset.sha512)?.let { Regex("(?i)\\b[0-9a-f]{128}\\b").find(it)?.value }
@@ -404,20 +347,12 @@ object ProtonExtras {
             val root = LinuxRuntime.rootDir(context)
             LinuxRuntime.writeAccounts(context)
             com.droiddeck.launcher.session.SessionFiles.stage(context, root)
-            val runtimeDir = File(context.filesDir, ".proton-install-rt").apply { mkdirs() }
             val guest = listOf(
                 "/usr/bin/env", "-i", "HOME=/root", "USER=root", "PATH=/usr/local/bin:/usr/bin:/bin",
                 "LANG=C.UTF-8", "XDG_DATA_HOME=/root/.local/share",
                 "/usr/local/bin/droiddeck-proton-extra", "/root/.local/share/Steam", archive.absolutePath,
             )
-            val command = LinuxRuntime.command(context, null, runtimeDir, null, guest)
-            val process = ProcessBuilder(command)
-                .directory(root)
-                .redirectErrorStream(true)
-            val hostEnv = process.environment()
-            hostEnv["PROOT_LOADER"] = LinuxRuntime.prootLoader(context).path
-            hostEnv["PROOT_TMP_DIR"] = LinuxRuntime.prootTempDir(context).path
-            LinuxRuntime.prootLibraryPath(context).takeIf { it.isNotEmpty() }?.let { hostEnv["LD_LIBRARY_PATH"] = it }
+            val process = guestProcess(context, guest)
             val child = process.start()
             var placed: String? = null
             child.inputStream.bufferedReader().useLines { lines ->
@@ -435,7 +370,7 @@ object ProtonExtras {
                 archive.delete()
                 unqueue(context, tool)
                 record(context, tool, placed, asset.tag)
-                if (tool.id == OWN) settleAfterInstall(context, tool, placed)
+                if (tool.id == OWN || tool.id == BIONIC) replaceOlder(context, tool)
                 if (EsyncPacks.enabled(context)) {
                     onProgress(context.getString(R.string.esync_fetching), -1)
                     try {
@@ -452,51 +387,106 @@ object ProtonExtras {
         }
     }
 
-    /** Under the pin, the tags tried in turn (a release can vanish): [want] when it is validated, then the list in its order. */
-    internal fun pinnedTries(want: String?, pinned: List<String>): List<String> =
-        (listOfNotNull(want?.let { w -> pinned.firstOrNull { versionKey(it) == versionKey(w) } }) + pinned).distinct()
-
-    private fun findLatestAsset(tool: Tool, want: String? = null): Asset? {
-        val pinned = validatedOwn
-        if (tool.id == OWN && pinned != null) {
-            for (tag in pinnedTries(want, pinned)) {
-                val body = Downloader.downloadString(RELEASE_TAG.format(tool.repo, tag)) ?: continue
-                val asset = runCatching { pickAsset(tool, JSONArray().put(JSONObject(body)), pinned) }
-                    .onFailure { Log.w(TAG, "release metadata for $tag", it) }.getOrNull()
-                if (asset != null) return asset
-            }
-            return null
-        }
-        val releases = Downloader.downloadString(RELEASES.format(tool.repo)) ?: return null
-        return try {
-            pickAsset(tool, JSONArray(releases))
-        } catch (e: Exception) {
-            Log.w(TAG, "release metadata for ${tool.id}", e)
-            null
+    internal fun guestProcess(context: Context, guest: List<String>): ProcessBuilder {
+        val root = LinuxRuntime.rootDir(context)
+        val runtimeDir = File(context.filesDir, ".proton-install-rt").apply { mkdirs() }
+        return if (com.droiddeck.launcher.runtime.NativeGuest.enabled(context)) {
+            com.droiddeck.launcher.runtime.NativeGuest.processBuilder(context, root,
+                LinuxRuntime.binds(context, null, runtimeDir, null, null), guest).redirectErrorStream(true)
+        } else {
+            ProcessBuilder(LinuxRuntime.command(context, null, runtimeDir, null, guest))
+                .directory(root)
+                .redirectErrorStream(true)
+                .also { builder ->
+                    val hostEnv = builder.environment()
+                    hostEnv["PROOT_LOADER"] = LinuxRuntime.prootLoader(context).path
+                    hostEnv["PROOT_TMP_DIR"] = LinuxRuntime.prootTempDir(context).path
+                    LinuxRuntime.prootLibraryPath(context).takeIf { it.isNotEmpty() }?.let { hostEnv["LD_LIBRARY_PATH"] = it }
+                }
         }
     }
 
-    internal fun pickAsset(tool: Tool, array: JSONArray, validated: List<String>? = if (tool.id == OWN) validatedOwn else null): Asset? {
-        for (i in 0 until array.length()) {
-            val release = array.getJSONObject(i)
-            if (release.optBoolean("draft", false) || release.optBoolean("prerelease", false)) continue
-            if (validated != null && !isValidated(release.optString("tag_name"), validated)) continue
-            val assets = release.optJSONArray("assets") ?: continue
-            val entries = (0 until assets.length()).map { assets.getJSONObject(it) }
-            val archive = entries.sortedBy { it.optString("name") }.firstOrNull { tool.assetPattern.containsMatchIn(it.optString("name")) } ?: continue
+    internal fun releases(tool: Tool): JSONArray? = releases(tool) { page ->
+        Downloader.downloadString(RELEASES.format(Locale.ROOT, tool.repo, page))?.let { body ->
+            try {
+                JSONArray(body)
+            } catch (e: Exception) {
+                Log.w(TAG, "release metadata for ${tool.id}", e)
+                null
+            }
+        }
+    }
+
+    internal fun releases(tool: Tool, fetch: (Int) -> JSONArray?): JSONArray? {
+        return releasesResult(tool, fetch, stopAtStable = true)?.releases
+    }
+
+    internal fun releasesForRemoval(tool: Tool, fetch: (Int) -> JSONArray? = { page ->
+        Downloader.downloadString(RELEASES.format(Locale.ROOT, tool.repo, page))?.let { body ->
+            runCatching { JSONArray(body) }.getOrNull()
+        }
+    }): ReleaseFetch? = releasesResult(tool, fetch, stopAtStable = false)
+
+    internal fun releaseGone(tool: Tool, tag: String): Boolean =
+        Downloader.gone(RELEASE_TAG.format(Locale.ROOT, tool.repo, java.net.URLEncoder.encode(tag, "UTF-8").replace("+", "%20"))) == true
+
+    private fun releasesResult(tool: Tool, fetch: (Int) -> JSONArray?, stopAtStable: Boolean): ReleaseFetch? {
+        val all = fetch(1) ?: return null
+        var page = 1
+        var last = all.length()
+        var complete = last < RELEASE_PAGE_SIZE
+        while (!complete && page < RELEASE_PAGES && (!stopAtStable || pickAsset(tool, all) == null)) {
+            val next = fetch(++page) ?: return null
+            for (i in 0 until next.length()) all.put(next.opt(i))
+            last = next.length()
+            complete = last < RELEASE_PAGE_SIZE
+        }
+        return ReleaseFetch(all, complete)
+    }
+
+    internal fun assets(tool: Tool, array: JSONArray, prerelease: Boolean): List<Asset> {
+        val releases = (0 until array.length()).mapNotNull { array.optJSONObject(it) }.filter { !it.optBoolean("draft", false) }
+        val stableAt = releases.filter { !it.optBoolean("prerelease", false) }.maxOfOrNull { it.optString("published_at") }.orEmpty()
+        return releases
+            .filter { it.optBoolean("prerelease", false) == prerelease && (!prerelease || it.optString("published_at") > stableAt) }
+            .mapNotNull { assetOf(tool, it, experimental = prerelease) }
+    }
+
+    internal fun pickAsset(tool: Tool, array: JSONArray): Asset? {
+        val candidates = (0 until array.length()).asSequence()
+            .mapNotNull { array.optJSONObject(it) }
+            .filter { !it.optBoolean("draft", false) && (tool.prereleases || !it.optBoolean("prerelease", false)) }
+        return candidates.firstNotNullOfOrNull { assetOf(tool, it) }
+    }
+
+    internal fun updateLatest(cache: JSONObject, tool: Tool, array: JSONArray?, now: Long) {
+        if (array == null) return
+        val tag = pickAsset(tool, array)?.tag
+        if (tag == null) {
+            return
+        }
+        cache.put(tool.id, JSONObject().put("tag", tag).put("at", now))
+    }
+
+    internal fun assetOf(tool: Tool, release: JSONObject, requireChecksum: Boolean = false, experimental: Boolean = false): Asset? = try {
+        val assets = release.optJSONArray("assets")
+        val entries = assets?.let { list -> (0 until list.length()).mapNotNull { list.optJSONObject(it) } }.orEmpty()
+        entries.sortedBy { it.optString("name") }.filter {
+            val name = it.optString("name")
+            if (experimental && tool.id == OWN) name.startsWith(release.optString("tag_name")) && ExperimentalProtons.TARBALL.containsMatchIn(name) && !ExperimentalProtons.FOREIGN_ARCH.containsMatchIn(name) else tool.assetPattern.containsMatchIn(name)
+        }.mapNotNull { archive ->
             val name = archive.optString("name")
             val stem = name.substringBefore(".tar")
             val checksum = entries.firstOrNull {
                 it.optString("name").startsWith(stem) && it.optString("name").contains("sha512", ignoreCase = true)
             }?.optString("browser_download_url")?.takeIf { it.startsWith("http") }
-            return Asset(
-                release.optString("tag_name"), name,
-                archive.optString("browser_download_url").takeIf { it.startsWith("http") } ?: continue, checksum,
-                archive.optLong("size", 0L),
-                Hashes.githubSha256(archive.optString("digest")),
-            )
-        }
-        return null
+            archive.optString("browser_download_url").takeIf { it.startsWith("http") }?.let { url ->
+                Asset(release.optString("tag_name"), name, url, checksum, archive.optLong("size", 0L), Hashes.githubSha256(archive.optString("digest")), release.optString("name").ifEmpty { release.optString("tag_name") })
+            }
+        }.let { found -> if (requireChecksum) found.firstOrNull { it.sha256 != null || it.sha512 != null } else found.firstOrNull() }
+    } catch (e: Exception) {
+        Log.w(TAG, "release metadata for ${tool.id}", e)
+        null
     }
 
     private fun requestLines(context: Context): List<String> =

@@ -42,13 +42,4 @@ class VrProducerLeaseTest(unittest.TestCase):
         headers = next((Path(path) for path in candidates if path and (Path(path) / "vulkan/vk_layer.h").is_file()), None)
         if headers is None:
             self.skipTest("needs Vulkan headers")
-        if "sysroot" in headers.parts:
-            # An NDK sysroot's include folder also holds bionic's libc headers, which then shadow the host's
-            # (glibc) ones: take only its Vulkan folders.
-            only = Path(tempfile.mkdtemp(prefix="vr-vk-headers-"))
-            self.addCleanup(shutil.rmtree, only, True)
-            for name in ("vulkan", "vk_video"):
-                if (headers / name).is_dir():
-                    (only / name).symlink_to(headers / name)
-            headers = only
         self.assertIn("1024 buffer values passed", self.compile_and_run("test_producer_gpu.c", headers=headers, gpu=True))

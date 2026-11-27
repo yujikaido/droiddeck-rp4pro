@@ -13,7 +13,10 @@ object GameProfileManager {
         }
 
         clear("environment") {
-            GameEnvironmentStore.update(context) { it.withEntries(scope, emptyMap()) }
+            GameEnvironmentStore.save(
+                context,
+                GameEnvironmentStore.read(context).withEntries(scope, emptyMap()),
+            )
         }
         clear("Proton") { ProtonDefault.requestGame(context, scope, null) }
         clear("component packages") { ComponentsManager.clearGameComponents(context, scope) }

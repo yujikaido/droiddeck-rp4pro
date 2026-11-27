@@ -164,11 +164,22 @@ class GameEnvironmentStoreTest {
         assertEquals(config, GameEnvironmentStore.read(context))
         val published = GameEnvironmentStore.decode(JSONObject(guest.readText()))
         assertEquals("false", published.shared["MESA_SHADER_CACHE_DISABLE"])
-        assertEquals("12_2", published.shared["VKD3D_FEATURE_LEVEL"])
-        assertEquals("6_9", published.shared["VKD3D_SHADER_MODEL"])
+        assertFalse(published.shared.containsKey("VKD3D_FEATURE_LEVEL"))
+        assertFalse(published.shared.containsKey("VKD3D_SHADER_MODEL"))
         assertEquals(config.games, published.games)
         assertEquals(config.shared["LITERAL"], published.shared["LITERAL"])
         assertEquals("", published.shared["EMPTY"])
+    }
+
+    @Test fun publishingPreservesExplicitSharedGraphicsCapabilities() {
+        val config = GameEnvironment.Config(shared = mapOf(
+            "VKD3D_FEATURE_LEVEL" to "12_1", "VKD3D_SHADER_MODEL" to "6_6",
+        ))
+        GameEnvironmentStore.save(context, config)
+        val published = GameEnvironmentStore.decode(JSONObject(guest.readText()))
+        assertEquals(config, GameEnvironmentStore.read(context))
+        assertEquals("12_1", published.shared["VKD3D_FEATURE_LEVEL"])
+        assertEquals("6_6", published.shared["VKD3D_SHADER_MODEL"])
     }
 
     @Test fun changingFexPresetPublishesForNextGameLaunch() {
@@ -303,5 +314,28 @@ class GameEnvironmentStoreTest {
         val config = GameEnvironment.Config(shared = mapOf("DXVK_ASYNC" to "1"))
         GameEnvironmentStore.save(context, config)
         assertEquals(config, GameEnvironmentStore.read(context))
+    }
+
+    @Test fun savedSettingsFromBeforeTheRenameKeepTheirValues() {
+        val json = JSONObject("""{"version":1,"shared":{"BL_SYNC":"1","DXVK_HUD":"fps"},
+            "games":{"440":{"BL_FSYNC_FIRST":"1","BL_SYNC_FALLBACK":"0","DD_SYNC_FALLBACK":"1"}}}""")
+        val config = GameEnvironmentStore.decode(json)
+        assertEquals(mapOf("DD_SYNC" to "1", "DXVK_HUD" to "fps"), config.shared)
+        assertEquals(mapOf("DD_FSYNC_FIRST" to "1", "DD_SYNC_FALLBACK" to "1"), config.games["440"])
+    }
+
+    @Test fun unreadableSettingsAreSetAsideAndSessionsStillStart() {
+        val settings = File(context.filesDir, "game-environment.json")
+        val aside = File(context.filesDir, "game-environment.json.unreadable")
+        aside.delete()
+        for (broken in listOf("", """{"version":1,"shared":{"bad name":"1"}}""")) {
+            settings.writeText(broken)
+            assertEquals(GameEnvironment.Config(), GameEnvironmentStore.read(context))
+            assertFalse(settings.exists())
+            assertEquals(broken, aside.readText())
+        }
+        GameEnvironmentStore.publish(context)
+        assertEquals(1, JSONObject(guest.readText()).getInt("version"))
+        aside.delete()
     }
 }

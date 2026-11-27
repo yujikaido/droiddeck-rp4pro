@@ -181,9 +181,35 @@ class AgentSecurityTest {
         assertEquals(listOf("TEST=old", "STICKY=1"), AgentEnv.beginSession(context))
     }
 
+    @Test fun binaryOverridesPreserveTheRuntimeSearchPathForOneSession() {
+        AgentAccess.setCommandsEnabled(context, true)
+        File(AgentEnv.inbox(context).apply { mkdirs() }, "gamescope").writeText("test binary")
+        AgentEnv.override(context, "gamescope")
+
+        val path = AgentEnv.beginSession(context).single { it.startsWith("PATH=") }.substringAfter('=')
+        assertEquals("/opt/droiddeck-agent/bin:" + LinuxRuntime.GUEST_PATH, path)
+        assertTrue(path.split(':').contains("/usr/games"))
+        assertTrue(path.split(':').contains("/usr/sbin"))
+
+        AgentEnv.endSession(context)
+        assertTrue(AgentEnv.beginSession(context).none { it.startsWith("PATH=") })
+    }
+
+    @Test fun binaryOverridesKeepExplicitPathsAndPendingPathPrecedence() {
+        AgentAccess.setCommandsEnabled(context, true)
+        AgentEnv.set(context, listOf("PATH=/custom/persistent"), true)
+        AgentEnv.set(context, listOf("PATH=/custom/next:/usr/games"), false)
+        File(AgentEnv.inbox(context).apply { mkdirs() }, "gamescope").writeText("test binary")
+        AgentEnv.override(context, "gamescope")
+
+        assertEquals("PATH=/opt/droiddeck-agent/bin:/custom/next:/usr/games", AgentEnv.beginSession(context).last())
+        AgentEnv.endSession(context)
+        assertEquals(listOf("PATH=/custom/persistent"), AgentEnv.beginSession(context))
+    }
+
     @Test fun fastPathLibraryIsValidatedAndSelectedForOneSession() {
         AgentAccess.setCommandsEnabled(context, true)
-        val source = File(AgentEnv.inbox(context).apply { mkdirs() }, "libblfastpath.so")
+        val source = File(AgentEnv.inbox(context).apply { mkdirs() }, "libddfastpath.so")
         source.writeText("wrong architecture")
         refused("INVALID_LIBRARY") { AgentEnv.override(context, source.name) }
         val header = ByteArray(64)
@@ -201,9 +227,41 @@ class AgentSecurityTest {
         assertEquals(64, response.getString("sha256").length)
         assertEquals(ProotFastPath.LIBRARY, AgentEnv.fastPathLibrary(context))
         AgentEnv.beginSession(context)
-        assertEquals("/opt/droiddeck-agent/bin/libblfastpath.so", AgentEnv.fastPathLibrary(context))
+        assertEquals("/opt/droiddeck-agent/bin/libddfastpath.so", AgentEnv.fastPathLibrary(context))
         AgentEnv.endSession(context)
         assertEquals(ProotFastPath.LIBRARY, AgentEnv.fastPathLibrary(context))
+    }
+
+    @Test fun aFastPathOverrideQueuedUnderTheOldNameStillApplies() {
+        AgentAccess.setCommandsEnabled(context, true)
+        File(AgentEnv.inbox(context).apply { mkdirs() }, "libblfastpath.so").writeText("old")
+        refused("INVALID_NAME") { AgentEnv.override(context, "libblfastpath.so") }
+        val bin = File(LinuxRuntime.rootDir(context), "opt/droiddeck-agent/bin").apply { mkdirs() }
+        File(bin, "libblfastpath.so").writeText("queued")
+        File(context.filesDir, "agent-env.json").writeText("""{"pendingOverrides":["libblfastpath.so"]}""")
+        AgentEnv.beginSession(context)
+        assertEquals("/opt/droiddeck-agent/bin/libddfastpath.so", AgentEnv.fastPathLibrary(context))
+        assertEquals("queued", File(bin, "libddfastpath.so").readText())
+        assertFalse(File(bin, "libblfastpath.so").exists())
+        AgentEnv.endSession(context)
+    }
+
+    @Test fun aQueuedOldNameOverrideThatCannotBeRenamedWaits() {
+        AgentAccess.setCommandsEnabled(context, true)
+        val bin = File(LinuxRuntime.rootDir(context), "opt/droiddeck-agent/bin").apply { mkdirs() }
+        File(bin, "libblfastpath.so").writeText("queued")
+        File(context.filesDir, "agent-env.json").writeText("""{"pendingOverrides":["libblfastpath.so"]}""")
+        bin.setWritable(false)
+        try {
+            org.junit.Assume.assumeFalse(bin.canWrite())
+            AgentEnv.beginSession(context)
+            assertEquals(ProotFastPath.LIBRARY, AgentEnv.fastPathLibrary(context))
+            assertTrue(File(bin, "libblfastpath.so").isFile)
+            val state = JSONObject(File(context.filesDir, "agent-env.json").readText())
+            assertEquals("libddfastpath.so", state.getJSONArray("pendingOverrides").getString(0))
+        } finally {
+            bin.setWritable(true)
+        }
     }
 
     @Test fun environmentValuesAreNotLogged() {

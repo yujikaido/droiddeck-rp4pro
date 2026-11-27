@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 RUN = Path(__file__).resolve().parents[1] / "linuxfs/overlay/usr/local/bin/droiddeck-appimage-run"
-KEYS = ("QT_QPA_PLATFORM", "WAYLAND_DISPLAY", "SDL_VIDEODRIVER", "XDG_SESSION_TYPE", "QT_WAYLAND_DISABLE_WINDOWDECORATION", "DISABLE_GAMESCOPE_WSI")
+KEYS = ("TU_DEBUG", "DROIDDECK_GAME_TU_DEBUG", "QT_QPA_PLATFORM", "WAYLAND_DISPLAY", "SDL_VIDEODRIVER", "XDG_SESSION_TYPE", "QT_WAYLAND_DISABLE_WINDOWDECORATION", "DISABLE_GAMESCOPE_WSI")
 QUICK = ("usr/lib/libQt6Quick.so.6", "usr/lib/libvulkan.so.1", "usr/plugins/platforms/libqwayland-generic.so")
 RUN_MODE = {"GAMESCOPE_WAYLAND_DISPLAY": "gamescope-0", "WAYLAND_DISPLAY": "gamescope-0", "DISPLAY": ":0",
             "QT_QPA_PLATFORM": "xcb", "SDL_VIDEODRIVER": "x11", "XDG_SESSION_TYPE": "x11"}
@@ -126,6 +126,43 @@ class AppImageRunTest(unittest.TestCase):
         (self.dir / "app/usr/lib/libQt6Quick.so.6").unlink()
         env, _ = self.launch(RUN_MODE)
         self.assertEqual("wayland;xcb", env["QT_QPA_PLATFORM"])
+
+
+    def test_a_program_drops_the_sessions_sysmem_like_a_steam_game(self):
+        env, _ = self.launch(dict(RUN_MODE, TU_DEBUG="sysmem", DROIDDECK_GAME_TU_DEBUG=""))
+        self.assertEqual("unset", env["TU_DEBUG"])
+        self.assertEqual("unset", env["DROIDDECK_GAME_TU_DEBUG"])
+
+    def test_a_program_gets_the_game_driver_setting(self):
+        env, _ = self.launch(dict(RUN_MODE, TU_DEBUG="sysmem", DROIDDECK_GAME_TU_DEBUG="gmem"))
+        self.assertEqual("gmem", env["TU_DEBUG"])
+
+    def test_a_chromium_app_keeps_the_session_setting(self):
+        self.bundle("chrome_100_percent.pak")
+        env, _ = self.launch(dict(RUN_MODE, TU_DEBUG="sysmem", DROIDDECK_GAME_TU_DEBUG=""))
+        self.assertEqual("sysmem", env["TU_DEBUG"])
+
+    def test_without_the_game_setting_the_session_value_stays(self):
+        env, _ = self.launch(dict(RUN_MODE, TU_DEBUG="sysmem"))
+        self.assertEqual("sysmem", env["TU_DEBUG"])
+
+    def test_an_arm64_app_uses_the_sessions_gl_libraries(self):
+        (self.dir / "arch").write_text("arm64")
+        self.bundle("usr/lib/libGLESv2.so.2", "usr/lib/libEGL.so.1", "usr/lib/libglfw.so.3", "usr/lib/libGLESv2.so.2.1.0")
+        _, log = self.launch(RUN_MODE)
+        lib = self.dir / "app/usr/lib"
+        self.assertEqual(["libGLESv2.so.2.1.0", "libglfw.so.3"], sorted(p.name for p in lib.iterdir()))
+        self.assertEqual(["libEGL.so.1", "libGLESv2.so.2"], sorted(p.name for p in (self.dir / "bundled-gl/usr/lib").iterdir()))
+        self.assertIn("the session's libGLESv2.so.2 replaces the bundled one", log)
+        _, log = self.launch(RUN_MODE)
+        self.assertNotIn("replaces the bundled one", log)
+
+    def test_other_architectures_keep_their_gl_libraries(self):
+        (self.dir / "arch").write_text("x86_64")
+        self.bundle("usr/lib/libGLESv2.so.2")
+        self.launch(RUN_MODE)
+        self.assertTrue((self.dir / "app/usr/lib/libGLESv2.so.2").exists())
+        self.assertFalse((self.dir / "bundled-gl").exists())
 
 
 if __name__ == "__main__":

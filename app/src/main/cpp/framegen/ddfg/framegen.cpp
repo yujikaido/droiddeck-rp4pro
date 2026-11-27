@@ -164,20 +164,10 @@ static VkExtent2D levelExtent(VkExtent2D e, int l) {
     return { e.width >> l ? e.width >> l : 1u, e.height >> l ? e.height >> l : 1u };
 }
 
-// In record_impl.inc: frees the per-size scratch (UBOs) and resets the descriptor pool.
-static void destroyScratch(const DeviceDispatch* dd, VkDevice dev, VkDescriptorPool pool);
-
 bool FrameGen::onResize(VkExtent2D extent, VkFormat  , bool force) {
 
 
     if (!force && ready_ && extent.width == extent_.width && extent.height == extent_.height) return true;
-    // The scratch built for the old size goes with the old images. Without this every size change
-    // left its descriptor sets in the pool: drivers that hold the pool to its sizes (Arm's Mali)
-    // then fail the next allocation, and the null set crashed the compositor in vkUpdateDescriptorSets.
-    if (device_) {
-        dd_->DeviceWaitIdle(device_);
-        destroyScratch(dd_, device_, descPool_);
-    }
     for (auto& i : pyrA_) destroyImage(i); pyrA_.clear();
     for (auto& i : pyrB_) destroyImage(i); pyrB_.clear();
     for (auto& i : pyrAs_) destroyImage(i); pyrAs_.clear();
@@ -242,10 +232,6 @@ void FrameGen::destroy() {
         gmSsbo_[s] = VK_NULL_HANDLE; gmSsboMem_[s] = VK_NULL_HANDLE; gmSsboPtr_[s] = nullptr;
     }
     gmBuffersReady_ = false;
-    // The scratch is global: left marked built, a later FrameGen of the same size would use sets
-    // from the pool destroyed here (and its UBOs would leak).
-    destroyScratch(dd_, device_, descPool_);
-    scratchFailed_ = false;
     if (descPool_) dd_->DestroyDescriptorPool(device_, descPool_, nullptr);
     if (linear_) dd_->DestroySampler(device_, linear_, nullptr);
     descPool_ = VK_NULL_HANDLE; linear_ = VK_NULL_HANDLE; device_ = VK_NULL_HANDLE; ready_ = false;

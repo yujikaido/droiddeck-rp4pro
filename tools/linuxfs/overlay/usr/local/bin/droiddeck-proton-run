@@ -1,40 +1,11 @@
 #!/usr/bin/python3
-"""Runs a Windows program with the Proton the Steam client has chosen for it.
-
-    droiddeck-proton-run [--window] [--prefix ID] [--verb run] [--game-id ID] [--desktop WxH] PROGRAM [ARGS...]
-    droiddeck-proton-run --app ID [--dir FOLDER] [--options TEXT] [PROGRAM [ARGS...]]
-
-The program belongs to an installed Steam game when it sits in one's folder, to a prefix when it
-sits in one's drive_c, or to a non-Steam shortcut that names it; any other program gets a prefix of
-its own, under the id the client gives a new shortcut. That title's CompatToolMapping entry in
-config.vdf picks the tool, else the client's default for all other titles ("0"). The tool is
-started as the client starts it - its toolmanifest's command line, the waitforexitandrun verb and
-the STEAM_COMPAT_* environment - so its wrapper applies the game's settings, components and audio.
---window keeps the program in the desktop's own window, drawn with WineD3D on the desktop's software
-GL (llvmpipe): KWin there composites in software, and the session's zink finds no device.
---prefix ID puts the program in compatdata/ID whatever it is. --verb run starts it beside what already
-runs in the prefix, which waitforexitandrun would wait for; the wrapper's launch-time steps are skipped.
---game-id ID keeps the id of the launch it runs for: gamescope shows the windows that carry the id Steam launched.
---app starts one game without the Steam client (its Start without Steam): a Steam game's default
-Windows launch option from appinfo.vdf when no program is given, else the program in that
-shortcut's own prefix, started in --dir with the shortcut's launch options (--options). Without
---options it takes the launch options set in the client's Properties for that game or shortcut.
-For a Steam game or a shortcut, MaliBridge's own planning can decide instead of the mapping (steam-compatibility launch_tool):
-a title with no prefix yet starts on the pinned DroidDeck-Proton, and a title it moved after two starts without a frame on
-Proton Experimental starts on the tool it moved it to; a tool the player picked always wins. With --app on the Mali bridge
-the tool runs as a child, so that a start that closes without a frame is counted the way Steam's own runs are
-(DD_PROTON_FALLBACK=0 keeps all of it off).
-"""
 import json
 import os
 import re
 import runpy
 import shlex
-import signal
 import struct
-import subprocess
 import sys
-import time
 import zlib
 
 HOME = os.environ.get("HOME") or "/root"
@@ -99,9 +70,19 @@ def mapping(root):
 
 
 def tools(root):
-    """Windows compatibility tools this runtime can start, by the name config.vdf uses."""
+    c = compat()
+    wrapper = os.path.join(root, "compatibilitytools.d", c["TOOL"])
+    complete = os.access(os.path.join(wrapper, c["LAUNCHER"]), os.X_OK) and os.path.isfile(os.path.join(wrapper, "toolmanifest.vdf"))
+    if c["TOOL"].lower() not in c["local_tools"](root) or not complete:
+        depot = c["find_source"](root, runnable=True)
+        if depot is not None:
+            try:
+                c["build_tool"](wrapper, depot)
+            except OSError:
+                pass
     found = {}
-    for base in [os.path.join(root, "compatibilitytools.d")] + list(SYSTEM_TOOLS):
+    bases = [os.path.join(root, "compatibilitytools.d")] + list(SYSTEM_TOOLS)
+    for base in bases:
         try:
             entries = sorted(os.listdir(base))
         except OSError:
@@ -119,15 +100,6 @@ def tools(root):
     return found
 
 
-def register_tools(root):
-    """steam-compatibility writes the DroidDeck Proton wrapper; the session runs it only in Steam mode."""
-    try:
-        subprocess.run([sys.executable, os.path.join(BIN_DIR, "steam-compatibility"), root],
-                       stdout=sys.stderr, stderr=sys.stderr, timeout=120, check=False)
-    except (OSError, subprocess.SubprocessError):
-        pass
-
-
 def state_default():
     try:
         with open(STATE, encoding="utf-8") as f:
@@ -137,132 +109,28 @@ def state_default():
         return None
 
 
+def newest_own(available):
+    c = compat()
+    builds = c["own_builds"]([{"name": name, "dir": os.path.basename(folder)} for name, (folder, _) in available.items()])
+    return max(builds, key=lambda t: (c["build_key"](t["dir"]), t["dir"]))["name"] if builds else None
+
+
 def choose_tool(appid, current, available):
-    """(tool name, why) from the client's mapping, else the session's own default."""
+    c = compat()
+    newest = newest_own(available)
     for key, why in ((appid, "Steam's choice for this title"), ("0", "Steam's default")):
         name = current.get(key)
         if name in available:
             return name, why
-    c = compat()
-    for name in (state_default(), c["TOOL"], c["TOOL_11"]):
+        if newest and isinstance(name, str) and name.startswith(c["OWN_PROTON"]):
+            return newest, "%s, replacing the removed %s" % (why, name)
+    default = state_default()
+    if newest and isinstance(default, str) and default.startswith(c["OWN_PROTON"]) and default not in available:
+        return newest, "the default, replacing the removed %s" % default
+    for name in (default, c["TOOL"], c["TOOL_11"]):
         if name in available:
             return name, "the default ARM64 Proton"
     return (sorted(available)[0], "the only one installed") if available else (None, None)
-
-
-# Titles the app plans like Steam's own (steam-compatibility launch_tool): a Steam game or a non-Steam shortcut.
-PLANNED_KINDS = ("steam", "shortcut")
-
-
-def planned_tool(target, current, available, root):
-    """(tool, why) when MaliBridge's own planning decides the tool of this launch (a move it made after the title closed twice
-    without a frame, or the pinned DroidDeck-Proton for a title with no prefix yet), else (None, None). Saved in its state, so the
-    next Steam session writes the same tool into config.vdf."""
-    if target.kind not in PLANNED_KINDS or os.path.realpath(root) != os.path.realpath(STEAM_ROOT):
-        return None, None  # the state belongs to the ARM64 client's library (an x86-64 client keeps its own)
-    c = compat()
-    try:
-        with c["locked"]():
-            path = c["state_path"]("state.json")
-            state = c["read_json"](path)
-            requests = {app: r for app, r in c["game_requests"]().items() if r is not None and c["valid_game_request"](app, r)}
-            name, why = c["launch_tool"](state, root, target.appid, current, set(available), requests)
-            if name is not None:
-                c["write_json"](path, state)
-            return name, why
-    except Exception as e:
-        say("MaliBridge's compatibility state could not be read (%s); the client's choice applies" % e)
-        return None, None
-
-
-def judged(app, target):
-    """Whether this launch is counted by the start-failure guard: a game started without the Steam client (--app), which has the
-    session to itself (Steam's game log, which the guard reads in a Steam session, has no line for it), on the Mali bridge."""
-    c = compat()
-    return (app is not None and target.kind in PLANNED_KINDS and not os.environ.get("BL_DESKTOP") and c["fallback_enabled"]()
-            and os.path.realpath(os.environ.get("STEAM_COMPAT_CLIENT_INSTALL_PATH") or STEAM_ROOT) == os.path.realpath(STEAM_ROOT)
-            and os.path.isdir(c["frames_directory"]() or "/nonexistent"))
-
-
-def judge(target, tool_dir, root, start_mono, start_wall, end_wall):
-    c = compat()
-    seconds = c["env_int"]("DD_START_FAIL_SECONDS", c["START_FAIL_SECONDS"], 5, 600)
-    limit = c["env_int"]("DD_START_FAIL_LIMIT", c["START_FAIL_LIMIT"], 1, 10)
-    evidence = c["launch_evidence"](c["frames_directory"](), start_mono, start_wall)
-    if evidence == "unknown":
-        return
-    app, life = target.appid, int(end_wall - start_wall)
-    title = c["app_title"](root, app)
-    with c["locked"]():
-        path = c["state_path"]("state.json")
-        state = c["read_json"](path)
-        before = c["start_fail_count"](state, app, tool_dir)
-        requests = {a: r for a, r in c["game_requests"]().items() if r is not None and c["valid_game_request"](a, r)}
-        kind, decision, record = c["judge_launch"](state, root, app, tool_dir, int(start_wall), int(end_wall), evidence, requests,
-                                                   seconds, limit)
-        if kind == "fail":
-            # a move takes the count out of state["start_runs"]; the record keeps it
-            fails = record["fails"] if isinstance(record, dict) and "fails" in record else c["start_fail_count"](state, app, tool_dir)
-            say("%s (%s): closed after %d s on %s without showing a frame (%d in a row)" % (app, title, life, tool_dir, fails))
-            if c["arm_exit_diag"](app):
-                say("%s (%s): %s" % (app, title, c["EXIT_DIAG_SAID"]))
-        if kind == "ok":
-            c["clear_exit_diag"](app)
-        if kind == "ok" and before:
-            say("%s (%s): showed frames on %s, so its count of starts without a frame is reset" % (app, title, tool_dir))
-        if decision == "picked":
-            if c["write_notice"]("picked", app, title, "", replace=False):
-                c["remember_pick_notice"](state, app, record["tool"])
-            say("%s (%s): closed before showing anything on Proton Experimental %d times in a row; you picked this tool for it, so "
-                "MaliBridge leaves it as it is" % (app, title, record["fails"]))
-        c["write_json"](path, state)
-    if decision == "switch":
-        say("%s (%s): closed before showing anything on Proton Experimental %d times in a row, so MaliBridge starts it on %s from "
-            "the next launch (its own decision, not yours; a tool you pick for it wins)" % (app, title, record["fails"], record["to"]))
-        c["write_notice"]("switched", app, title, record["to"])
-    elif decision == "missing":
-        say("%s (%s): closed before showing anything on Proton Experimental %d times in a row, but no DroidDeck-Proton is installed "
-            "to move it to; the move waits for one, and the app is asked to get it" % (app, title, record["fails"]))
-        c["write_notice"]("install", app, title, "", reason="failed", replace=False)
-
-
-def run_judged(entry, argv, env, target, tool_dir, root):
-    """Runs the tool as a child instead of in place, so that how the game ended can be counted (judge). Signals the session sends
-    go on to the tool; a launch the session or the player stopped is not counted."""
-    stopped = []
-    start_mono, start_wall = time.monotonic(), time.time()
-    parent = os.getpid()
-
-    def tied_to_parent():
-        # Killed with this process, as it was when the tool ran in its place (os.execve): a session that kills this pid
-        # outright must not leave the game running without it.
-        try:
-            import ctypes
-            ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGKILL, 0, 0, 0)  # PR_SET_PDEATHSIG
-        except (OSError, AttributeError):
-            pass
-        if os.getppid() != parent:
-            os._exit(1)
-
-    child = subprocess.Popen(argv, executable=entry, env=env, preexec_fn=tied_to_parent)
-
-    def forward(signum, _frame):
-        stopped.append(signum)
-        try:
-            child.send_signal(signum)
-        except OSError:
-            pass
-
-    for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGQUIT):
-        signal.signal(signum, forward)
-    code = child.wait()
-    launch_dir = os.environ.get("BL_LAUNCH_DIR")
-    if not stopped and not (launch_dir and os.path.exists(os.path.join(launch_dir, "steam-stop"))):
-        try:
-            judge(target, tool_dir, root, start_mono, start_wall, time.time())
-        except Exception as e:
-            say("could not judge how %s ended (%s)" % (target.appid, e))
-    return code if code >= 0 else 128 - code
 
 
 class Target:
@@ -276,7 +144,6 @@ class Target:
 
 
 def ancestors(path):
-    """(folder, the entry below it on the way to path) from the program's folder up to /."""
     child, folder = path, os.path.dirname(path)
     while True:
         yield folder, os.path.basename(child)
@@ -343,7 +210,6 @@ def same_file(a, b):
 
 
 def shortcut_entries(root):
-    """(appid, exe, start dir) of the client's non-Steam shortcuts and the app's added games."""
     entries = []
     try:
         tool = runpy.run_path(os.path.join(BIN_DIR, "droiddeck-steam-shortcuts"))
@@ -361,7 +227,7 @@ def shortcut_entries(root):
     except (OSError, ValueError, IndexError, KeyError, struct.error):
         pass
     try:
-        with open(os.environ.get("BL_ADDED_GAMES", ""), encoding="utf-8") as f:
+        with open(os.environ.get("DD_ADDED_GAMES", ""), encoding="utf-8") as f:
             for game in json.load(f):
                 if isinstance(game, dict) and game.get("exe") and str(game.get("appid", "")).isdigit():
                     entries.append((int(game["appid"]) & 0xFFFFFFFF, game["exe"], game.get("dir") or ""))
@@ -371,7 +237,6 @@ def shortcut_entries(root):
 
 
 def prefix_folder(root, appid):
-    """The prefix folder the client made for [appid], under either spelling of the id."""
     folder = os.path.join(root, "steamapps", "compatdata")
     try:
         names = sorted(os.listdir(folder))
@@ -399,7 +264,6 @@ def vdf_string(token):
 
 
 def steam_options(app, root):
-    """The launch options the client keeps for a game (localconfig.vdf) or a shortcut (shortcuts.vdf)."""
     try:
         tool = runpy.run_path(os.path.join(BIN_DIR, "droiddeck-steam-shortcuts"))
         account = tool["account_dir"](root)
@@ -437,7 +301,6 @@ def shortcut(program, root):
 
 
 def own_id(program):
-    """The id the client gives a new shortcut: the CRC of its quoted target and its name."""
     name = os.path.splitext(os.path.basename(program))[0]
     return zlib.crc32(('"%s"%s' % (program, name)).encode("utf-8")) | SHORTCUT_BIT
 
@@ -452,8 +315,8 @@ def locate(program, root):
                   os.path.dirname(program), root, "own")
 
 
-def fixed(program, root, appid):
-    return Target(appid, os.path.join(root, "steamapps", "compatdata", str(appid)),
+def fixed(program, root, appid, compatdata=None):
+    return Target(appid, compatdata or os.path.join(root, "steamapps", "compatdata", str(appid)),
                   os.path.dirname(program), root, "fixed")
 
 
@@ -469,8 +332,6 @@ def split_words(text):
 
 
 def split_options(text):
-    """A shortcut's launch options: NAME=value words before %command% go to the environment, the words
-    after it - or all of them, without %command% - are the program's arguments."""
     words = split_words(text)
     if "%command%" not in words:
         return {}, words
@@ -484,7 +345,6 @@ def split_options(text):
 
 
 def find_file(base, relative):
-    """base/relative, matching each part without regard to case as Windows does."""
     path = base
     for part in [p for p in relative.replace("\\", "/").split("/") if p and p != "."]:
         exact = os.path.join(path, part)
@@ -511,11 +371,10 @@ def steam_install(appid, root):
 
 
 def steam_launch(appid, root):
-    """(target, program, arguments) for a Steam game's default Windows launch option, or None."""
     library, install = steam_install(appid, root)
     if not install or not os.path.isdir(install):
         return None
-    entry = compat()["appinfo_entries"](os.path.join(root, "appcache", "appinfo.vdf")).get(str(appid), {})
+    entry = compat()["appinfo_entries"](os.path.join(root, "appcache", "appinfo.vdf"), wanted={str(appid)}).get(str(appid), {})
     options = [option for option in entry.get("launch_options", ())
                if not option["betakey"] and (not option["oslist"] or "windows" in option["oslist"])]
     options.sort(key=lambda option: (option["type"] not in ("", "default", "none"),
@@ -538,10 +397,9 @@ def shortcut_target(appid, program, start, root):
 
 
 def steam_launches(target, program, root):
-    """Whether a launch option of the Steam game starts [program]: then Steam should start it."""
     if target.kind != "steam":
         return False
-    entry = compat()["appinfo_entries"](os.path.join(root, "appcache", "appinfo.vdf")).get(target.appid, {})
+    entry = compat()["appinfo_entries"](os.path.join(root, "appcache", "appinfo.vdf"), wanted={target.appid}).get(target.appid, {})
     return os.path.relpath(program, target.install).replace(os.sep, "/").lower() in entry.get("launch", ())
 
 
@@ -593,6 +451,7 @@ def arguments(program, args, desktop=None, compatdata=None):
 def main(argv):
     window = False
     prefix = None
+    compatdata = None
     verb = VERB
     game_id = None
     desktop = None
@@ -603,6 +462,8 @@ def main(argv):
             window = True
         elif option == "--prefix" and argv and prefix_id(argv[0]):
             prefix = argv.pop(0)
+        elif option == "--compatdata" and argv and os.path.isabs(argv[0]):
+            compatdata = argv.pop(0)
         elif option == "--verb" and argv and argv[0] in VERBS:
             verb = argv.pop(0)
         elif option == "--game-id" and argv and argv[0].isdigit() and argv[0] != "0":
@@ -626,7 +487,7 @@ def main(argv):
         say("%s is not an app id" % app)
         return 2
     if not argv and app is None:
-        say("usage: droiddeck-proton-run [--window] [--prefix ID] [--verb run] [--game-id ID] [--desktop WxH] PROGRAM [ARGS...]")
+        say("usage: droiddeck-proton-run [--window] [--prefix ID [--compatdata DIR]] [--verb run] [--game-id ID] [--desktop WxH] PROGRAM [ARGS...]")
         return 2
     root = os.environ.get("STEAM_COMPAT_CLIENT_INSTALL_PATH") or STEAM_ROOT
     if options is None:
@@ -651,25 +512,20 @@ def main(argv):
         if app is not None and int(app) >= STEAM_APP_LIMIT:
             target = shortcut_target(app, program, start, root)
         elif prefix:
-            target = fixed(program, root, prefix)
+            target = fixed(program, root, prefix, compatdata)
         else:
             target = locate(program, root)
     available = tools(root)
     name, why = choose_tool(target.appid, mapping(root), available)
     if name is None:
-        register_tools(root)
-        available = tools(root)
-        name, why = choose_tool(target.appid, mapping(root), available)
-    if name is None:
         say("no Proton is installed yet; open Steam once and it is downloaded for you")
         return 69
-    own, own_why = planned_tool(target, mapping(root), available, root)
-    if own in available:
-        name, why = own, own_why
     folder, command = available[name]
     os.makedirs(target.compatdata, exist_ok=True)
     env = environment(os.environ, target, folder, root, window, game_id)
     env.update(extra)
+    if app is None and verb == VERB:
+        env["DROIDDECK_DESKTOP_PROGRAM"] = program
     say("%s with %s (%s), %s prefix %s%s" % (program, name, why, target.kind, target.compatdata,
                                               ", without the Steam client" if app is not None else ""))
     try:
@@ -677,10 +533,7 @@ def main(argv):
     except OSError:
         os.chdir(os.path.dirname(program))
     entry = os.path.join(folder, command)
-    argv = [entry, verb] + arguments(program, args, desktop, target.compatdata)
-    if judged(app, target):
-        return run_judged(entry, argv, env, target, os.path.basename(folder), root)
-    os.execve(entry, argv, env)
+    os.execve(entry, [entry, verb] + arguments(program, args, desktop, target.compatdata), env)
 
 
 if __name__ == "__main__":

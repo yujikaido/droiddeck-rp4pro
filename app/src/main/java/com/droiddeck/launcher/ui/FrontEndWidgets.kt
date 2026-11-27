@@ -27,6 +27,7 @@ import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
@@ -54,8 +55,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.semantics.Role
@@ -111,7 +114,8 @@ internal fun Actions(content: @Composable () -> Unit) = FlowRow(
 ) { content() }
 
 @Composable
-internal fun ActionChip(t: String, ok: Boolean) = Box(contentAlignment = Alignment.Center, modifier = Modifier.heightIn(min = 44.dp)) { Chip(t, ok) }
+internal fun ActionChip(t: String, ok: Boolean, fraction: Float? = null, key: Any? = null, minWidth: androidx.compose.ui.unit.Dp = 0.dp) =
+    Box(contentAlignment = Alignment.Center, modifier = Modifier.heightIn(min = 44.dp)) { Chip(t, ok, fraction, key, minWidth) }
 
 internal val Shape16 = RoundedCornerShape(16.dp)
 
@@ -138,17 +142,58 @@ internal fun BackLink(label: String, compact: Boolean = false, onClick: () -> Un
 }
 
 @Composable
-internal fun Chip(t: String, ok: Boolean) {
+internal fun Chip(t: String, ok: Boolean, fraction: Float? = null, key: Any? = null, minWidth: androidx.compose.ui.unit.Dp = 0.dp) {
     val colors = MaterialTheme.colorScheme
     val pal = LocalPalette.current
-    Text(
-        t, fontSize = 12.sp, color = if (ok) pal.good else colors.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis,
-        modifier = Modifier.clip(RoundedCornerShape(99.dp)).background(colors.surfaceVariant).border(1.dp, if (ok) pal.good.copy(alpha = 0.3f) else pal.line, RoundedCornerShape(99.dp)).padding(horizontal = 9.dp, vertical = 4.dp),
-    )
+    val shape = RoundedCornerShape(99.dp)
+    val ink = if (ok) pal.good else colors.onSurfaceVariant
+    Box(Modifier.widthIn(min = minWidth).clip(shape).background(colors.surfaceVariant).border(1.dp, if (ok) pal.good.copy(alpha = 0.3f) else pal.line, shape), contentAlignment = Alignment.CenterStart) {
+        if (fraction != null) ChipFill(fraction, key, pal.signal.copy(alpha = 0.3f))
+        Text(
+            t, fontSize = 12.sp, color = ink, maxLines = 1, overflow = TextOverflow.Ellipsis,
+            style = androidx.compose.ui.text.TextStyle(fontFeatureSettings = "tnum"),
+            modifier = Modifier.padding(horizontal = 9.dp, vertical = 4.dp),
+        )
+    }
+}
+
+@Composable
+internal fun androidx.compose.foundation.layout.BoxScope.ChipFill(fraction: Float, key: Any?, color: Color) {
+    androidx.compose.runtime.key(key) {
+        val target = fraction.coerceIn(0f, 1f)
+        val shown = remember { Animatable(target) }
+        LaunchedEffect(target) { shown.animateTo(target, androidx.compose.animation.core.tween(250, easing = androidx.compose.animation.core.LinearEasing)) }
+        Box(
+            Modifier.matchParentSize().drawBehind {
+                drawRect(color, size = androidx.compose.ui.geometry.Size(size.width * shown.value, size.height))
+            },
+        )
+    }
 }
 
 @Composable
 internal fun rememberHot(src: MutableInteractionSource): Boolean = src.collectIsFocusedAsState().value || src.collectIsHoveredAsState().value
+
+@Composable
+internal fun DialogToggleRow(label: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+    val pal = LocalPalette.current
+    val src = remember { MutableInteractionSource() }
+    val hot = rememberHot(src)
+    val flip = { onChange(!checked) }
+    Row(
+        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp),
+        modifier = Modifier.fillMaxWidth().clip(Shape12)
+            .background(if (hot) pal.signal.copy(alpha = 0.12f) else Color.Transparent)
+            .border(if (hot) 2.dp else 1.dp, if (hot) pal.signal else pal.line, Shape12)
+            .hoverable(src)
+            .clickable(interactionSource = src, indication = null, role = Role.Switch, onClick = flip)
+            .controllerConfirm(onClick = flip)
+            .padding(start = 14.dp, end = 4.dp),
+    ) {
+        Text(label, fontSize = 14.sp, color = MaterialTheme.colorScheme.onBackground, modifier = Modifier.weight(1f))
+        ToggleSwitch(checked, label = label, modifier = Modifier.focusProperties { canFocus = false }) { onChange(it) }
+    }
+}
 
 @Composable
 internal fun PrimaryButton(
@@ -160,12 +205,15 @@ internal fun PrimaryButton(
     large: Boolean = false,
     icon: ImageVector? = null,
     fill: Boolean = false,
+    progress: Float? = null,
     onClick: () -> Unit,
 ) {
     val colors = MaterialTheme.colorScheme
     val pal = LocalPalette.current
+    val shownProgress by animateFloatAsState(progress?.coerceIn(0f, 1f) ?: 0f, Motion.tw(300), label = "btnProgress")
     val pillMode = LocalPillButtons.current
     val btnShape = if (pillMode) CircleShape else Shape12
+    val outlined = LocalGradientOutline.current && enabled
     val frontFocus = if (main) LocalFrontFocus.current else null
     if (frontFocus != null) DisposableEffect(Unit) {
         frontFocus.primaryAttached++
@@ -188,7 +236,13 @@ internal fun PrimaryButton(
             .graphicsLayer { alpha = if (LaunchOrigin.flooding === placed) 0f else 1f; scaleX = scale; scaleY = scale; shadowElevation = if (enabled) lift.dp.toPx() else 0f; shape = btnShape; clip = false; ambientShadowColor = pal.signal; spotShadowColor = pal.signal }
             .clip(btnShape)
             .background(if (enabled) Brush.linearGradient(listOf(colors.primary, pal.primary2)) else Brush.linearGradient(listOf(colors.surfaceVariant, colors.surfaceVariant)))
+            .then(if (progress != null) Modifier.drawBehind {
+                val done = size.width * shownProgress
+                if (enabled) drawRect(Color.Black.copy(alpha = 0.32f), topLeft = androidx.compose.ui.geometry.Offset(done, 0f), size = androidx.compose.ui.geometry.Size(size.width - done, size.height))
+                else drawRect(pal.signal.copy(alpha = 0.4f), size = androidx.compose.ui.geometry.Size(done, size.height))
+            } else Modifier)
             .then(if (enabled) Modifier else Modifier.border(1.dp, pal.line2, btnShape))
+            .then(if (outlined) Modifier.border(2.dp, Brush.linearGradient(listOf(pal.primary2, colors.primary)), btnShape) else Modifier)
             .glideBorder(hot, btnShape, pal.signal, hotFillAlpha = 0f)
             .hoverable(src).clickable(role = Role.Button, interactionSource = src, indication = null, enabled = enabled) {
                 placed[0]?.takeIf { it.isAttached }?.let { LaunchOrigin.mark(it.boundsInRoot(), placed) }
@@ -264,23 +318,3 @@ internal fun SecondaryButton(text: String, enabled: Boolean = true, compact: Boo
     }
 }
 
-@Composable
-internal fun Cog(size: androidx.compose.ui.unit.Dp = 48.dp, onClick: () -> Unit) {
-    val colors = MaterialTheme.colorScheme
-    val src = remember { MutableInteractionSource() }
-    val hot = rememberHot(src)
-    var spins by remember { mutableIntStateOf(0) }
-    val rot by animateFloatAsState((if (hot) 90f else 0f) + spins * 180f, Motion.sp(0.55f), label = "cog")
-    val pal = LocalPalette.current
-    val placed = remember { arrayOfNulls<androidx.compose.ui.layout.LayoutCoordinates>(1) }
-    val cornerPx = with(androidx.compose.ui.platform.LocalDensity.current) { (if (size > 48.dp) 14.dp else 12.dp).toPx() }
-    Box(
-        contentAlignment = Alignment.Center,
-        modifier = Modifier.paneItem("cog").downToFirstTile().size(size).onGloballyPositioned { placed[0] = it }.clip(if (size > 48.dp) Shape14 else Shape12).background(Color.White.copy(alpha = 0.03f)).glideBorder(hot, if (size > 48.dp) Shape14 else Shape12, pal.signal, pal.line2)
-            .hoverable(src).clickable(role = androidx.compose.ui.semantics.Role.Button, interactionSource = src, indication = LocalIndication.current) {
-                placed[0]?.takeIf { it.isAttached }?.let { PageOrigin.mark(Origin(it.boundsInRoot(), cornerPx)) }
-                spins++
-                onClick()
-            },
-    ) { Icon(Icons.Filled.Settings, stringResource(R.string.drawer_page_settings), tint = if (hot) pal.signal else colors.onBackground, modifier = Modifier.size(if (size > 48.dp) 20.dp else 18.dp).rotate(rot)) }
-}

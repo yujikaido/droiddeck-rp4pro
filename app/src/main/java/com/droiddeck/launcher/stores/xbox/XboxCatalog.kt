@@ -10,7 +10,6 @@ import java.time.Instant
 internal object XboxCatalog {
     private val productId = Regex("[A-Z0-9]{12}")
     private val plans = setOf("CFQ7TTC0KGQ8", "CFQ7TTC0KHS0", "CFQ7TTC0P85B", "CFQ7TTC0K5DJ", "CFQ7TTC0K6L8", "CFQ7TTC10QFD")
-    /** Plans whose store offers advertise PC games. Library entitlements under any active plan count, as the backend resolves a PC package for them. */
     private val pcPlans = mapOf(
         "CFQ7TTC0KGQ8" to "PC Game Pass",
         "CFQ7TTC0KHS0" to "Game Pass Ultimate",
@@ -18,6 +17,14 @@ internal object XboxCatalog {
         "CFQ7TTC0K5DJ" to "Xbox Game Pass Essential",
         "CFQ7TTC10QFD" to "Xbox Game Pass (Starter Edition)",
     )
+
+    /**
+     * The formats the installer can put on disk, so the catalogue never lists a
+     * title it cannot install. `MSIXVC` streams in place; an EAppx container is a
+     * legacy package that takes `legacy-install` instead.
+     */
+    internal fun installableFormat(format: String): Boolean =
+        format.equals("MSIXVC", true) || format.equals("EAPPX", true) || format.equals("EAPPXBUNDLE", true)
 
     fun access(json: JSONObject, account: String, market: String, now: Instant = Instant.now(), report: (String) -> Unit = {}): Map<String, String> {
         require(json.getInt("schema") == 1 && json.getString("account") == account && json.getString("market") == market)
@@ -103,11 +110,15 @@ internal object XboxCatalog {
         if (!productId.matches(id) || json.optString("ProductType") != "Game") return null
         val localized = objects(json.optJSONArray("LocalizedProperties")).firstOrNull() ?: return null
         val title = localized.optString("ProductTitle").takeIf { it.isNotBlank() } ?: return null
-        val packages = objects(json.optJSONArray("DisplaySkuAvailabilities")).flatMap {
-            objects(it.optJSONObject("Sku")?.optJSONObject("Properties")?.optJSONArray("Packages"))
-        }
+        val packages = objects(json.optJSONArray("DisplaySkuAvailabilities"))
+            .mapNotNull { it.optJSONObject("Sku")?.optJSONObject("Properties") }
+            .filter { it.opt("IsTrial") != true && it.opt("IsPreOrder") != true }
+            .flatMap { objects(it.optJSONArray("Packages")) }
         val pc = packages.filter { pkg -> objects(pkg.optJSONArray("PlatformDependencies")).any { it.optString("PlatformName") == "Windows.Desktop" } }
-        val installable = pc.any { it.optString("PackageFormat").equals("MSIXVC", true) }
+        val installable = pc.any { installableFormat(it.optString("PackageFormat")) }
+        // The installer needs the format, not just the fact that one exists: a
+        // legacy container takes a different subcommand from a streamed package.
+        val format = pc.firstOrNull { installableFormat(it.optString("PackageFormat")) }?.optString("PackageFormat").orEmpty()
         val streams = cloud?.streams(id, access[id].orEmpty()) == true
         if (!installable && !streams) return null
         val images = objects(localized.optJSONArray("Images"))
@@ -130,14 +141,14 @@ internal object XboxCatalog {
             publisher = localized.optString("PublisherName"), developer = localized.optString("DeveloperName"),
             description = localized.optString("ProductDescription"),
             sizeBytes = if (installable) pc.maxOfOrNull { it.optLong("MaxDownloadSizeInBytes") } ?: 0L else 0L,
-            extra = mapOf("market" to Xodus.market(), "access" to kind.orEmpty(), "pc" to flag(installable), "cloud" to flag(streams)),
+            extra = mapOf("market" to Xodus.market(), "access" to kind.orEmpty(), "pc" to flag(installable),
+                "cloud" to flag(streams), "format" to format),
         )
     }
 
     private const val CLOUD_GAME_PASS = "29a81209-df6f-41fd-a528-2ae6b91f719c"
     private const val CLOUD_ALL = "ce573635-7c18-4d0c-9d68-90b932393470"
 
-    /** Microsoft's public cloud lists (catalog.gamepass.com "sigls"; ids as Better xCloud by redphx, MIT, uses them). */
     fun cloudCatalog(market: String = Xodus.market()): XboxCloudCatalog =
         XboxCloudCatalog(cloudList(CLOUD_GAME_PASS, market), cloudList(CLOUD_ALL, market))
 
@@ -169,7 +180,6 @@ val CatalogItem.xboxPc: Boolean get() = extra["pc"] != "0"
 val CatalogItem.xboxCloud: Boolean get() = extra["cloud"] == "1"
 val CatalogItem.xboxCloudId: String get() = extra["cloudId"]?.takeIf { it.isNotEmpty() } ?: id
 
-/** Microsoft lists console and PC editions as separate products; a cloud-only one with a PC game's title folds into that card. */
 internal fun mergeEditions(games: List<CatalogItem>): List<CatalogItem> {
     fun key(title: String) = title.lowercase().replace(Regex("[^a-z0-9]+"), "")
     val cloudOnly = games.filter { !it.xboxPc && it.xboxCloud }.groupBy { key(it.title) }

@@ -15,16 +15,21 @@ done
 if grep -qxE '__gxx_personality_v0|__cxa_throw|_Unwind_Resume' <<<"$FAKE"; then
   echo "::error::libfakeinput.so exports the C++ runtime"; exit 1
 fi
-SESSION=$(syms "$D/libblsession.so")
-for sym in socket bind getsockname setsockopt statfs statvfs syscall shm_open shm_unlink mmap mmap64 munmap drmPrimeFDToHandle drmCloseBufferHandle kill killpg tgkill sigqueue waitpid wait4; do
-  grep -qx "$sym" <<<"$SESSION" || { echo "::error::libblsession.so does not export $sym"; exit 1; }
+SESSION=$(syms "$D/libddsession.so")
+for sym in socket bind getsockname setsockopt statfs statvfs syscall shm_open shm_unlink mmap mmap64 munmap mprotect drmPrimeFDToHandle drmCloseBufferHandle; do
+  grep -qx "$sym" <<<"$SESSION" || { echo "::error::libddsession.so does not export $sym"; exit 1; }
 done
 if grep -qx drmIoctl <<<"$SESSION"; then
-  echo "::error::libblsession.so exports drmIoctl"; exit 1
+  echo "::error::libddsession.so exports drmIoctl"; exit 1
 fi
 SSBS=$(syms "$D/libssbs.so")
 for sym in sigaction signal bsd_signal sysv_signal; do
   grep -qx "$sym" <<<"$SSBS" || { echo "::error::libssbs.so does not export $sym"; exit 1; }
 done
+XCLIPSE=$(syms "$D/usr/local/lib/droiddeck-xclipse/libVkLayer_droiddeck_xclipse.so")
+for sym in vkNegotiateLoaderLayerInterfaceVersion vkGetInstanceProcAddr vkGetDeviceProcAddr; do
+  grep -qx "$sym" <<<"$XCLIPSE" || { echo "::error::the Xclipse layer does not export $sym"; exit 1; }
+done
+test -f "$D/usr/local/lib/droiddeck-xclipse/VkLayer_droiddeck_xclipse.json"
 test -f "$D/usr/local/bin/droiddeck-session"
 test -f "$D/usr/local/bin/droiddeck-proton-extra"

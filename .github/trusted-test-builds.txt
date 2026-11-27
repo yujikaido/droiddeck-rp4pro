@@ -1,5 +1,9 @@
-# GitHub PR openers trusted for automatic release-signed test builds.
+ASEbrahim
 FX192
+FryMcNugget
 K11MCH1
+KeegantheVeganat0r
 kingokksa
 ovurrsl
+KeegantheVeganat0r
+EnzoDLofi

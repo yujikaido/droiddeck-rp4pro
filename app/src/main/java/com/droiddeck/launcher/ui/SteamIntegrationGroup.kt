@@ -23,7 +23,9 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.AutoAwesome
 import androidx.compose.material.icons.outlined.Close
+import androidx.compose.material.icons.outlined.Bluetooth
 import androidx.compose.material.icons.outlined.Home
+import androidx.compose.material.icons.outlined.KeyboardCommandKey
 import androidx.compose.material.icons.outlined.LightMode
 import androidx.compose.material.icons.outlined.Wifi
 import androidx.compose.material3.Icon
@@ -59,6 +61,8 @@ internal fun SteamIntegration.State.enabled(feature: Feature) = when (feature) {
     Feature.WIFI -> wifi && locationPermission && locationOn
     Feature.BRIGHTNESS -> brightness
     Feature.HOME -> home
+    Feature.SHORTCUTS -> shortcuts
+    Feature.BLUETOOTH -> bluetooth
 }
 
 internal fun SteamIntegration.State.enabledCount() = Feature.entries.count { enabled(it) }
@@ -68,6 +72,7 @@ internal fun SteamIntegrationGroup(
     state: SteamIntegration.State,
     focus: Feature? = null,
     onFeature: (Feature) -> Unit,
+    onAppInfo: () -> Unit,
     onLocation: () -> Unit = {},
 ) {
     SettingsGroup(
@@ -75,7 +80,7 @@ internal fun SteamIntegrationGroup(
         detail = stringResource(R.string.integration_count, state.enabledCount(), Feature.entries.size),
     ) {
         Feature.entries.forEachIndexed { i, feature ->
-            IntegrationRow(state, feature, focus == feature, i < Feature.entries.lastIndex, onFeature, onLocation)
+            IntegrationRow(state, feature, focus == feature, i < Feature.entries.lastIndex, onFeature, onAppInfo, onLocation)
         }
     }
 }
@@ -88,6 +93,7 @@ private fun IntegrationRow(
     focused: Boolean,
     divider: Boolean,
     onFeature: (Feature) -> Unit,
+    onAppInfo: () -> Unit,
     onLocation: () -> Unit,
 ) {
     val colors = MaterialTheme.colorScheme
@@ -101,12 +107,19 @@ private fun IntegrationRow(
     val bg by animateColorAsState(if (flash) pal.signal.copy(alpha = 0.12f) else Color.Transparent, Motion.tw(400), label = "integrationFlash")
     val wifiLocationOff = feature == Feature.WIFI && state.wifi && state.locationPermission && !state.locationOn
     val wifiDenied = feature == Feature.WIFI && !state.locationPermission && state.locationBlocked
+    val restricted = feature == Feature.SHORTCUTS && !state.shortcuts && state.shortcutsRestricted
+    val maybeRestricted = feature == Feature.SHORTCUTS && !state.shortcuts && !restricted && state.shortcutsTried &&
+        android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU
     val hint = stringResource(when {
         wifiLocationOff -> R.string.integration_wifi_location_off
         wifiDenied -> R.string.integration_wifi_denied
+        restricted -> R.string.integration_shortcuts_restricted
+        maybeRestricted -> R.string.integration_shortcuts_maybe_restricted
         feature == Feature.WIFI -> if (on) R.string.integration_wifi_on else R.string.integration_wifi_hint
         feature == Feature.BRIGHTNESS -> R.string.integration_brightness_hint
-        else -> R.string.integration_home_hint
+        feature == Feature.HOME -> R.string.integration_home_hint
+        feature == Feature.BLUETOOTH -> R.string.integration_bluetooth_hint
+        else -> R.string.integration_shortcuts_hint
     })
     Row(
         verticalAlignment = Alignment.CenterVertically,
@@ -119,16 +132,17 @@ private fun IntegrationRow(
         Column(Modifier.weight(1f)) {
             Text(stringResource(featureTitle(feature)), fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = colors.onBackground,
                 maxLines = 1, overflow = TextOverflow.Ellipsis)
-            Text(hint, fontSize = 13.sp, color = if (wifiLocationOff || wifiDenied) AttentionAmber else colors.onSurfaceVariant,
+            Text(hint, fontSize = 13.sp, color = if (wifiLocationOff || wifiDenied || restricted) AttentionAmber else colors.onSurfaceVariant,
                 maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             when {
                 wifiLocationOff -> SecondaryButton(stringResource(R.string.integration_location), compact = true, onClick = onLocation)
                 wifiDenied -> SecondaryButton(stringResource(R.string.integration_app_info), compact = true, onClick = onLocation)
+                restricted || maybeRestricted -> SecondaryButton(stringResource(R.string.integration_app_info), compact = true, onClick = onAppInfo)
             }
             val checked = if (feature == Feature.WIFI) state.wifi && state.locationPermission else on
-            ToggleSwitch(checked, label = stringResource(featureTitle(feature)),
+            ToggleSwitch(checked, enabled = !restricted, label = stringResource(featureTitle(feature)),
                 modifier = Modifier.testTag("integration-action-${feature.name.lowercase()}")) { onFeature(feature) }
         }
     }
@@ -152,12 +166,16 @@ private fun featureIcon(feature: Feature) = when (feature) {
     Feature.WIFI -> Icons.Outlined.Wifi
     Feature.BRIGHTNESS -> Icons.Outlined.LightMode
     Feature.HOME -> Icons.Outlined.Home
+    Feature.SHORTCUTS -> Icons.Outlined.KeyboardCommandKey
+    Feature.BLUETOOTH -> Icons.Outlined.Bluetooth
 }
 
 private fun featureTitle(feature: Feature) = when (feature) {
     Feature.WIFI -> R.string.integration_wifi
     Feature.BRIGHTNESS -> R.string.integration_brightness
     Feature.HOME -> R.string.integration_home
+    Feature.SHORTCUTS -> R.string.integration_shortcuts
+    Feature.BLUETOOTH -> R.string.integration_bluetooth
 }
 
 @Composable

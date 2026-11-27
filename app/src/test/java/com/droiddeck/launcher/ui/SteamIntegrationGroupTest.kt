@@ -24,13 +24,14 @@ class SteamIntegrationGroupTest {
     @get:Rule val compose = createRobolectricComposeRule()
     private val state = mutableStateOf(SteamIntegration.State())
     private val requests = mutableListOf<Feature>()
+    private var appInfo = 0
     private var location = 0
 
     private fun stateIs(value: String) = SemanticsMatcher.expectValue(SemanticsProperties.StateDescription, value)
 
     private fun show() = compose.setContent {
         DroidDeckTheme {
-            SteamIntegrationGroup(state.value, onFeature = { requests.add(it) }, onLocation = { location++ })
+            SteamIntegrationGroup(state.value, onFeature = { requests.add(it) }, onAppInfo = { appInfo++ }, onLocation = { location++ })
         }
     }
 
@@ -39,24 +40,45 @@ class SteamIntegrationGroupTest {
         show()
         compose.onNodeWithTag("integration-action-brightness").performClick()
         compose.onNodeWithTag("integration-action-home").performClick()
-        assertEquals(listOf(Feature.BRIGHTNESS, Feature.HOME), requests)
+        compose.onNodeWithTag("integration-action-shortcuts").performClick()
+        compose.onNodeWithTag("integration-action-bluetooth").performClick()
+        assertEquals(listOf(Feature.BRIGHTNESS, Feature.HOME, Feature.SHORTCUTS, Feature.BLUETOOTH), requests)
     }
 
     @Test fun switchesReflectAndroidGrants() {
-        state.value = SteamIntegration.State(brightness = true, home = true)
+        state.value = SteamIntegration.State(brightness = true, home = true, shortcuts = true)
         show()
         compose.onNodeWithTag("integration-action-brightness").assert(stateIs("On"))
-        compose.onNodeWithTag("integration-action-home").assert(stateIs("On"))
+        compose.onNodeWithTag("integration-action-shortcuts").assert(stateIs("On"))
         compose.onNodeWithTag("integration-action-wifi").assert(stateIs("Off"))
-        compose.onNodeWithText("2 of 3 on").assertExists()
+        compose.onNodeWithTag("integration-action-bluetooth").assert(stateIs("Off"))
+        compose.onNodeWithText("3 of 5 on").assertExists()
     }
 
-    @Test fun thereIsNoHomeButtonShortcutsRow() {
+    @Test fun shortcutsDoNotNeedHome() {
+        show()
+        compose.onNodeWithTag("integration-action-shortcuts").assertIsEnabled()
+    }
+
+    @Test fun restrictedShortcutsPointToAppInfo() {
+        state.value = SteamIntegration.State(home = true, shortcutsRestricted = true)
+        show()
+        compose.onNodeWithTag("integration-action-shortcuts").assertIsNotEnabled()
+        compose.onNodeWithText("App info").performClick()
+        assertEquals(1, appInfo)
+        compose.runOnIdle { state.value = state.value.copy(shortcutsRestricted = false) }
+        compose.onNodeWithText("App info").assertDoesNotExist()
+        compose.onNodeWithTag("integration-action-shortcuts").assertIsEnabled()
+    }
+
+    @Test fun unconfirmedRestrictionOffersAppInfoAfterAnAttempt() {
         state.value = SteamIntegration.State(home = true)
         show()
-        compose.onNodeWithTag("integration-action-shortcuts").assertDoesNotExist()
-        compose.onNodeWithText("Home button shortcuts").assertDoesNotExist()
-        compose.onNodeWithText("1 of 3 on").assertExists()
+        compose.onNodeWithText("App info").assertDoesNotExist()
+        compose.runOnIdle { state.value = state.value.copy(shortcutsTried = true) }
+        compose.onNodeWithTag("integration-action-shortcuts").assertIsEnabled()
+        compose.onNodeWithText("App info").performClick()
+        assertEquals(1, appInfo)
     }
 
     @Test fun deniedLocationPointsToAppInfoWithoutTogglingWifi() {

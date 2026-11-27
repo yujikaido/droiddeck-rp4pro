@@ -8,7 +8,7 @@
  * link to https://github.com/The412Banner/FusionHUD in the project documentation
  * AND in the in-app credits/about screen.
  *
- * Ported to DroidDeck from FusionHUD (Bannerlator's HUD); DroidDeck changes are marked in the code.
+ * Ported to DroidDeck from FusionHUD (Bannerlator's HUD) and modified for DroidDeck.
  */
 
 package com.droiddeck.launcher.hud
@@ -18,78 +18,119 @@ package com.droiddeck.launcher.hud
  * visual language, four amounts of detail — see the approved mockup. The config value is the lower-case
  * token stored under the `hudSize` key; the label is the user-facing string.
  */
+/** The text sizes and spacing a [DroidDeckHudSize] lays its rows out with, in sp. */
+data class DroidDeckHudStyle(
+    val row: Float,
+    val unit: Float,
+    val pad: Float,
+    val lineGap: Float,
+    val labelGap: Float,
+    val key: Float = 0f,
+    val sub: Float = 0f,
+    val foot: Float = 0f,
+    val band: Float = 0f,
+    val gutter: Float = 0f,
+    val tileGap: Float = 0f,
+    val innerPad: Float = 0f,
+)
+
 enum class DroidDeckHudSize(val token: String, val label: String) {
     FULL("full", "Full"),
     TILES("tiles", "Tiles"),
     PILL("pill", "Pill"),
     MINIMAL("minimal", "Minimal"),
-    MEGA("mega", "Mega");
+    MEGA("mega", "Mega"),
+    STRIP("strip", "Strip");
 
-    /** Next size in the tap-cycle: Full → Tiles → Pill → Minimal → Mega → Full. */
     fun next(): DroidDeckHudSize {
         val all = values()
         return all[(ordinal + 1) % all.size]
     }
 
     /**
-     * The metric toggle chips this size actually renders — the SINGLE source of truth queried by BOTH
-     * config surfaces ({@code FpsCounterConfigDialog} + in-game {@code XServerDrawer} HudContent) so the
-     * chip list can't drift from what the view draws. Chip ids are the chip LABELS used in the UI.
-     * (Hiding a chip is purely UI; buildConfig() still emits every key — strip-invariant.)
+     * The rows this size draws, in the order it draws them before the user moves any. This is the single
+     * source of truth for both surfaces: [DroidDeckHudView] draws exactly these and the settings screen
+     * offers exactly these. A switch outside the set is ignored by the size, so the two cannot drift.
      */
-    fun supportedChips(): Set<String> = when (this) {
-        MINIMAL -> MINIMAL_CHIPS
-        PILL -> PILL_CHIPS
-        FULL, TILES -> STANDARD_CHIPS
-        MEGA -> MEGA_CHIPS
-    }
+    val rows: List<String> get() = ROWS.getValue(this)
+
+    /** This size's rows: the ones the user moved first, then the rest in the order [rows] lists them. */
+    fun rowsIn(stored: List<String>): List<String> =
+        stored.filter { it in rows } + rows.filter { it !in stored }
+    /**
+     * The numbers each size sets its text in, in sp. One table so a size's scale can be read (and changed)
+     * in one place instead of hunting the `sp(...)` literals scattered through its builder.
+     */
+    val style: DroidDeckHudStyle get() = STYLE.getValue(this)
+
 
     companion object {
         fun from(token: String?): DroidDeckHudSize =
             values().firstOrNull { it.token.equals(token, ignoreCase = true) } ?: FULL
 
-        // Chip-label ids (must match the labels the config UIs build). "Clock" is a small subtle
-        // corner readout available in EVERY size, so it's in all sets.
-        // The API/engine label ("Engine" chip) shows on the FPS row in EVERY size, so it's in all sets.
-        // "Wrapper" and "DX ver" are Mega-only: the wrapper appears solely below Mega's frametime graph,
-        // and "DX ver" gates the DX-version suffix on Mega's FPS-row engine label.
-        val MINIMAL_CHIPS = setOf("FPS", "FPS graph", "0.01% low", "FPS .1", "Engine", "Clock")
-        val PILL_CHIPS = setOf("FPS", "FPS graph", "GPU", "CPU", "VRAM", "RAM", "Battery", "Thermal", "GPU model", "FPS .1", "Engine", "Clock")
-        val STANDARD_CHIPS = setOf(
-            "FPS", "FPS graph", "GPU", "GPU temp", "CPU", "VRAM", "RAM", "Power", "Temp",
-            "Battery", "Thermal", "GPU model", "Engine", "0.01% low", "FPS .1", "Clock",
+        private val EXTRAS = setOf("showClock")
+
+        val ROWS: Map<DroidDeckHudSize, List<String>> = mapOf(
+            FULL to listOf(
+                "showFPS", "showFPSGraph", "showGpuModel", "showDisplay", "showHdr", "showGPULoad", "showGpuTemp",
+                "showCPUUsage", "showTemp", "showVram", "showRAM", "showBattery", "showBatteryTemp", "showBatteryTime",
+                "showPower", "showLatency", "showAvg", "showLow1", "showLow01", "showLow001",
+            ),
+            TILES to listOf(
+                "showFPS", "showFPSGraph", "showLatency", "showGPULoad", "showGpuTemp", "showCPUUsage", "showTemp",
+                "showVram", "showRAM", "showEngine", "showDisplay", "showHdr", "showAvg", "showLow1",
+                "showLow01", "showLow001", "showGpuModel", "showBattery", "showBatteryTemp", "showBatteryTime", "showPower",
+            ),
+            PILL to listOf(
+                "showFPS", "showFPSGraph", "showGpuModel", "showGPULoad", "showGpuTemp", "showCPUUsage", "showTemp",
+                "showRAM", "showBattery", "showBatteryTemp", "showBatteryTime", "showPower", "showLatency", "showDisplay",
+                "showVram", "showHdr",
+            ),
+            MINIMAL to listOf(
+                "showFPS", "showBatteryTime", "showFPSGraph", "showLow1", "showLow01", "showLow001", "showAvg", "showLatency",
+                "showEngine", "showDisplay", "showHdr",
+            ),
+            MEGA to DroidDeckHudConfig.ORDER.filter { it !in EXTRAS },
+            STRIP to listOf(
+                "showFPS", "showFPSGraph", "showLow1", "showLow01", "showLow001", "showGPULoad", "showGpuTemp",
+                "showCPUUsage", "showTemp", "showVram", "showRAM", "showBattery", "showBatteryTemp", "showBatteryTime",
+                "showPower", "showDisplay", "showHdr", "showGpuModel",
+            ),
         )
-        val MEGA_ONLY = setOf(
-            "Per-core", "Swap", "Network", "Resolution", "Proton", "Wrapper", "DX ver", "Session",
+
+
+        val STYLE: Map<DroidDeckHudSize, DroidDeckHudStyle> = mapOf(
+            FULL to DroidDeckHudStyle(row = 12f, unit = 12f * 0.62f, pad = 10f, lineGap = 4f, labelGap = 8f),
+            TILES to DroidDeckHudStyle(row = 18f, unit = 11f, pad = 9f, lineGap = 4f, labelGap = 8f,
+                key = 10f, sub = 10f, tileGap = 6f, innerPad = 8f),
+            PILL to DroidDeckHudStyle(row = 30f, unit = 30f * 0.36f, pad = 10f, lineGap = 3f, labelGap = 12f,
+                sub = 11.5f),
+            MINIMAL to DroidDeckHudStyle(row = 34f, unit = 34f * 0.32f, pad = 10f, lineGap = 4f, labelGap = 8f,
+                sub = 11.5f, foot = 9.5f),
+            MEGA to DroidDeckHudStyle(row = 11.5f, unit = 11.5f * 0.62f, pad = 10f, lineGap = 3.5f, labelGap = 7f,
+                band = 9.5f, gutter = 16f),
+            STRIP to DroidDeckHudStyle(row = 11.5f, unit = 11.5f * 0.8f, pad = 10f, lineGap = 0f, labelGap = 13f),
         )
-        val MEGA_CHIPS = STANDARD_CHIPS + MEGA_ONLY
+
+        fun rowsFor(size: DroidDeckHudSize, values: Map<String, String>): List<String> =
+            size.rowsIn(DroidDeckHudConfig.storedOrder(values, size))
     }
 }
 
-/** The screen edge the HUD is tucked against, where only its FPS tab shows ([NONE] = floating free). */
 enum class DroidDeckHudDock(val token: String) {
-    NONE("none"), LEFT("left"), RIGHT("right"), TOP("top"), BOTTOM("bottom");
+    NONE("none"), LEFT("left"), RIGHT("right"), TOP("top"), BOTTOM("bottom"), FLOAT("float");
 
     companion object {
         fun from(token: String?): DroidDeckHudDock = values().firstOrNull { it.token == token } ?: NONE
     }
 }
 
-/**
- * The Wayland HDR state the DroidDeck HUD shows on its own line, directly under the latency · display-server
- * line (the host sets it with [DroidDeckHudView.setHdrState]). [NONE] = no line at all: every session whose
- * HDR gate is closed (X11, SDR screens, HDR off) keeps the HUD exactly as it was.
- */
 object DroidDeckHudHdr {
     const val NONE = 0
-    const val ON = 1           // HDR frames on screen with HDR headroom
-    const val NO_HEADROOM = 2  // HDR frames on screen, but the display gives them no headroom (5 s+)
-    const val OFF = 3          // the drawer's HDR output switch is off (tone-mapped to SDR)
-    const val READY = 4        // HDR open for the session, no HDR frames on screen right now
-    const val TONEMAPPED = 5   // HDR output on, but the frames are shown tone-mapped (frame generation
-                               // on a screen that offers no HDR10 swapchain)
-    const val NOT_ON_THIS_SCREEN = 6 // HDR open for the session, but the screen the game is on NOW
-                               // reports no HDR10 (the TV was unplugged mid-game). The offer to the
-                               // game cannot be withdrawn once made, so the gate stays open for the
-                               // session — but "ready" would be a lie on a panel that cannot show it.
+    const val ON = 1
+    const val NO_HEADROOM = 2
+    const val OFF = 3
+    const val READY = 4
+    const val TONEMAPPED = 5
+    const val NOT_ON_THIS_SCREEN = 6
 }

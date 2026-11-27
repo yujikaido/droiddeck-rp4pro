@@ -3,15 +3,15 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import threading
 import unittest
-
-from inotify_slots import NO_SLOT
 
 PRELOAD = Path(__file__).resolve().parents[1] / "linuxfs/preload"
 
 FAKE = r"""
 #define _GNU_SOURCE
 #include <dirent.h>
+#include <errno.h>
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <string.h>
@@ -19,9 +19,12 @@ FAKE = r"""
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
+#include <sys/inotify.h>
 #include <unistd.h>
 
 int real_opendirs;
+int real_accesses;
+int real_stats;
 
 static void coarse(const char *path, struct stat *st) {
   if (getenv("COARSE") && strstr(path, "/fuse/") && S_ISDIR(st->st_mode)) {
@@ -31,12 +34,42 @@ static void coarse(const char *path, struct stat *st) {
   }
 }
 
-int stat(const char *path, struct stat *st) {
-  static int (*next)(const char *, struct stat *);
-  if (!next) next = dlsym(RTLD_NEXT, "stat");
+static const char *fold_case(const char *path, char *folded, size_t size) {
+  const char *fold = getenv("FOLD");
+  const char *upper = fold ? strstr(path, "/STEAMAPPS") : NULL;
+  if (!upper && fold && !strcmp(fold, "all")) upper = strcasestr(path, "/steamapps/");
+  if (!upper || strlen(path) >= size) return path;
+  strcpy(folded, path);
+  memcpy(folded + (upper - path) + 1, "steamapps", 9);
+  if (!strcmp(fold, "all"))
+    for (char *c = folded + (upper - path); *c; c++) if (*c >= 'A' && *c <= 'Z') *c += 'a' - 'A';
+  return folded;
+}
+
+static int fold_stat(const char *name, const char *path, struct stat *st) {
+  int (*next)(const char *, struct stat *) = dlsym(RTLD_NEXT, name);
+  char folded[4096];
+  if (strstr(path, "/fuse/")) real_stats++;
   int r = next(path, st);
+  if (r != 0) r = next(fold_case(path, folded, sizeof(folded)), st);
+  return r;
+}
+
+int stat(const char *path, struct stat *st) {
+  int r = fold_stat("stat", path, st);
   if (r == 0) coarse(path, st);
   return r;
+}
+
+int lstat(const char *path, struct stat *st) {
+  return fold_stat("lstat", path, st);
+}
+
+int __xstat64(int version, const char *path, struct stat64 *st) {
+  static int (*next)(int, const char *, struct stat64 *);
+  if (!next) next = dlsym(RTLD_NEXT, "__xstat64");
+  if (strstr(path, "/fuse/")) real_stats++;
+  return next ? next(version, path, st) : stat64(path, st);
 }
 
 int fstat(int fd, struct stat *st) {
@@ -63,6 +96,32 @@ int fstatfs(int fd, struct statfs *out) {
   return r;
 }
 
+int inotify_add_watch(int fd, const char *path, uint32_t mask) {
+  static int (*next)(int, const char *, uint32_t);
+  if (!next) next = dlsym(RTLD_NEXT, "inotify_add_watch");
+  if (getenv("NOFOLLOW_FAIL") && (mask & IN_DONT_FOLLOW)) {
+    errno = ENOSPC;
+    return -1;
+  }
+  if (getenv("NESTED") && (mask & IN_ONLYDIR)) {
+    static DIR *(*uncounted)(const char *);
+    if (!uncounted) uncounted = dlsym(RTLD_NEXT, "opendir");
+    mkdir(path, 0755);
+    DIR *d = uncounted("/proc/self/fd");
+    while (d && readdir(d)) {}
+    if (d) closedir(d);
+  }
+  return next(fd, path, mask);
+}
+
+int remove(const char *path) {
+  static int (*next)(const char *);
+  if (!next) next = dlsym(RTLD_NEXT, "remove");
+  if (!getenv("NESTED")) return next(path);
+  if (unlink(path) == 0) return 0;
+  return errno == EISDIR ? rmdir(path) : -1;
+}
+
 int statfs(const char *path, struct statfs *out) {
   static int (*next)(const char *, struct statfs *);
   if (!next) next = dlsym(RTLD_NEXT, "statfs");
@@ -84,6 +143,13 @@ DIR *opendir(const char *path) {
   return next(path);
 }
 
+int faccessat(int dirfd, const char *path, int mode, int flags) {
+  static int (*next)(int, const char *, int, int);
+  if (!next) next = dlsym(RTLD_NEXT, "faccessat");
+  if (strstr(path, "/fuse/")) real_accesses++;
+  return next(dirfd, path, mode, flags);
+}
+
 DIR *fdopendir(int fd) {
   static DIR *(*next)(int);
   if (!next) next = dlsym(RTLD_NEXT, "fdopendir");
@@ -96,6 +162,7 @@ PROGRAM = r"""
 #define _GNU_SOURCE
 #include <dirent.h>
 #include <dlfcn.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -173,6 +240,8 @@ static void stress(const char *dir) {
 
 int main(int argc, char **argv) {
   int *opens = dlsym(RTLD_DEFAULT, "real_opendirs");
+  int *accesses = dlsym(RTLD_DEFAULT, "real_accesses");
+  int *stats = dlsym(RTLD_DEFAULT, "real_stats");
   for (int i = 1; i < argc; i++) {
     const char *op = argv[i], *a = argv[i + 1];
     if (!strcmp(op, "list")) { list(a); i++; }
@@ -180,6 +249,14 @@ int main(int argc, char **argv) {
     else if (!strcmp(op, "create")) { close(open(a, O_WRONLY | O_CREAT, 0644)); i++; }
     else if (!strcmp(op, "sneak")) { close((int)syscall(SYS_openat, AT_FDCWD, a, O_WRONLY | O_CREAT, 0644)); i++; }
     else if (!strcmp(op, "sneak-unlink")) { syscall(SYS_unlinkat, AT_FDCWD, a, 0); i++; }
+    else if (!strcmp(op, "sneak-rename")) { syscall(SYS_renameat, AT_FDCWD, a, AT_FDCWD, argv[i + 2]); i += 2; }
+    else if (!strcmp(op, "sneak-mkdir")) { syscall(SYS_mkdirat, AT_FDCWD, a, 0755); i++; }
+    else if (!strcmp(op, "pause")) {
+      char line[16];
+      printf("ready\n");
+      fflush(stdout);
+      if (!fgets(line, sizeof(line), stdin)) return 1;
+    }
     else if (!strcmp(op, "unlink")) { unlink(a); i++; }
     else if (!strcmp(op, "remove")) { remove(a); i++; }
     else if (!strcmp(op, "mkdir")) { mkdir(a, 0755); i++; }
@@ -248,16 +325,38 @@ int main(int argc, char **argv) {
       waitpid(child, NULL, 0);
       i += 2;
     }
+    else if (!strcmp(op, "access")) {
+      int r = access(a, F_OK);
+      printf("%d %d\n", r, r ? errno : 0);
+      i++;
+    }
+    else if (!strcmp(op, "accessat")) {
+      int r = faccessat(STDIN_FILENO, a, F_OK, 0);
+      printf("%d %d\n", r, r ? errno : 0);
+      i++;
+    }
+    else if (!strcmp(op, "xstat")) {
+      int (*old)(int, const char *, struct stat64 *) = dlsym(RTLD_DEFAULT, "__xstat64");
+      struct stat64 st;
+      int r = old ? old(0, a, &st) : -2;
+      printf("%d %d\n", r, r ? errno : 0);
+      i++;
+    }
+    else if (!strcmp(op, "inode")) {
+      DIR *d = opendir(a);
+      struct dirent *e;
+      while (d && (e = readdir(d)))
+        if (!strcmp(e->d_name, argv[i + 2])) printf("%llu\n", (unsigned long long)e->d_ino);
+      if (d) closedir(d);
+      i += 2;
+    }
+    else if (!strcmp(op, "stats")) printf("%d\n", stats ? *stats : -1);
+    else if (!strcmp(op, "accesses")) printf("%d\n", accesses ? *accesses : -1);
     else if (!strcmp(op, "opens")) printf("%d\n", opens ? *opens : -1);
   }
   return 0;
 }
 """
-
-
-# The cache keeps a listing only while an inotify watch guards it; without one, opendir reads the real
-# directory every time (correct, just uncached). Tests that count real reads need the watch.
-needs_inotify = unittest.skipIf(NO_SLOT, "cache hits can't be counted: %s" % NO_SLOT)
 
 
 @unittest.skipUnless(shutil.which("cc"), "needs a C compiler")
@@ -269,7 +368,7 @@ class DirCachePreloadTest(unittest.TestCase):
         build.mkdir()
         (build / "fake.c").write_text(FAKE)
         (build / "program.c").write_text(PROGRAM)
-        cls.cache = build / "libblsession.so"
+        cls.cache = build / "libddsession.so"
         cls.fake = build / "fake.so"
         subprocess.run(["cc", "-shared", "-fPIC", "-O2", "-Wall", "-pthread", "-o", str(cls.cache),
                         *map(str, sorted(PRELOAD.glob("*.c"))), "-ldl"], check=True)
@@ -291,19 +390,43 @@ class DirCachePreloadTest(unittest.TestCase):
         for name in ("a.bundle", "b.bundle"):
             (self.staging / name).touch()
 
-    def run_program(self, *args, program=None, env=None):
+    def environment(self, env):
         environment = dict(os.environ, LD_PRELOAD="%s:%s" % (self.cache, self.fake))
         environment.update(env or {})
-        result = subprocess.run([str(program or self.steam), *map(str, args)], env=environment,
-                                capture_output=True, text=True, check=True, timeout=60)
+        return environment
+
+    def run_program(self, *args, program=None, env=None, timeout=60):
+        result = subprocess.run([str(program or self.steam), *map(str, args)], env=self.environment(env),
+                                capture_output=True, text=True, check=True, timeout=timeout)
         return result.stdout.splitlines()
 
-    @needs_inotify
+    def run_paused(self, *args, between, env=None):
+        probe = subprocess.Popen([str(self.steam), *map(str, args)], env=self.environment(env), text=True,
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        timer = threading.Timer(60, probe.kill)
+        timer.start()
+        try:
+            before = []
+            for line in probe.stdout:
+                if line == "ready\n":
+                    break
+                before.append(line.rstrip("\n"))
+            else:
+                self.fail("the probe stopped before it was ready")
+            between()
+            after, _ = probe.communicate("go\n", timeout=60)
+        finally:
+            timer.cancel()
+            if probe.poll() is None:
+                probe.kill()
+            probe.communicate()
+        self.assertEqual(0, probe.returncode)
+        return before + after.splitlines()
+
     def test_repeated_listings_read_the_directory_once(self):
         out = self.run_program("list", self.staging, "list", self.staging, "list", self.staging, "opens")
         self.assertEqual(["a.bundle,b.bundle"] * 3 + ["1"], out)
 
-    @needs_inotify
     def test_own_changes_keep_the_listing_exact(self):
         s = self.staging
         out = self.run_program(
@@ -320,7 +443,6 @@ class DirCachePreloadTest(unittest.TestCase):
         self.assertEqual("d.bundle", out[-2])
         self.assertEqual("1", out[-1])
 
-    @needs_inotify
     def test_moves_between_directories_update_both(self):
         common = self.lib / "common/Game"
         common.mkdir(parents=True)
@@ -345,7 +467,6 @@ class DirCachePreloadTest(unittest.TestCase):
         self.assertEqual(out[4], out[3])
         self.assertEqual("b.bundle,c.bundle,x.bundle", out[3])
 
-    @needs_inotify
     def test_own_changes_stay_cached_when_directory_times_are_coarse(self):
         s = self.staging
         out = self.run_program("list", s, "create", s / "c.bundle", "rename", s / "c.bundle", s / "d.bundle",
@@ -357,7 +478,6 @@ class DirCachePreloadTest(unittest.TestCase):
         out = self.run_program("list", s, "drain", s, "list", s, "raw", s, env={"COARSE": "1"})
         self.assertEqual(["1", "", ""], out[1:])
 
-    @needs_inotify
     def test_directories_opened_through_fdopendir_underneath(self):
         s = self.staging
         out = self.run_program("list", s, "list", s, "sneak", s / "x.bundle", "list", s, "rewind", s,
@@ -381,17 +501,14 @@ class DirCachePreloadTest(unittest.TestCase):
         self.assertEqual(["a.bundle,b.bundle"], first)
         self.assertEqual(["a.bundle,b.bundle,y.bundle"], self.run_program("list", s))
 
-    @needs_inotify
     def test_a_listing_read_halfway_is_not_kept(self):
         out = self.run_program("half", self.staging, "list", self.staging, "list", self.staging, "opens")
         self.assertEqual(["a.bundle,b.bundle", "a.bundle,b.bundle", "2"], out)
 
-    @needs_inotify
     def test_rewind_and_dirfd_work_on_a_cached_listing(self):
         out = self.run_program("list", self.staging, "rewind", self.staging, "opens")
         self.assertEqual(["4 4 1", "1"], out[1:])
 
-    @needs_inotify
     def test_seekdir_returns_to_a_told_position(self):
         for name in ("c.bundle", "d.bundle", "e.bundle"):
             (self.staging / name).touch()
@@ -414,8 +531,370 @@ class DirCachePreloadTest(unittest.TestCase):
         outside.mkdir()
         self.assertEqual("2", self.run_program("list", outside, "list", outside, "opens")[-1])
 
+    def test_missing_names_are_answered_from_the_listing(self):
+        s = self.staging
+        out = self.run_program("list", s, "access", s / "x.bundle", "access", s / "y/z.bundle",
+                               "access", s / "c.bundle", "accesses", "access", s / "a.bundle", "accesses", "opens")
+        self.assertEqual(["-1 2", "-1 2", "-1 2", "1", "0 0", "2", "1"], out[1:])
+
+    def test_a_name_that_differs_only_in_case_is_asked_of_the_filesystem(self):
+        s = self.staging
+        out = self.run_program("list", s, "access", s / "A.BUNDLE", "accesses")
+        self.assertEqual(["-1 2", "1"], out[1:])
+
+    def test_misses_before_the_client_lists_a_directory_reach_the_filesystem(self):
+        s = self.staging
+        out = self.run_program("access", s / "x.bundle", "access", s / "y.bundle", "accesses", "opens")
+        self.assertEqual(["-1 2", "-1 2", "2", "0"], out)
+
+    def test_names_created_after_a_miss_are_found(self):
+        s = self.staging
+        out = self.run_program("list", s, "access", s / "x.bundle", "create", s / "x.bundle", "access", s / "x.bundle",
+                               "access", s / "y.bundle", "sneak", s / "y.bundle", "access", s / "y.bundle",
+                               "rename", s / "y.bundle", s / "w.bundle", "access", s / "w.bundle",
+                               "mkdir", s / "sub", "access", s / "sub",
+                               env={"COARSE": "1"})
+        self.assertEqual(["-1 2", "0 0", "-1 2", "0 0", "0 0", "0 0"], out[1:])
+
+    def test_a_differently_cased_directory_reaches_the_filesystem_when_case_matters(self):
+        s = self.staging
+        upper = Path(str(s).replace("downloading", "DOWNLOADING"))
+        out = self.run_program("list", s, "access", upper / "x.bundle", "accesses")
+        self.assertEqual(["-1 2", "1"], out[1:])
+
+    def test_a_differently_cased_directory_uses_the_listing_when_the_filesystem_folds_case(self):
+        s = self.staging
+        upper = Path(str(s).replace("downloading", "DOWNLOADING"))
+        out = self.run_program("list", s, "access", upper / "x.bundle", "access", upper / "A.BUNDLE", "accesses",
+                               env={"FOLD": "all"})
+        self.assertEqual(["-1 2", "-1 2", "1"], out[1:])
+
+    def test_a_case_sensitive_folder_below_a_folding_steamapps_reaches_the_filesystem(self):
+        s = self.staging
+        upper = self.lib / "DOWNLOADING" / s.name
+        upper.mkdir(parents=True)
+        (upper / "x.bundle").write_bytes(b"")
+        out = self.run_program("list", s, "access", upper / "x.bundle", "access", upper / "y.bundle", "accesses",
+                               env={"FOLD": "1"})
+        self.assertEqual(["0 0", "-1 2", "2"], out[1:])
+
+    def test_a_differently_cased_folder_above_steamapps_reaches_the_filesystem(self):
+        s = self.staging
+        top = self.lib.parent.parent
+        other = top.parent / top.name.swapcase() / s.relative_to(top)
+        self.assertNotEqual(top.name, top.name.swapcase())
+        other.mkdir(parents=True)
+        (other / "x.bundle").write_bytes(b"")
+        out = self.run_program("list", s, "access", other / "x.bundle", "accesses", env={"FOLD": "all"})
+        self.assertEqual(["0 0", "1"], out[1:])
+
+    def test_a_differently_cased_sibling_of_a_folded_listing_reaches_the_filesystem(self):
+        s = self.staging
+        (self.lib.parent / "STEAMAPPS").symlink_to("steamapps")
+        (self.lib / "DOWNLOADING").symlink_to("downloading")
+        other = self.lib / "Downloading" / s.name
+        other.mkdir(parents=True)
+        (other / "x.bundle").touch()
+        out = self.run_program("list", s, "access", other / "x.bundle", "accesses")
+        self.assertEqual("0 0", out[1])
+
+    def test_a_listing_is_dropped_when_a_folder_above_it_is_renamed(self):
+        s = self.staging
+        parent = s.parent
+        moved = parent.parent / "downloading.old"
+        out = self.run_program("list", s, "rename", parent, moved, "mkdir", parent, "mkdir", s,
+                               "sneak", s / "x.bundle", "access", s / "x.bundle", "accesses")
+        self.assertEqual(["0 0", "1"], out[1:])
+
+    def test_a_listing_is_dropped_when_another_process_renames_a_folder_above_it(self):
+        s = self.staging
+        parent = s.parent
+
+        def swap():
+            parent.rename(parent.parent / "downloading.old")
+            s.mkdir(parents=True)
+            (s / "x.bundle").touch()
+
+        out = self.run_paused("list", s, "pause", "access", s / "x.bundle", "accesses", between=swap)
+        self.assertEqual(["0 0", "1"], out[1:])
+
+    def test_a_listing_is_dropped_when_another_process_renames_the_library_above_steamapps(self):
+        s = self.staging
+        root = self.lib.parent
+
+        def swap():
+            root.rename(root.parent / "fuse.old")
+            s.mkdir(parents=True)
+            (s / "x.bundle").touch()
+
+        out = self.run_paused("list", s, "pause", "access", s / "x.bundle", "accesses", between=swap)
+        self.assertEqual(["0 0", "1"], out[1:])
+
+    def test_a_repointed_symlink_above_a_listing_does_not_hide_files(self):
+        s = self.staging
+        real = self.lib / "dl-a"
+        s.parent.rename(real)
+        s.parent.symlink_to(real.name)
+        other = self.lib / "dl-b" / s.name
+        other.mkdir(parents=True)
+        (other / "x.bundle").touch()
+
+        def repoint():
+            link = self.lib / "downloading.new"
+            link.symlink_to("dl-b")
+            link.replace(s.parent)
+
+        out = self.run_paused("list", s, "pause", "access", s / "x.bundle", between=repoint)
+        self.assertEqual("0 0", out[1])
+
+    def test_a_symlink_check_that_cannot_be_watched_does_not_hide_files(self):
+        s = self.staging
+        real = self.lib / "dl-a"
+        s.parent.rename(real)
+        s.parent.symlink_to(real.name)
+        other = self.lib / "dl-b" / s.name
+        other.mkdir(parents=True)
+        (other / "x.bundle").touch()
+
+        def repoint():
+            link = self.lib / "downloading.new"
+            link.symlink_to("dl-b")
+            link.replace(s.parent)
+
+        out = self.run_paused("list", s, "pause", "access", s / "x.bundle", between=repoint, env={"NOFOLLOW_FAIL": "1"})
+        self.assertEqual("0 0", out[1])
+
+    def test_an_unreadable_folder_above_steamapps_does_not_hide_files(self):
+        s = self.staging
+        root = self.lib.parent
+        moved = root.parent / "fuse.old"
+        root.chmod(0o311)
+        self.addCleanup(lambda: moved.chmod(0o755) if moved.exists() else root.chmod(0o755))
+        if os.access(root, os.R_OK):
+            self.skipTest("folder permissions are not enforced here")
+
+        def swap():
+            root.rename(moved)
+            s.mkdir(parents=True)
+            (s / "x.bundle").touch()
+
+        out = self.run_paused("list", s, "pause", "access", s / "x.bundle", between=swap)
+        self.assertEqual("0 0", out[1])
+
+    def test_a_listing_is_dropped_when_another_process_removes_a_folder_above_it(self):
+        deep = self.staging / "deep"
+        deep.mkdir()
+        parent = self.staging.parent
+
+        def swap():
+            self.staging.rename(self.lib / "moved")
+            parent.rmdir()
+            deep.mkdir(parents=True)
+            (deep / "x.bundle").touch()
+
+        out = self.run_paused("list", deep, "pause", "access", deep / "x.bundle", "accesses", between=swap)
+        self.assertEqual(["", "0 0", "1"], out)
+
+    def test_a_listing_is_dropped_when_a_folder_above_it_is_renamed_around_the_cache(self):
+        s = self.staging
+        parent = s.parent
+        out = self.run_program("list", s, "sneak-rename", parent, parent.parent / "downloading.old",
+                               "sneak-mkdir", parent, "sneak-mkdir", s, "sneak", s / "x.bundle",
+                               "access", s / "x.bundle", "accesses")
+        self.assertEqual(["0 0", "1"], out[1:])
+
+    def test_changes_in_a_cached_folder_above_keep_the_listing_below(self):
+        s = self.staging
+        parent = s.parent
+
+        def churn():
+            (parent / "z").touch()
+            (parent / "z").unlink()
+            (parent / "sibling").mkdir()
+            (parent / "sibling").rmdir()
+
+        out = self.run_paused("list", parent, "list", s, "pause", "list", parent, "list", s,
+                              "access", s / "x.bundle", "accesses", "opens", between=churn)
+        self.assertEqual([s.name, "a.bundle,b.bundle", s.name, "a.bundle,b.bundle", "-1 2", "0", "3"], out)
+
+    def test_absolute_paths_checked_against_a_descriptor_are_answered_from_the_listing(self):
+        s = self.staging
+        out = self.run_program("list", s, "accessat", s / "x.bundle", "accessat", s / "y.bundle", "accesses",
+                               "accessat", s / "a.bundle", "accessat", s / "a.bundle", "accesses",
+                               "create", s / "x.bundle", "accessat", s / "x.bundle")
+        self.assertEqual(["-1 2", "-1 2", "0", "0 0", "0 0", "1", "0 0"], out[1:])
+
+    def test_absolute_paths_checked_against_a_descriptor_elsewhere_reach_the_filesystem(self):
+        s = self.staging
+        other = self.run_program("list", s, "accessat", s / "x.bundle", "accessat", s / "x.bundle", "accesses",
+                                 program=self.other)
+        self.assertEqual(["-1 2", "-1 2", "2"], other[1:])
+        off = self.run_program("list", s, "accessat", s / "x.bundle", "accessat", s / "x.bundle", "accesses",
+                               env={"DD_NO_DIR_CACHE": "1", "DD_NO_PATH_CACHE": "1"})
+        self.assertEqual(["-1 2", "-1 2", "2"], off[1:])
+
+    def test_missing_names_asked_through_the_old_stat_entry_are_answered_from_the_listing(self):
+        s = self.staging
+        out = self.run_program("list", s, "stats", "xstat", s / "x.bundle", "stats", "xstat", s / "a.bundle", "stats",
+                               "create", s / "x.bundle", "xstat", s / "x.bundle")
+        self.assertEqual(["-1 2", out[1], "0 0", str(int(out[1]) + 1), "0 0"], out[2:])
+        other = self.run_program("list", s, "stats", "xstat", s / "z.bundle", "stats", program=self.other)
+        self.assertEqual(["-1 2", str(int(other[1]) + 1)], other[2:])
+
+    def test_folders_that_differ_only_in_case_stay_cached_together(self):
+        s = self.staging
+        names = ["Content/Data", "content/data", "Content/Characters", "content/characters"]
+        for name in names:
+            (s / name).mkdir(parents=True)
+        checks = [op for name in names for op in ("access", s / name)]
+        out = self.run_program(*checks, "accesses", *checks, *checks, "accesses")
+        self.assertEqual(out[4], out[-1])
+
+    def test_a_cached_listing_is_served_without_asking_the_filesystem(self):
+        s = self.staging
+        out = self.run_program("list", s, "stats", "list", s, "list", s, "access", s / "x.bundle", "stats", "opens")
+        self.assertEqual(out[1], out[-2])
+        self.assertEqual("1", out[-1])
+
+    def test_own_changes_in_a_cached_folder_do_not_ask_the_filesystem(self):
+        s = self.staging
+        out = self.run_program(
+            "list", s, "stats",
+            "create", s / "c.bundle", "rename", s / "c.bundle", s / "d.bundle", "unlink", s / "a.bundle", "stats",
+            "list", s, "raw", s, "opens")
+        self.assertEqual(out[1], out[2])
+        self.assertEqual(["b.bundle,d.bundle", "b.bundle,d.bundle", "1"], out[3:])
+
+    def test_own_changes_in_a_folder_never_listed_do_not_ask_the_filesystem(self):
+        s = self.staging
+        out = self.run_program("stats", "create", s / "c.bundle", "rename", s / "c.bundle", s / "d.bundle",
+                               "unlink", s / "d.bundle", "stats", "list", s, "raw", s)
+        self.assertEqual(out[0], out[1])
+        self.assertEqual(["a.bundle,b.bundle", "a.bundle,b.bundle"], out[2:])
+
+    def test_a_differently_cased_folder_is_checked_once(self):
+        s = self.staging
+        upper = Path(str(s).replace("downloading", "DOWNLOADING"))
+        out = self.run_program("list", s, "access", upper / "x.bundle", "stats",
+                               "access", upper / "y.bundle", "access", upper / "z.bundle", "stats", "accesses",
+                               env={"FOLD": "all"})
+        self.assertEqual(out[2], out[5])
+        self.assertEqual("0", out[-1])
+
+    def test_a_folder_reached_through_a_link_follows_the_link(self):
+        s = self.staging
+        other = self.lib / "elsewhere" / s.name
+        other.mkdir(parents=True)
+        (other / "x.bundle").touch()
+        link = self.lib / "DOWNLOADING"
+        link.symlink_to("downloading")
+
+        def repoint():
+            link.unlink()
+            link.symlink_to("elsewhere")
+
+        out = self.run_paused("list", s, "access", link / s.name / "x.bundle", "pause",
+                              "access", link / s.name / "x.bundle", between=repoint, env={"FOLD": "all"})
+        self.assertEqual(["-1 2", "0 0"], out[1:])
+
+    def test_a_linked_last_component_follows_the_link(self):
+        s = self.staging
+        other = self.lib / "elsewhere" / s.name
+        other.mkdir(parents=True)
+        (other / "x.bundle").touch()
+        twin = self.lib / "DOWNLOADING"
+        twin.mkdir()
+        link = twin / s.name
+        link.symlink_to(s)
+
+        def repoint():
+            link.unlink()
+            link.symlink_to(other)
+
+        out = self.run_paused("list", s, "access", link / "x.bundle", "pause",
+                              "access", link / "x.bundle", between=repoint, env={"FOLD": "all"})
+        self.assertEqual(["-1 2", "0 0"], out[1:])
+
+    def test_a_folder_reached_through_a_parent_step_is_checked_each_time(self):
+        s = self.staging
+        other = self.lib / "elsewhere"
+        (other / "branch").mkdir(parents=True)
+        (other / s.parent.name / s.name).mkdir(parents=True)
+        (other / s.parent.name / s.name / "x.bundle").touch()
+        (self.lib / "branch").mkdir()
+        twin = self.lib / "BRANCH"
+        twin.mkdir()
+        listed = self.lib / "branch" / ".." / s.parent.name / s.name
+        through = twin / ".." / s.parent.name / s.name
+
+        def repoint():
+            twin.rmdir()
+            twin.symlink_to(other / "branch")
+
+        out = self.run_paused("list", listed, "access", through / "x.bundle", "pause",
+                              "access", through / "x.bundle", between=repoint, env={"FOLD": "all"})
+        self.assertEqual(["-1 2", "0 0"], out[1:])
+
+    def test_a_permission_change_on_the_folder_or_above_it_is_noticed(self):
+        s = self.staging
+        for target in (s, s.parent):
+            with self.subTest(target=target.name):
+                out = self.run_paused("list", s, "opens", "pause", "list", s, "opens",
+                                      between=lambda: target.chmod(0o700))
+                self.assertEqual(int(out[1]) + 1, int(out[3]))
+
+    def test_a_permission_change_on_a_file_keeps_the_listing(self):
+        s = self.staging
+        out = self.run_paused("list", s, "opens", "pause", "list", s, "opens",
+                              between=lambda: (s / "a.bundle").chmod(0o600))
+        self.assertEqual(out[1], out[3])
+
+    def test_opening_an_existing_link_keeps_its_entry(self):
+        s = self.staging
+        (s / "l.bundle").symlink_to("a.bundle")
+        out = self.run_program("list", s, "create", s / "l.bundle", "inode", s, "l.bundle", "raw", s)
+        self.assertEqual(str((s / "l.bundle").lstat().st_ino), out[1])
+
+    def test_changes_made_around_the_cache_after_own_changes_are_noticed(self):
+        s = self.staging
+        out = self.run_program("list", s, "create", s / "c.bundle", "sneak", s / "y.bundle", "list", s, "raw", s,
+                               "access", s / "y.bundle")
+        self.assertEqual(out[1], out[2])
+        self.assertIn("y.bundle", out[1])
+        self.assertEqual("0 0", out[3])
+
+    def test_misses_outside_the_client_or_fuse_steamapps_reach_the_filesystem(self):
+        s = self.staging
+        other = self.run_program("list", s, "access", s / "x.bundle", "access", s / "y.bundle", "accesses",
+                                 program=self.other)
+        self.assertEqual(["-1 2", "-1 2", "2"], other[1:])
+        outside = self.lib.parent / "elsewhere"
+        outside.mkdir()
+        out = self.run_program("list", outside, "access", outside / "x", "access", outside / "y", "accesses")
+        self.assertEqual(["-1 2", "-1 2", "2"], out[1:])
+
+    def test_misses_reach_the_filesystem_when_turned_off(self):
+        s = self.staging
+        out = self.run_program("list", s, "access", s / "x.bundle", "access", s / "y.bundle", "accesses",
+                               env={"DD_NO_DIR_CACHE": "1"})
+        self.assertEqual(["-1 2", "-1 2", "2"], out[1:])
+
+    def test_a_preload_below_calling_back_while_a_folder_is_watched_does_not_hang(self):
+        common = self.lib / "common/Game"
+        common.mkdir(parents=True)
+        (common / "game.exe").touch()
+        out = self.run_program("list", self.staging, "list", common, "list", common, "opens",
+                               env={"NESTED": "1"}, timeout=20)
+        self.assertEqual(["a.bundle,b.bundle", "game.exe", "game.exe", "2"], out)
+
+    def test_a_preload_below_removing_through_unlink_does_not_hang(self):
+        s = self.staging
+        out = self.run_program("list", s, "remove", s / "a.bundle", "list", s, "raw", s, "opens",
+                               env={"NESTED": "1"}, timeout=20)
+        self.assertEqual(["a.bundle,b.bundle", "b.bundle", "b.bundle", "1"], out)
+
     def test_can_be_turned_off(self):
-        out = self.run_program("list", self.staging, "list", self.staging, "opens", env={"BL_NO_DIR_CACHE": "1"})
+        out = self.run_program("list", self.staging, "list", self.staging, "opens", env={"DD_NO_DIR_CACHE": "1"})
         self.assertEqual("2", out[-1])
 
 

@@ -1,18 +1,27 @@
 package com.droiddeck.launcher.stores.xbox
 
 import android.annotation.SuppressLint
+import android.content.Intent
 import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
 import android.util.Log
+import android.util.TypedValue
+import android.view.Gravity
+import android.view.View
+import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Button
+import android.widget.FrameLayout
+import android.widget.ImageButton
 import android.widget.LinearLayout
+import android.widget.ProgressBar
 import android.widget.TextView
 import androidx.activity.ComponentActivity
+import com.droiddeck.launcher.R
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 import com.droiddeck.launcher.core.AddonPack
@@ -24,8 +33,10 @@ import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
 class XboxLoginActivity : ComponentActivity() {
-    private lateinit var host: LinearLayout
+    private lateinit var host: FrameLayout
     private lateinit var status: TextView
+    private lateinit var retry: Button
+    private lateinit var progressBar: ProgressBar
     private var view: WebView? = null
     @Volatile private var child: Xodus.Child? = null
     @Volatile private var session = 0L
@@ -37,11 +48,7 @@ class XboxLoginActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         requestedOrientation = com.droiddeck.launcher.core.AppUiPrefs.orientation(this)
-        host = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setBackgroundColor(Color.BLACK) }
-        status = TextView(this).apply { setTextColor(Color.WHITE); text = "Preparing Microsoft sign-in…"; setPadding(24, 16, 24, 16) }
-        host.addView(status)
-        host.addView(Button(this).apply { text = getString(com.droiddeck.launcher.R.string.stores_login_close); setOnClickListener { finish() } })
-        setContentView(host)
+        setContentView(buildChrome())
         if (android.os.Build.VERSION.SDK_INT < 28 || !WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER) ||
             !WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
             status.text = "Update Android System WebView to sign in to Xbox."
@@ -55,8 +62,6 @@ class XboxLoginActivity : ComponentActivity() {
         Thread({
             if (closed) return@Thread
             try {
-                // A record without a username is left from a sign-in that never finished; starting clean
-                // also avoids reading it back with an older, slow Keystore key.
                 progress("preparing the sign-in", "Preparing Microsoft sign-in…")
                 val leftover = StoreAccounts.read(applicationContext, Store.XBOX)
                 if (leftover != null && leftover.optString("username").isBlank()) {
@@ -73,7 +78,6 @@ class XboxLoginActivity : ComponentActivity() {
                 Xodus.start(applicationContext, listOf("--external-webview-stdio", "login"), credentialGeneration = accountGeneration).use { process ->
                     child = process
                     if (closed) return@use
-                    // StoresState.logLine writes no file in this process, so the reason would miss the shared log.
                     Xodus.diagnostics(process) { line ->
                         logStep(line)
                         line.removePrefix("NEXUS_CREDENTIAL_ERROR_V1 ").takeIf { it != line && it !in codes && codes.size < 6 }?.let(codes::add)
@@ -151,20 +155,64 @@ class XboxLoginActivity : ComponentActivity() {
                 val failed = step
                 val reason = failure(e)
                 logStep("failed while $failed: $reason")
+                if (e is java.io.IOException) logStep("I/O detail: ${e.message.orEmpty().take(300)}")
                 runOnUiThread {
                     disposeView()
                     val details = if (codes.isEmpty()) "" else "\nDetails: ${codes.joinToString(", ")}"
-                    status.text = "Microsoft sign-in did not complete.\nFailed while $failed: $reason$details\nClose this window and try again."
+                    status.text = "Microsoft sign-in did not complete.\nFailed while $failed: $reason$details"
+                    retry.visibility = View.VISIBLE
                 }
             }
         }, "xbox-login").start()
+    }
+
+    private fun dp(value: Int): Int = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, value.toFloat(), resources.displayMetrics).toInt()
+
+    /** The other stores' sign-in frame: a title bar with close, a load bar, and a centered status. */
+    private fun buildChrome(): View {
+        val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setBackgroundColor(BACKGROUND) }
+        val bar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; setBackgroundColor(BAR)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(48))
+        }
+        bar.addView(TextView(this).apply {
+            text = getString(R.string.stores_login_title, Store.XBOX.label)
+            setTextColor(TEXT); textSize = 16f; setPadding(dp(16), 0, dp(8), 0)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        })
+        bar.addView(ImageButton(this).apply {
+            setImageResource(android.R.drawable.ic_menu_close_clear_cancel); setBackgroundColor(Color.TRANSPARENT)
+            contentDescription = getString(R.string.stores_login_close); layoutParams = LinearLayout.LayoutParams(dp(48), dp(48))
+            setOnClickListener { finish() }
+        })
+        progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 100; visibility = View.GONE
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(3))
+        }
+        host = FrameLayout(this).apply {
+            setBackgroundColor(BACKGROUND)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
+        }
+        val panel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER; setBackgroundColor(BACKGROUND)
+            setPadding(dp(24), dp(24), dp(24), dp(24))
+        }
+        status = TextView(this).apply { setTextColor(TEXT); textSize = 15f; gravity = Gravity.CENTER; text = "Preparing Microsoft sign-in…" }
+        retry = Button(this).apply {
+            text = getString(R.string.stores_login_retry); visibility = View.GONE
+            setOnClickListener { startActivity(Intent(intent)); finish() }
+        }
+        panel.addView(status)
+        panel.addView(retry, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(16) })
+        host.addView(panel, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        root.addView(bar); root.addView(progressBar); root.addView(host)
+        return root
     }
 
     private fun show(text: String) = runOnUiThread { if (!closed && view == null) status.text = text }
 
     private fun progress(name: String, text: String) { step = name; show(text) }
 
-    /** Written to the stores log, which the shared log zip carries; the main process's log helpers don't run in this process. */
     private fun logStep(line: String) {
         val text = StoreLog.redactLine("Xbox sign-in: $line")
         Log.i(TAG, text)
@@ -195,7 +243,6 @@ class XboxLoginActivity : ComponentActivity() {
             override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean = !trusted(request.url.toString())
             override fun onPageFinished(view: WebView, url: String) {
                 if (!trusted(url)) { finish(); return }
-                status.text = "Microsoft sign-in"
                 val uri = Uri.parse(url)
                 if (uri.host == "login.live.com" && uri.path == "/ppsecure/post.srf") {
                     view.evaluateJavascript("JSON.stringify(globalThis.ServerData ?? null)") { raw ->
@@ -207,7 +254,14 @@ class XboxLoginActivity : ComponentActivity() {
                 }
             }
         }
-        host.addView(web, LinearLayout.LayoutParams(-1, 0, 1f))
+        web.setBackgroundColor(BACKGROUND)
+        web.webChromeClient = object : android.webkit.WebChromeClient() {
+            override fun onProgressChanged(view: WebView?, newProgress: Int) {
+                progressBar.progress = newProgress
+                progressBar.visibility = if (newProgress in 1..99) View.VISIBLE else View.GONE
+            }
+        }
+        host.addView(web, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         val headers = frame.getJSONObject("headers")
         val values = headers.keys().asSequence().associateWith { key ->
             require(key in allowedHeaders)
@@ -216,7 +270,11 @@ class XboxLoginActivity : ComponentActivity() {
         web.loadUrl(frame.getString("url"), values)
     }
 
-    private fun disposeView() { view?.let { host.removeView(it); it.stopLoading(); it.destroy() }; view = null }
+    private fun disposeView() {
+        view?.let { host.removeView(it); it.stopLoading(); it.destroy() }
+        view = null
+        if (::progressBar.isInitialized) progressBar.visibility = View.GONE
+    }
     override fun onDestroy() {
         closed = true
         val current = child; child = null
@@ -229,8 +287,10 @@ class XboxLoginActivity : ComponentActivity() {
 
     companion object {
         private const val TAG = "XboxLogin"
+        private const val BACKGROUND = 0xFF0A0B0D.toInt()
+        private const val BAR = 0xFF121417.toInt()
+        private const val TEXT = 0xFFF2F4F7.toInt()
 
-        /** Our own check messages are safe to show; anything else is named by its type, never its text, which may hold sign-in data. */
         internal fun failure(e: Exception): String {
             val message = e.message.orEmpty()
             return if (e is IllegalStateException && message.isNotBlank() && message != "Check failed." && message.length <= 160) message

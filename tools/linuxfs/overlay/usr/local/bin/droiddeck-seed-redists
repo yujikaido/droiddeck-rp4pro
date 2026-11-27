@@ -24,7 +24,7 @@ read_scripts() { xargs -0 -r awk -v want="${1:-redists}" '
       proc[depth] = 1
       program = tolower(part[4])
       sub(/.*[\\\/]/, "", program)
-      if (program ~ /vulkan|uplay|ubisoft|eaappinstaller|eadesktop|originthinsetup/) vulkan[depth] = 1
+      if (program ~ /vulkan|uplay|ubisoft|eaapp/) vulkan[depth] = 1
       next
     }
     if (n == 3) pending = part[2]
@@ -34,8 +34,6 @@ pairs=$(find "$redist" -name installscript.vdf -print0 2>/dev/null | sort -z | r
 [ -n "$pairs" ] || pairs=$(sed 's/^\([^ ]*\) /HKEY_LOCAL_MACHINE\\\\Software\\\\Valve\\\\Steam\\\\Apps\\\\CommonRedist\\\\\1\t/' <<'KNOWN'
 DirectX\\Jun2010 dxsetup
 .NET\\4.8 4.8
-vcredist\\2005 x86
-vcredist\\2005 x64
 vcredist\\2008 x86 SP1
 vcredist\\2008 x64 SP1
 vcredist\\2010 x86
@@ -53,60 +51,80 @@ vcredist\\2022 x64 14.51.36247.0
 KNOWN
 )
 
-CACHE_VERSION="droiddeck-game-scripts 2"
 cache="$steam_root/.droiddeck-game-scripts"
 libraries="$steam_root"
 for library in $LIBRARIES; do libraries="$libraries
 $library"; done
 libraries=$(printf '%s\n%s\n' "$libraries" "$(sed -n 's/^[[:space:]]*"path"[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p' "$steam_root/steamapps/libraryfolders.vdf" 2>/dev/null)" | awk 'NF && !seen[$0]++')
-manifests() {
-  local library manifest
-  while IFS= read -r library; do
-    for manifest in "$library"/steamapps/appmanifest_*.acf; do [ -f "$manifest" ] && printf '%s\0' "$manifest"; done
-  done <<<"$libraries" | xargs -0 -r awk '
-    function value(key,   rest) {
-      if (!match(low, "\"" key "\"[ \t\r\n]+\"")) return ""
-      rest = substr(text, RSTART + RLENGTH)
-      return substr(rest, 1, index(rest, "\"") - 1)
+games=$(while IFS= read -r library; do
+  library="$library" awk '
+    function flush() { if (dir != "") printf "%s|%s|%s|%s\t%s/steamapps/common/%s\n", file, build, updated, size, ENVIRON["library"], dir }
+    FNR == 1 { flush(); file = FILENAME; dir = build = updated = size = "" }
+    {
+      n = split($0, part, "\"")
+      for (i = 2; i + 2 <= n; i += 2) {
+        name = tolower(part[i])
+        if (name == "installdir" && dir == "") dir = part[i + 2]
+        else if (name == "buildid" && build == "") build = part[i + 2]
+        else if (name == "lastupdated" && updated == "") updated = part[i + 2]
+        else if (name == "sizeondisk" && size == "") size = part[i + 2]
+        else continue
+        i += 2
+      }
     }
-    function flush(   dir, library) {
-      if (file == "") return
-      low = tolower(text)
-      dir = value("installdir")
-      library = file
-      sub(/\/steamapps\/[^\/]*$/, "", library)
-      if (dir != "" && dir != "." && dir != ".." && index(dir, "/") == 0 && tolower(dir) != "steamworks shared")
-        printf "%s/steamapps/common/%s\t%s:%s:%s\n", library, dir, value("stateflags"), value("buildid"), value("lastupdated")
-      text = ""
-    }
-    FNR == 1 { flush(); file = FILENAME }
-    { text = text $0 "\n" }
     END { flush() }
-  ' | awk -F'\t' 'NF == 2 && !seen[$1]++'
+  ' "$library"/steamapps/appmanifest_*.acf 2>/dev/null
+done <<<"$libraries")
+legacy=
+[ -s "$cache" ] && ! grep -q $'\t' "$cache" && legacy=$(tail -n +2 "$cache"; echo .)
+declare -A scanned=() current=()
+read_scanned() {
+  scanned=()
+  while IFS=$'\t' read -r key _; do
+    [ -n "$key" ] && scanned[$key]=1
+  done < <(grep $'\t' "$cache" 2>/dev/null)
 }
-cached_lines() { [ "$(head -n 1 "$cache" 2>/dev/null)" = "$CACHE_VERSION" ] && tail -n +2 "$cache"; }
-if [ -n "${DROIDDECK_SEED_PREFIX:-}" ]; then
-  entries=$(cached_lines)
-else
-  current=$(manifests)
-  old=$(cached_lines)
-  kept=$(awk -F'\t' 'NR == FNR { if (NF == 2) want[$1 FS $2] = 1; next } ($1 FS $2) in want' \
-    <(printf '%s\n' "$current") <(printf '%s\n' "$old"))
-  fresh=$(awk -F'\t' 'NR == FNR { have[$1 FS $2] = 1; next } NF == 2 && !(($1 FS $2) in have)' \
-    <(printf '%s\n' "$kept") <(printf '%s\n' "$current"))
-  found=$(while IFS=$'\t' read -r dir stamp; do
-    [ -n "$dir" ] || continue
-    scripts=$(find "$dir" -mindepth 1 -maxdepth 4 -iname 'installscript*.vdf' 2>/dev/null | sort)
-    if [ -z "$scripts" ]; then printf '%s\t%s\t\n' "$dir" "$stamp"; continue; fi
-    while IFS= read -r script; do printf '%s\t%s\t%s\n' "$dir" "$stamp" "$script"; done <<<"$scripts"
-  done <<<"$fresh")
-  entries=$(printf '%s\n%s\n' "$kept" "$found" | sed '/^$/d' | sort -u)
-  if [ "$(printf '%s\n%s' "$CACHE_VERSION" "$entries")" != "$(cat "$cache" 2>/dev/null)" ]; then
-    printf '%s\n%s' "$CACHE_VERSION" "$entries" >"$cache.tmp" && mv -f "$cache.tmp" "$cache"
+read_scanned
+later=
+fresh=()
+while IFS=$'\t' read -r key dir; do
+  [ -n "$key" ] || continue
+  current[$key]=1
+  [ -z "${scanned[$key]:-}" ] || continue
+  if [ -z "$legacy" ] && [ -n "${DROIDDECK_SEED_SCRIPTS:-}${DROIDDECK_SEED_LATER:-}" ]; then
+    [ -z "${DROIDDECK_SEED_LATER:-}" ] || later=1
+    continue
   fi
+  [ -d "$dir" ] || continue
+  scanned[$key]=1
+  if [ -n "$legacy" ] && [ "$cache" -nt "${key%%|*}" ]; then
+    found=$(printf '%s\n' "${legacy%.}" | dir="$dir" awk 'index($0, ENVIRON["dir"] "/") == 1')
+  else
+    found=$(find "$dir" -mindepth 1 -maxdepth 4 -iname 'installscript*.vdf' \
+      -not -path '*/Steamworks Shared/*' 2>/dev/null) || continue
+    found=$(printf '%s\n' "$found" | sort -u)
+  fi
+  fresh+=("$key" "$found")
+done <<<"$games"
+exec 9>"$cache.lock" && command -v flock >/dev/null 2>&1 && flock 9
+if [ ${#fresh[@]} -gt 0 ]; then
+  read_scanned
+  for ((i = 0; i < ${#fresh[@]}; i += 2)); do
+    [ -z "${scanned[${fresh[i]}]:-}" ] || continue
+    printf '%s\n' "${fresh[i + 1]}" | key="${fresh[i]}" awk '{ print ENVIRON["key"] "\t" $0 }' >>"$cache"
+  done
 fi
-library_scripts=$(printf '%s\n' "$entries" | awk -F'\t' 'NF >= 3 && $3 != "" { print $3 }' | sort -u)
-game_scripts() { printf '%s\n%s\n' "$library_scripts" "${DROIDDECK_SEED_SCRIPTS:-}" | sed '/^$/d' | tr '\n' '\0'; }
+if [ -n "$later" ]; then
+  (DROIDDECK_SEED_LATER= DROIDDECK_SEED_SCRIPTS= DROIDDECK_SEED_DEFERRED=1 setsid "$0" "$steam_root" >/dev/null 2>&1 9>&- &)
+fi
+if [ -e "$cache" ]; then
+  keys=$(printf '%s\n' "${!current[@]}") awk -F'\t' '
+    BEGIN { n = split(ENVIRON["keys"], key, "\n"); for (i = 1; i <= n; i++) want[key[i]] = 1 }
+    NF > 1 && ($1 in want)
+  ' "$cache" >"$cache.tmp" && { cmp -s "$cache.tmp" "$cache" && rm -f "$cache.tmp" || mv -f "$cache.tmp" "$cache"; }
+fi
+[ -z "${DROIDDECK_SEED_DEFERRED:-}" ] || ! pgrep -x wineserver >/dev/null 2>&1 || exit 0
+game_scripts() { { cut -s -f2- "$cache" 2>/dev/null; printf '%s\n' "${DROIDDECK_SEED_SCRIPTS:-}"; } | sed '/^$/d' | tr '\n' '\0'; }
 game_pairs=$(game_scripts | read_scripts)
 [ -n "$(printf '%s' "$game_pairs" | tr -d '[:space:]')" ] && pairs=$(printf '%s\n%s\n' "$pairs" "$game_pairs" | sort -u | sed '/^$/d')
 declare -A vulkan=()
@@ -126,11 +144,6 @@ vcrt() {
     done
   done
 }
-
-declare -A game_step=()
-while IFS= read -r line; do
-  [[ $line == *$'\t'* ]] && game_step[$line]=1
-done <<<"$game_pairs"
 
 want=()
 declare -A wanted=()
@@ -188,8 +201,6 @@ unseed() {
   return 1
 }
 
-# The ledger lines whose values the registry still holds, in both views where we wrote both. A Proton
-# update replaces its default_pfx system.reg but not our ledger beside it, and new prefixes copy both.
 present() { awk -F'\t' -v hive="$hive" '
   NR == FNR {
     path = $1
@@ -233,19 +244,18 @@ present() { awk -F'\t' -v hive="$hive" '
   }
 ' - "$1"; }
 
-registries=("$steam_root"/steamapps/common/Proton*/files/share/default_pfx*/system.reg
-            /mnt/droiddeck-sd/steamapps/common/Proton*/files/share/default_pfx*/system.reg
-            /root/Games/*/steamapps/common/Proton*/files/share/default_pfx*/system.reg
-            "$steam_root"/compatibilitytools.d/*/files/share/default_pfx*/system.reg)
-if [ -n "${DROIDDECK_SEED_PREFIX:-}" ]; then
-  registries+=("${DROIDDECK_SEED_PREFIX%/}/pfx/system.reg")
-else
-  registries+=("$steam_root"/steamapps/compatdata/*/pfx/system.reg
-               /mnt/droiddeck-sd/steamapps/compatdata/*/pfx/system.reg
-               /root/Games/*/steamapps/compatdata/*/pfx/system.reg)
-fi
 regs=()
-for reg in "${registries[@]}"; do
+for reg in "$steam_root"/steamapps/common/Proton*/files/share/default_pfx*/system.reg \
+           /mnt/droiddeck-sd/steamapps/common/Proton*/files/share/default_pfx*/system.reg \
+           /mnt/droiddeck-lib/*/steamapps/common/Proton*/files/share/default_pfx*/system.reg \
+           /mnt/droiddeck-lib/*/x86-64/steamapps/common/Proton*/files/share/default_pfx*/system.reg \
+           /root/Games/*/steamapps/common/Proton*/files/share/default_pfx*/system.reg \
+           "$steam_root"/compatibilitytools.d/*/files/share/default_pfx*/system.reg \
+           "$steam_root"/steamapps/compatdata/*/pfx/system.reg \
+           /mnt/droiddeck-sd/steamapps/compatdata/*/pfx/system.reg \
+           /mnt/droiddeck-lib/*/steamapps/compatdata/*/pfx/system.reg \
+           /mnt/droiddeck-lib/*/x86-64/steamapps/compatdata/*/pfx/system.reg \
+           /root/Games/*/steamapps/compatdata/*/pfx/system.reg; do
   [ -f "$reg" ] && regs+=("$reg")
 done
 declare -A regid=()
@@ -292,7 +302,7 @@ for system in "${regs[@]}"; do
       had=()
       for line in "${kept[@]}"; do had[$line]=1; done
       printf '%s\n' "${other[@]}" "${kept[@]}" >"$seeded"
-      echo "== took Vulkan runtime, EA app and Ubisoft Connect markers out of $reg"
+      echo "== took Vulkan runtime, Ubisoft Connect and EA app markers out of $reg"
     fi
     if [ ${#had[@]} -gt 0 ] && { [ -z "$id" ] || [ "$id" != "$prev" ]; }; then
       declare -A held=()
@@ -321,16 +331,7 @@ for system in "${regs[@]}"; do
     if printf '%s\n' "$(block_for "${missing[@]}")" >>"$reg"; then
       printf '%s\n' "${other[@]}" "${!had[@]}" "${missing[@]}" >"$seeded"
       id=
-      steps=()
-      for line in "${missing[@]}"; do [ -n "${game_step[$line]:-}" ] && steps+=("${line#*$'\t'}"); done
-      if [ ${#steps[@]} -gt 0 ]; then
-        listed=$(printf '%s\n' "${steps[@]}" | sort -u | head -n 8 | paste -sd, - | sed 's/,/, /g')
-        more=$(( $(printf '%s\n' "${steps[@]}" | sort -u | wc -l) - 8 ))
-        [ $more -gt 0 ] && listed="$listed and $more more"
-        echo "== seeded redist markers into $reg (games' own install steps: $listed)"
-      else
-        echo "== seeded redist markers into $reg"
-      fi
+      echo "== seeded redist markers into $reg"
     fi
     touch -r "$dated" "$reg"
     rm -f "$dated"

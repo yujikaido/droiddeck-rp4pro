@@ -3,6 +3,7 @@ package com.droiddeck.launcher.core
 import android.content.Context
 import android.os.Build
 import com.droiddeck.launcher.R
+import com.droiddeck.launcher.gpu.SystemVulkanDriver
 import java.io.File
 
 object DeviceSupport {
@@ -10,40 +11,39 @@ object DeviceSupport {
         File("/sys/class/kgsl/kgsl-3d0").exists() || File("/vendor/lib64/hw/vulkan.adreno.so").exists()
     }
 
-    private val maliGpu by lazy { !adrenoGpu && File("/dev/mali0").exists() }
-
     fun adreno(): Boolean = adrenoGpu
 
-    fun mali(): Boolean = maliGpu
+    fun graphicsAvailable(): Boolean = graphicsAvailable(adreno(), SystemVulkanDriver.isAvailable())
 
-    /** On a Mali phone the bridge is the only way to draw (Turnip needs an Adreno), so a "Mali bridge: off"
-     * in Setup is ignored there; only the hidden pref vkBridgeForceOff=true (debugging) really turns it off. */
+    internal fun graphicsAvailable(adreno: Boolean, powerVrReady: Boolean): Boolean = adreno || powerVrReady
+
     fun vkBridge(context: Context): Boolean =
-        vkBridgeFor(adreno(), mali(), com.droiddeck.launcher.session.SessionPrefs.vkBridge(context),
-            com.droiddeck.launcher.session.SessionPrefs.vkBridgeForceOff(context))
+        bridgeUsable() && !com.droiddeck.launcher.session.VenusComponent.wanted(context) &&
+            com.droiddeck.launcher.session.SessionPrefs.vkBridge(context)
 
-    /** True when the Setup switch is off on a Mali phone and the bridge is used anyway. */
-    fun bridgeTurnedOn(context: Context): Boolean =
-        bridgeTurnedOnFor(adreno(), mali(), com.droiddeck.launcher.session.SessionPrefs.vkBridge(context),
-            com.droiddeck.launcher.session.SessionPrefs.vkBridgeForceOff(context))
+    fun mali(): Boolean = isMali
 
-    internal fun bridgeTurnedOnFor(adreno: Boolean, mali: Boolean, switchOn: Boolean, forceOff: Boolean): Boolean =
-        mali && !adreno && !switchOn && !forceOff
+    private val isMali by lazy {
+        !adreno() && (File("/dev/mali0").exists() ||
+            com.droiddeck.launcher.gpu.GpuInfo.detect().family.name.startsWith("MALI"))
+    }
 
-    internal fun vkBridgeFor(adreno: Boolean, mali: Boolean, switchOn: Boolean, forceOff: Boolean): Boolean =
-        !adreno && (switchOn || bridgeTurnedOnFor(adreno, mali, switchOn, forceOff))
+    fun bridgeUsable(): Boolean = bridgeUsable(adreno(), SystemVulkanDriver.isAvailable())
 
-    const val BRIDGE_TURNED_ON_LINE = "Mali bridge was off in Setup; turned on for this session"
+    internal fun bridgeUsable(adreno: Boolean, systemDriverReady: Boolean): Boolean = !adreno && !systemDriverReady
 
-    fun canDraw(context: Context): Boolean = adreno() || vkBridge(context)
+    fun openDriverActive(context: Context): Boolean {
+        if (adreno()) return false
+        if (com.droiddeck.launcher.session.VenusComponent.wanted(context)) return false
+        if (bridgeUsable() && com.droiddeck.launcher.session.SessionPrefs.vkBridge(context)) return false
+        val linux = com.droiddeck.launcher.session.SessionPrefs.linuxDriver(context).ifEmpty { return false }
+        return com.droiddeck.launcher.gpu.DriverPairs.isNonAdreno(com.droiddeck.launcher.gpu.DriverBundle.containing(context, linux, true)?.id)
+    }
 
-    /** The GPU's name. Adreno phones: the chip label as before. Others: the GPU itself ("Mali-G720-Immortalis MC12"),
-     *  or the chip label when it is not known yet. */
-    fun gpuName(context: Context): String =
-        (if (adreno()) null else com.droiddeck.launcher.gpu.MaliGpuNames.resolve(context)) ?: chipLabel(context)
+    fun canDraw(context: Context): Boolean = graphicsAvailable() || openDriverActive(context) || vkBridge(context) ||
+        com.droiddeck.launcher.session.VenusComponent.wanted(context)
 
-    /** "SOC_MODEL (hardware)": the chip as the system names it; what logs and uploads carry. */
-    fun chipLabel(context: Context): String {
+    fun gpuName(context: Context): String {
         val soc = if (Build.VERSION.SDK_INT >= 31) Build.SOC_MODEL.takeIf { it.isNotBlank() && it != Build.UNKNOWN } else null
         return soc?.let { "$it (${Build.HARDWARE})" } ?: Build.HARDWARE.ifBlank { context.getString(R.string.gpu_this_gpu) }
     }

@@ -73,72 +73,6 @@ class BattleNetTest {
         assertEquals(crc or 0x80000000L, BattleNet.APP_ID)
     }
 
-    @Test fun theNewestD2rfixIsTheHighestFexThenTheHighestFix() {
-        val items = listOf(
-            item("FEXCore-2610-linux.wcp"),
-            item("FEXCore-2609-d2rfix25-linux.wcp"),
-            item("FEXCore-2610-d2rfix9-linux.wcp"),
-            item("FEXCore-2610-d2rfix28-linux.wcp"),
-            item("FEXCore-2509.1-d2rfix40-linux.wcp"),
-        )
-        assertEquals("FEXCore-2610-d2rfix28-linux.wcp", BattleNet.newestD2rFix(items)?.file)
-        assertEquals("FEXCore-2610.1-d2rfix1-linux.wcp", BattleNet.newestD2rFix(items + item("FEXCore-2610.1-d2rfix1-linux.wcp"))?.file)
-        assertEquals("FexCore-2611-D2RFIX2-linux.wcp", BattleNet.newestD2rFix(items + item("FexCore-2611-D2RFIX2-linux.wcp"))?.file)
-    }
-
-    @Test fun onlyFexD2rfixPackagesCount() {
-        assertNull(BattleNet.newestD2rFix(listOf(item("FEXCore-2610-linux.wcp"), item("FEXCore-2610-d2rfix28-linux.wcp", comp = "dxvk"))))
-        assertNull(BattleNet.d2rfix("FEXCore-2610-d2rfix28-linux.wcp.part"))
-        assertNull(BattleNet.d2rfix("FEXCore-2610-d2rfix-linux.wcp"))
-        assertEquals(listOf(2610L) to 28L, BattleNet.d2rfix("FEXCore-2610-d2rfix28-linux.wcp"))
-    }
-
-    @Test fun theNewestStoredBuildIsSetForThePrefix() {
-        catalog("FEXCore-2609-d2rfix25-linux.wcp", "FEXCore-2610-d2rfix28-linux.wcp", "FEXCore-2610-linux.wcp")
-        store("FEXCore-2610-d2rfix28-linux.wcp")
-
-        assertEquals("FEXCore-2610-d2rfix28-linux.wcp", BattleNet.ensureFex(context, ::noRefresh))
-
-        assertEquals(mapOf("fex" to "FEXCore-2610-d2rfix28-linux.wcp"), ComponentsManager.gameComponents(context, BattleNet.APP_ID.toString()))
-        assertEquals("FEXCore-2610-d2rfix28-linux.wcp", BattleNet.ensureFex(context, ::noRefresh))
-    }
-
-    @Test fun aNewerBuildReplacesTheOldOne() {
-        catalog("FEXCore-2609-d2rfix25-linux.wcp")
-        store("FEXCore-2609-d2rfix25-linux.wcp")
-        BattleNet.ensureFex(context, ::noRefresh)
-        catalog("FEXCore-2609-d2rfix25-linux.wcp", "FEXCore-2610-d2rfix28-linux.wcp")
-        store("FEXCore-2610-d2rfix28-linux.wcp")
-
-        BattleNet.ensureFex(context, ::noRefresh)
-
-        assertEquals("FEXCore-2610-d2rfix28-linux.wcp", ComponentsManager.gameComponents(context, BattleNet.APP_ID.toString())["fex"])
-    }
-
-    @Test fun aStaleListingIsFetchedAgain() {
-        catalog("FEXCore-2609-d2rfix25-linux.wcp", fetchedAt = 1)
-        store("FEXCore-2610-d2rfix28-linux.wcp")
-
-        BattleNet.ensureFex(context) { listOf(item("FEXCore-2609-d2rfix25-linux.wcp"), item("FEXCore-2610-d2rfix28-linux.wcp")) }
-
-        assertEquals("FEXCore-2610-d2rfix28-linux.wcp", ComponentsManager.gameComponents(context, BattleNet.APP_ID.toString())["fex"])
-    }
-
-    @Test fun aFailedFetchFallsBackOnTheCachedListing() {
-        catalog("FEXCore-2609-d2rfix25-linux.wcp", fetchedAt = 1)
-        store("FEXCore-2609-d2rfix25-linux.wcp")
-
-        assertEquals("FEXCore-2609-d2rfix25-linux.wcp", BattleNet.ensureFex(context) { error("offline") })
-    }
-
-    @Test fun aListingWithoutD2rfixIsAnError() {
-        catalog("FEXCore-2610-linux.wcp")
-        var refreshed = 0
-        assertThrows(IllegalStateException::class.java) { BattleNet.ensureFex(context) { refreshed++; emptyList() } }
-        assertEquals(1, refreshed)
-        assertEquals(emptyMap<String, String>(), ComponentsManager.gameComponents(context, BattleNet.APP_ID.toString()))
-    }
-
     @Test fun installedIsTheLauncherInThePrefix() {
         assertFalse(BattleNet.installed(context))
         launcher().apply { parentFile!!.mkdirs(); writeText("MZ") }
@@ -152,9 +86,9 @@ class BattleNetTest {
     }
 
     @Test fun removeTakesThePrefixItsMenuEntryAndCacheButNothingItLinksTo() {
-        catalog("FEXCore-2610-d2rfix28-linux.wcp")
-        store("FEXCore-2610-d2rfix28-linux.wcp")
-        BattleNet.ensureFex(context, ::noRefresh)
+        store("FEXCore-2610-linux.wcp")
+        ComponentsManager.setGameComponent(context, BattleNet.APP_ID.toString(), "fex", "FEXCore-2610-linux.wcp")
+        assertEquals(mapOf("fex" to "FEXCore-2610-linux.wcp"), ComponentsManager.gameComponents(context, BattleNet.APP_ID.toString()))
         val root = LinuxRuntime.rootDir(context)
         fun put(relative: String) = File(root, relative).apply { parentFile!!.mkdirs(); writeText("x") }
         launcher().apply { parentFile!!.mkdirs(); writeText("MZ") }
@@ -176,7 +110,7 @@ class BattleNetTest {
         assertTrue(otherMenu.isFile)
         assertFalse(log.parentFile!!.exists())
         assertTrue(otherPrefix.isFile)
-        assertNull(BattleNet.fexInUse(context))
+        assertEquals(emptyMap<String, String>(), ComponentsManager.gameComponents(context, BattleNet.APP_ID.toString()))
         outside.deleteRecursively()
     }
 
@@ -259,6 +193,185 @@ class BattleNetTest {
             BattleNet.hostFolder(context, "Z:/root/Games/Stores/Battle.net/Hearthstone/"))
     }
 
+    @Test fun aMappedWineDriveResolvesThroughItsLink() {
+        val devices = File(BattleNet.prefix(context), "pfx/dosdevices").apply { mkdirs() }
+        java.nio.file.Files.createSymbolicLink(File(devices, "d:").toPath(), java.nio.file.Paths.get("/root/Games/Card"))
+        java.nio.file.Files.createSymbolicLink(File(devices, "e:").toPath(), java.nio.file.Paths.get("../drive_c"))
+        assertEquals(File(LinuxRuntime.rootDir(context), "root/Games/Card/Battle.net/Hearthstone"),
+            BattleNet.hostFolder(context, "D:\\Battle.net\\Hearthstone"))
+        assertEquals(File(BattleNet.prefix(context), "pfx/drive_c/Games/X"), BattleNet.hostFolder(context, "E:\\Games\\X"))
+        assertNull(BattleNet.hostFolder(context, "F:\\Games\\X"))
+        assertNull(BattleNet.hostFolder(context, "D:\\..\\etc"))
+    }
+
+    @Test fun aDriveLinkTheNativeUserlandMadeRelativeStillResolvesInTheGuest() {
+        val root = LinuxRuntime.rootDir(context)
+        val devices = File(BattleNet.prefix(context), "pfx/dosdevices").apply { mkdirs() }
+        java.nio.file.Files.createSymbolicLink(File(devices, "d:").toPath(), java.nio.file.Paths.get("/root/Games/Card"))
+        java.nio.file.Files.createSymbolicLink(File(devices, "g:").toPath(), java.nio.file.Paths.get("../../../../../../../../../../.."))
+        NativeGuest.relinkAbsoluteSymlinks(context, root)
+        assertFalse(java.nio.file.Files.readSymbolicLink(File(devices, "d:").toPath()).isAbsolute)
+        assertEquals(File(root, "root/Games/Card/Battle.net/Hearthstone"),
+            BattleNet.hostFolder(context, "D:\\Battle.net\\Hearthstone"))
+        assertNull(BattleNet.hostFolder(context, "G:\\etc\\passwd"))
+    }
+
+    @Test fun aDriveAtTheAppDataFolderHoldingTheRuntimeListsTheGamesInside() {
+        val root = LinuxRuntime.rootDir(context)
+        val data = context.filesDir.parentFile!!
+        val pfx = File(BattleNet.prefix(context), "pfx")
+        val devices = File(pfx, "dosdevices").apply { mkdirs() }
+        java.nio.file.Files.createSymbolicLink(File(devices, "d:").toPath(), data.absoluteFile.toPath())
+        java.nio.file.Files.createSymbolicLink(File(devices, "e:").toPath(), java.nio.file.Paths.get("/root/Games/Card"))
+        val wow = File(root, "root/Games/Stores/Battle.net/World of Warcraft").apply { mkdirs() }
+        File(wow, "_forever_").mkdirs()
+        val drive = "D:/" + data.absoluteFile.toPath().relativize(wow.absoluteFile.toPath()).joinToString("/")
+        File(pfx, "drive_c/ProgramData/Battle.net/Agent").mkdirs()
+        File(pfx, "drive_c/ProgramData/Battle.net/Agent/product.db").writeBytes(message(
+            field(1, message(field(1, "wowf"), field(2, "wowf"), field(3, message(field(1, drive))))),
+        ))
+        assertEquals(wow, BattleNet.hostFolder(context, drive))
+        assertEquals(wow, BattleNet.games(context).single().folder)
+        assertEquals(File(root, "root/Games/Card/Battle.net/X"), BattleNet.hostFolder(context, "E:\\Battle.net\\X"))
+        assertNull(BattleNet.hostFolder(context, "D:\\..\\etc"))
+    }
+
+    @Test fun aDriveAtAnAliasOfTheAppDataFolderListsTheGameUnderTheRuntimePath() {
+        val root = LinuxRuntime.rootDir(context)
+        val data = context.filesDir.parentFile!!
+        val alias = File(data.parentFile, "alias-" + data.name)
+        java.nio.file.Files.createSymbolicLink(alias.toPath(), data.absoluteFile.toPath())
+        try {
+            val devices = File(BattleNet.prefix(context), "pfx/dosdevices").apply { mkdirs() }
+            java.nio.file.Files.createSymbolicLink(File(devices, "d:").toPath(), alias.absoluteFile.toPath())
+            val game = File(root, "root/Games/Stores/Battle.net/StarCraft").apply { mkdirs() }
+            val drive = "D:\\" + data.absoluteFile.toPath().relativize(game.absoluteFile.toPath()).joinToString("\\")
+            assertEquals(game.path, BattleNet.hostFolder(context, drive)?.path)
+        } finally {
+            java.nio.file.Files.delete(alias.toPath())
+        }
+    }
+
+    @Test fun wowForeverIsListedBesideRetailInTheSharedWorldOfWarcraftFolder() {
+        val pfx = File(BattleNet.prefix(context), "pfx").apply { mkdirs() }
+        val wow = File(pfx, "drive_c/Program Files (x86)/World of Warcraft").apply { mkdirs() }
+        File(wow, "_retail_").mkdirs()
+        File(wow, "_forever_").mkdirs()
+        File(pfx, "drive_c/ProgramData/Battle.net/Agent").mkdirs()
+        File(pfx, "drive_c/ProgramData/Battle.net/Agent/product.db").writeBytes(message(
+            field(1, message(field(1, "wow"), field(2, "wow"), field(3, message(field(1, "C:/Program Files (x86)/World of Warcraft"))))),
+            field(1, message(field(1, "wow_forever"), field(2, "wowf"), field(3, message(field(1, "C:/Program Files (x86)/World of Warcraft"))))),
+        ))
+        val games = BattleNet.games(context)
+        assertEquals(listOf("WoW", "WoWF"), games.map { it.code })
+        assertEquals(listOf(wow, File(wow, "_forever_")), games.map { it.folder })
+        assertEquals("World of Warcraft: Forever", games[1].name)
+        assertEquals(2, games.map { it.folder.canonicalPath }.distinct().size)
+        val shortcut = BattleNet.shortcut(context, games[1])!!
+        assertTrue(shortcut.launchOptions.endsWith("--exec=\"launch WoWF\""))
+    }
+
+    @Test fun anInstallWithAnUnknownUidIsListedByItsProductCode() {
+        val pfx = File(BattleNet.prefix(context), "pfx").apply { mkdirs() }
+        File(pfx, "drive_c/Games/World of Warcraft").mkdirs()
+        File(pfx, "drive_c/ProgramData/Battle.net/Agent").mkdirs()
+        File(pfx, "drive_c/ProgramData/Battle.net/Agent/product.db").writeBytes(message(
+            field(1, message(field(1, "wowf_live"), field(2, "wowf"), field(3, message(field(1, "C:/Games/World of Warcraft"))))),
+            field(1, message(field(1, "unknown_thing"), field(2, "nothing"), field(3, message(field(1, "C:/Games/World of Warcraft"))))),
+        ))
+        val games = BattleNet.games(context)
+        assertEquals(listOf("WoWF"), games.map { it.code })
+        assertEquals("wowf_live", games[0].installUid)
+        assertEquals("wow_forever", games[0].uid)
+        assertEquals("WoWF", BattleNet.titleForProduct("WOWF")?.code)
+        assertEquals("WTCG", BattleNet.titleForProduct("wtcg")?.code)
+        assertNull(BattleNet.titleForProduct(""))
+        assertEquals(listOf(Triple("wowf_live", "C:/Games/World of Warcraft", "wowf")),
+            BattleNet.productDbInstalls(message(field(1, message(field(1, "wowf_live"), field(2, "wowf"), field(3, message(field(1, "C:/Games/World of Warcraft")))))))!!
+                .map { Triple(it.uid, it.path, it.product) })
+    }
+
+    @Test fun aGameKeepsTheFolderItWasListedWithWhenAnotherVersionComesOrGoes() {
+        val root = File(context.filesDir, "World of Warcraft").apply { mkdirs() }
+        val retailDir = File(root, "_retail_").apply { mkdirs() }
+        val foreverDir = File(root, "_forever_").apply { mkdirs() }
+        val wow = BattleNet.title("wow")!!
+        val forever = BattleNet.title("wow_forever")!!
+        val classic = BattleNet.title("wow_classic")!!
+        assertEquals(mapOf("WoWF" to root), BattleNet.ownFolders(mapOf("WoWF" to (forever to root)), mapOf("WoWF" to null)))
+        assertEquals(mapOf("WoW" to root, "WoWF" to foreverDir),
+            BattleNet.ownFolders(linkedMapOf("WoW" to (wow to root), "WoWF" to (forever to root)), mapOf("WoW" to null, "WoWF" to null)))
+        assertEquals(mapOf("WoWF" to foreverDir), BattleNet.ownFolders(mapOf("WoWF" to (forever to root)), mapOf("WoWF" to foreverDir.path)))
+        assertEquals(mapOf("WoW" to retailDir, "WoWC" to root),
+            BattleNet.ownFolders(linkedMapOf("WoW" to (wow to root), "WoWC" to (classic to root)), mapOf("WoW" to null, "WoWC" to root.path)))
+        assertEquals(mapOf("WoW" to root, "WoWC" to root),
+            BattleNet.ownFolders(linkedMapOf("WoW" to (wow to root), "WoWC" to (classic to root)), mapOf("WoW" to null, "WoWC" to null)))
+        assertEquals(mapOf("WoWF" to root), BattleNet.ownFolders(mapOf("WoWF" to (forever to root)), mapOf("WoWF" to "/elsewhere")))
+    }
+
+    @Test fun aFolderSavedThroughAnAliasOfTheAppDataFolderIsKept() {
+        val data = context.filesDir.parentFile!!
+        val root = File(context.filesDir, "World of Warcraft").apply { mkdirs() }
+        val foreverDir = File(root, "_forever_").apply { mkdirs() }
+        val forever = BattleNet.title("wow_forever")!!
+        val alias = File(data.parentFile, "alias-" + data.name)
+        java.nio.file.Files.createSymbolicLink(alias.toPath(), data.absoluteFile.toPath())
+        try {
+            val saved = File(alias, data.absoluteFile.toPath().relativize(foreverDir.absoluteFile.toPath()).toString()).path
+            assertEquals(mapOf("WoWF" to foreverDir), BattleNet.ownFolders(mapOf("WoWF" to (forever to root)), mapOf("WoWF" to saved)))
+        } finally {
+            java.nio.file.Files.delete(alias.toPath())
+        }
+    }
+
+    @Test fun theListedFolderIsRememberedAcrossScans() {
+        val pfx = File(BattleNet.prefix(context), "pfx").apply { mkdirs() }
+        val wow = File(pfx, "drive_c/Program Files (x86)/World of Warcraft").apply { mkdirs() }
+        File(wow, "_forever_").mkdirs()
+        val db = File(pfx, "drive_c/ProgramData/Battle.net/Agent/product.db").apply { parentFile!!.mkdirs() }
+        val retail = field(1, message(field(1, "wow"), field(2, "wow"), field(3, message(field(1, "C:/Program Files (x86)/World of Warcraft")))))
+        val forever = field(1, message(field(1, "wow_forever"), field(2, "wowf"), field(3, message(field(1, "C:/Program Files (x86)/World of Warcraft")))))
+        db.writeBytes(message(retail, forever))
+        assertEquals(listOf(wow, File(wow, "_forever_")), BattleNet.games(context).map { it.folder })
+        db.writeBytes(message(forever))
+        assertEquals(listOf(File(wow, "_forever_")), BattleNet.games(context).map { it.folder })
+        db.writeBytes(message(forever, retail))
+        assertEquals(listOf(File(wow, "_forever_"), wow), BattleNet.games(context).map { it.folder })
+    }
+
+    @Test fun aGameInstalledUnderBlizzardsChineseUidIsStillListed() {
+        val pfx = File(BattleNet.prefix(context), "pfx").apply { mkdirs() }
+        File(pfx, "drive_c/ProgramData/Battle.net/Agent").mkdirs()
+        File(pfx, "drive_c/ProgramData/Battle.net/Agent/product.db").writeBytes(message(
+            field(1, message(field(1, "osic"), field(3, message(field(1, "Z:/root/Games/Stores/Battle.net/Diablo II Resurrected"))))),
+            field(1, message(field(1, "s2_cn"), field(3, message(field(1, "Z:/root/Games/Stores/Battle.net/StarCraft II"))))),
+        ))
+        for (folder in listOf("Diablo II Resurrected", "StarCraft II")) {
+            File(LinuxRuntime.rootDir(context), "root/Games/Stores/Battle.net/$folder").mkdirs()
+        }
+        val games = BattleNet.games(context)
+        assertEquals(listOf("osic", "s2_cn"), games.map { it.installUid })
+        assertEquals(listOf("osi", "s2"), games.map { it.uid })
+        assertEquals(listOf("Diablo II: Resurrected" to "OSI", "StarCraft II" to "S2"), games.map { it.name to it.code })
+        assertFalse(BattleNet.notInstalled(BattleNet.title("osi")!!, listOf("osic")))
+        assertFalse(BattleNet.notInstalled(BattleNet.title("s2")!!, games.map { it.installUid }))
+
+    }
+
+    @Test fun aScannedGamesShortcutReusesTheKeptRankingInsteadOfWalkingItsFolder() {
+        val added = com.droiddeck.launcher.frontend.AddedGames
+        val folder = File(BattleNet.prefix(context), "pfx/drive_c/Program Files (x86)/Kept Game").apply { mkdirs() }
+        File(folder, "Game.exe").writeBytes(byteArrayOf(0x4d, 0x5a))
+        val kept = File(folder, "Other.exe").apply { writeBytes(byteArrayOf(0x4d, 0x5a)) }
+        com.droiddeck.launcher.frontend.AddedGamesCache(File(context.filesDir, com.droiddeck.launcher.frontend.AddedGamesCache.FILE)).apply {
+            keepRank(folder, com.droiddeck.launcher.frontend.GameExePicker.Ranking(listOf(kept), listOf(10), false))
+            save()
+        }
+        added.scan(context)
+        assertEquals(kept, BattleNet.shortcut(context, BattleNet.Game("fenris", "Kept Game", "Fen", folder))!!.exe)
+        assertEquals("Game.exe", added.candidates(folder).first().name)
+    }
+
     @Test fun aGamesShortcutHasBattleNetLaunchItInItsPrefix() {
         val folder = File(BattleNet.prefix(context), "pfx/drive_c/Program Files (x86)/Diablo IV").apply { mkdirs() }
         File(folder, "Diablo IV Launcher.exe").writeBytes(byteArrayOf(0x4d, 0x5a))
@@ -291,12 +404,15 @@ class BattleNetTest {
         assertEquals(codes.distinct(), codes)
         assertTrue("Fen" in codes && "OSI" in codes && "WTCG" in codes)
         assertFalse(BattleNet.STORE.any { it.uid == "d3cn" || it.uid == "fen" })
+        assertFalse(BattleNet.STORE.any { it.code == "WoWC" })
+        assertEquals("wow_forever", BattleNet.STORE.first { it.code == "WoWF" }.uid)
         assertEquals("fenris", BattleNet.STORE.first { it.code == "Fen" }.uid)
         assertTrue(BattleNet.STORE.all { it.uid.matches(Regex("[a-z0-9_]{1,32}")) })
         val installed = listOf("fenris", "diablo3_enus", null)
         val offered = BattleNet.STORE.filter { BattleNet.notInstalled(it, installed) }.map { it.code }
         assertFalse("Fen" in offered || "D3" in offered)
-        assertTrue("OSI" in offered)
+        assertTrue("OSI" in offered && "WoWF" in offered)
+        assertFalse("WoWF" in BattleNet.STORE.filter { BattleNet.notInstalled(it, listOf("wow_forever")) }.map { it.code })
     }
 
     @Test fun aBattleNetGameStartsWithoutSteamThroughItsShortcutUntilThatIsSwitchedOff() {
@@ -351,6 +467,22 @@ class BattleNetTest {
         assertTrue(BattleNet.ensureVideoMemory(context))
     }
 
+    @Test fun theProfileDefaultsAreSetForTheBattleNetProgramOrOnceInstalledAndNeverForAnythingElse() {
+        File(context.filesDir, "game-environment.json").delete()
+        val manager = context.getSystemService(android.app.ActivityManager::class.java)
+        org.robolectric.Shadows.shadowOf(manager).setMemoryInfo(android.app.ActivityManager.MemoryInfo().apply { totalMem = 11113L shl 20 })
+        val scope = BattleNet.APP_ID.toString()
+        BattleNet.ensureDefaults(context, null)
+        assertNull(GameEnvironmentStore.read(context).games[scope]?.get("DXVK_CONFIG"))
+        BattleNet.ensureDefaults(context, BattleNet.PROGRAM)
+        assertEquals(BattleNet.videoMemoryOptions(2048), GameEnvironmentStore.read(context).games[scope]?.get("DXVK_CONFIG"))
+        assertTrue(com.droiddeck.launcher.session.SessionPrefs.battleNetNoSteamSet(context))
+        File(context.filesDir, "game-environment.json").delete()
+        launcher().apply { parentFile!!.mkdirs(); writeText("MZ") }
+        BattleNet.ensureDefaults(context, null)
+        assertEquals(BattleNet.videoMemoryOptions(2048), GameEnvironmentStore.read(context).games[scope]?.get("DXVK_CONFIG"))
+    }
+
     private fun launcher() = File(BattleNet.prefix(context), "pfx/drive_c/Program Files (x86)/Battle.net/Battle.net Launcher.exe")
 
     private fun varint(value: Long): ByteArray {
@@ -365,21 +497,6 @@ class BattleNetTest {
     private fun field(number: Int, text: String) = field(number, text.toByteArray())
     private fun varintField(number: Int, value: Long) = varint((number shl 3).toLong()) + varint(value)
     private fun message(vararg fields: ByteArray) = fields.fold(ByteArray(0)) { all, f -> all + f }
-
-    private fun noRefresh(context: Context): List<ComponentsManager.CatalogItem> = error("the cached listing was fresh")
-
-    private fun item(file: String, comp: String = "fex") = ComponentsManager.CatalogItem(
-        file, comp, "FexCore-Linux", "https://github.com/The412Banner/Nightlies/releases/download/FexCore-Linux/$file", 4, "sha256:" + "ab".repeat(32),
-    )
-
-    private fun catalog(vararg files: String, fetchedAt: Long = System.currentTimeMillis() / 1000) {
-        val cache = File(context.filesDir, "components/catalog.json")
-        cache.parentFile!!.mkdirs()
-        val items = JSONArray()
-        for (file in files) items.put(JSONObject().put("file", file).put("comp", "fex").put("release", "FexCore-Linux")
-            .put("url", item(file).url).put("size", 4).put("digest", item(file).digest))
-        cache.writeText(JSONObject().put("items", items).put("fetchedAt", fetchedAt).toString())
-    }
 
     private fun store(file: String) {
         val wcp = File(context.filesDir, "components/packages/$file")

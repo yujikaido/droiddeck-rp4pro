@@ -115,6 +115,7 @@ internal fun Pane(
             s.pageKey != null && page != null -> null
             selected.startsWith("app:") -> s.steamGames.firstOrNull { "app:${it.appId}" == selected }?.art
             selected == "games" -> s.steamGames.maxByOrNull { it.lastPlayed }?.art
+            selected.startsWith("sound:") -> s.soundtracks.firstOrNull { "sound:${it.appId}" == selected }?.let { it.hero ?: it.art }
             selected.startsWith("rom:") -> romFor(s, selected)?.second?.art
             else -> null
         }
@@ -124,10 +125,12 @@ internal fun Pane(
         val origins = remember { HashMap<String, Origin>() }
         val paneAt = remember { arrayOf(Offset.Zero) }
         val livePage by rememberUpdatedState(s.pageKey)
-        val railContent = if (selected.startsWith("app:")) "games" else selected
+        val railContent = if (selected.startsWith("app:")) "games" else if (selected.startsWith("sound:")) "soundtracks" else selected
         val target = if (page != null && s.pageKey != null) s.pageKey else railContent
         val gameShown = remember { arrayOf("games") }
         if (selected == "games" || selected.startsWith("app:")) gameShown[0] = selected
+        val soundShown = remember { arrayOf("soundtracks") }
+        if (selected == "soundtracks" || selected.startsWith("sound:")) soundShown[0] = selected
         val before = remember { arrayOf(target) }
         if (page != null && s.pageKey != null) {
             pages[s.pageKey] = page
@@ -171,7 +174,7 @@ internal fun Pane(
             label = "pane",
         ) { key ->
             val drawn = (if (page != null && key == s.pageKey) page else pages[key])
-                ?: { Content(s, if (key == "games") gameShown[0] else key, a, Modifier.fillMaxSize(), onSelect, onAndroidAppClick, onOpenDeveloperOptions, onRequestWirelessAdb, onPairWirelessDebugging) }
+                ?: { Content(s, if (key == "games") gameShown[0] else if (key == "soundtracks") soundShown[0] else key, a, Modifier.fillMaxSize(), onSelect, onAndroidAppClick, onOpenDeveloperOptions, onRequestWirelessAdb, onPairWirelessDebugging) }
             val hopSink by androidx.compose.animation.core.animateFloatAsState(
                 if (Hops.sinking == key) 1f else 0f, Motion.tw(260), label = "hopSink",
             )
@@ -209,6 +212,8 @@ internal fun inPane(o: Origin): Origin =
 private fun Backdrop(art: File?) {
     val colors = MaterialTheme.colorScheme
     val pal = LocalPalette.current
+    // True black keeps the page unlit: no art wash and no corner glow.
+    if (pal.id == Themes.TRUE_BLACK) return
     Crossfade(targetState = art, animationSpec = Motion.tw(700), label = "backdrop") { a ->
         if (a != null && Build.VERSION.SDK_INT >= 31) {
             Box(modifier = Modifier.fillMaxSize().alpha(0.26f).blur(70.dp)) {
@@ -246,6 +251,22 @@ private fun Content(
         }
         return
     }
+    if (selected == "downloads") {
+        DownloadsPage(s, a, modifier.padding(horizontal = padH).padding(top = padV))
+        return
+    }
+    if (selected == "storage") {
+        StorageTabPage(s, a, modifier.padding(horizontal = padH).padding(top = padV))
+        return
+    }
+    if (selected == "sync") {
+        SyncTabPage(s, modifier.padding(horizontal = padH).padding(top = padV))
+        return
+    }
+    if (selected == "decky" || selected == "boot-movies") {
+        SteamTabPage(selected, a, modifier.padding(horizontal = padH).padding(top = padV))
+        return
+    }
     if (selected == "updates") {
         UpdatesPage(s, a, modifier.padding(horizontal = padH).padding(top = padV))
         return
@@ -259,19 +280,37 @@ private fun Content(
         return
     }
     if (selected == "stores") {
-        StoresPage(s, a, modifier)
+        Box(modifier) {
+            StoresPage(s, a, Modifier.fillMaxSize())
+            ManageStoresSheet()
+        }
         return
     }
-    if (selected == "games" || selected.startsWith("app:")) {
-        LibraryPage(s, a, selected, onSelect, modifier)
+    if (selected == "games" || selected.startsWith("app:") || selected == "soundtracks" || selected.startsWith("sound:")) {
+        Box(modifier) {
+            LibraryPage(s, a, selected, onSelect, Modifier.fillMaxSize())
+            if (selected == "games") LibraryPreviewPill(Modifier.align(androidx.compose.ui.Alignment.BottomCenter).padding(bottom = 20.dp))
+            ManageStoresSheet()
+        }
         return
     }
     if (selected == "desktop") {
         DesktopPage(s, a, modifier, onSelect)
         return
     }
-    if (selected == "android-apps" && s.isHomeApp) {
-        AndroidAppsPage(s, modifier, onAndroidAppClick)
+    if (selected == NavTabs.MORE) {
+        Box(modifier) {
+            MorePage(s, a, onSelect, Modifier.padding(horizontal = padH).padding(top = padV))
+            EditTabsSheet(s, a)
+        }
+        return
+    }
+    if (selected == "agent") {
+        AgentPage(modifier.padding(horizontal = padH).padding(top = padV))
+        return
+    }
+    if (selected == "android-apps") {
+        AndroidAppsPage(s, a, modifier, onAndroidAppClick)
         return
     }
     Column(modifier = modifier.verticalScroll(rememberScrollState()).padding(horizontal = padH, vertical = padV)) {
@@ -442,7 +481,7 @@ private fun UserAppIcon(app: UserApps.App, size: Int) {
 }
 
 @Composable
-private fun UserAppsProgress() {
+internal fun UserAppsProgress() {
     val colors = MaterialTheme.colorScheme
     val working = UserAppsState.working
     Column(verticalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
@@ -479,7 +518,9 @@ private fun UserAppPage(app: UserApps.App, s: FrontEndState, a: FrontEndActions,
             Column {
                 Text(app.name, fontSize = if (narrow) 22.sp else 26.sp, fontWeight = FontWeight.Bold, color = colors.onBackground)
                 Text(
-                    (app.repo?.let { stringResource(R.string.user_apps_github_version, it, app.version.orEmpty()) } ?: stringResource(app.kind.label())) +
+                    (app.repo?.let { stringResource(R.string.user_apps_github_version, it, app.version.orEmpty()) }
+                        ?: app.version?.takeIf { app.feed != null }?.let { stringResource(R.string.user_apps_github_version, stringResource(app.kind.label()), it) }
+                        ?: stringResource(app.kind.label())) +
                         (if (app.arch == "x86_64" || app.arch == "i386") " · " + stringResource(R.string.app_fex_x86, app.arch) else ""),
                     fontSize = 14.sp, color = colors.onSurfaceVariant,
                 )
@@ -491,7 +532,7 @@ private fun UserAppPage(app: UserApps.App, s: FrontEndState, a: FrontEndActions,
             PrimaryButton(stringResource(R.string.user_apps_open, app.name), enabled = !s.busy, main = true) { a.onUserApp(app) }
             BusyChip(s)
             SecondaryButton(stringResource(R.string.user_apps_edit), enabled = UserAppsState.working == null) { editing = true }
-            if (app.repo != null) UpdateButton(app, s)
+            if (app.updatable) UpdateButton(app, s)
             RemoveAppButton(app, enabled = !s.busy && !s.sessionRunning && UserAppsState.working == null) {
                 UserAppsState.remove(ctx, app); onSelect("desktop")
             }

@@ -1,22 +1,4 @@
 #!/usr/bin/python3
-"""The guest side of the agent bridge (docs/agent-control.md).
-
-Started by droiddeck-session inside the session, so whatever it runs has the session's own
-environment: DISPLAY, the games' Xwayland, XDG_RUNTIME_DIR, and the preloads every guest process
-gets - which is what lets it reach the Steam client's DevTools port, open to guest processes only.
-
-The app talks to it through files under $BL_LAUNCH_DIR/agent (the session root, the same path on
-both sides):
-
-    req/<id>.json    a request the app wrote (tmp + rename)
-    resp/<id>.json   the answer, written the same way
-    hello.json       this daemon is up: pid, version, what it can do
-    focus.json       gamescope's focus and every server's top-level windows, rewritten on change
-    cdp-port         the client's DevTools port, written by droiddeck-session
-
-Requests: ping, exec, focus, cdp, quit. Each answer is {"ok": true, ...} or
-{"ok": false, "error": {"code", "message"}}.
-"""
 
 import base64
 import json
@@ -72,7 +54,6 @@ class AgentError(Exception):
 
 
 class X:
-    """One connection to an Xwayland server. The rootfs has xprop but no python X library."""
 
     def __init__(self, display):
         num = display.lstrip(":").split(".")[0]
@@ -116,7 +97,6 @@ class X:
         return buf
 
     def request(self, data):
-        """Send one request and return its reply, or None for an X error (a window that went)."""
         self.s.sendall(data)
         while True:
             head = self._read(32)
@@ -186,7 +166,6 @@ class X:
 
 
 def windows(x):
-    """Top-level windows that are mapped or carry an app id: what gamescope picks focus from."""
     out = []
     for win in x.children(x.root):
         attrs = x.attributes(win)
@@ -230,9 +209,6 @@ def displays():
 
 
 def focus_snapshot():
-    """gamescope's focus as Steam sees it (root properties on the client's server) and every
-    server's windows. GAMESCOPE_FOCUSABLE_WINDOWS is the list the client orders the base layer
-    from: a game missing there stays behind the client however healthy its window looks."""
     shown = displays()
     if not shown:
         raise AgentError("NO_DISPLAY", "This session has no X display")
@@ -307,7 +283,7 @@ def sandboxed_apps(proc=Path("/proc")):
 def window_steam_app(win, flatpaks, proc=Path("/proc")):
     match = STEAM_APP_CLASS.match(win.get("class") or "")
     if match:
-        return match.group(1) if os.environ.get("BL_STEAM_CLIENT_ARCH") == "x86_64" else None
+        return match.group(1) if os.environ.get("DD_STEAM_CLIENT_ARCH") == "x86_64" else None
     pid = win.get("pid")
     if pid:
         if under_reaper(pid, proc):
@@ -349,7 +325,6 @@ def tag_game_windows(snap, proc=Path("/proc")):
 
 
 def vr_scene_app(path=Path('/run/droiddeck/droiddeck-steamvr/scene-focus.json'), proc=Path('/proc')):
-    """Only a live SteamVR scene with its dashboard hidden may claim game focus."""
     try:
         state = json.loads(path.read_text())
         server, scene = int(state['serverPid']), int(state['scenePid'])
@@ -385,8 +360,6 @@ class VrSceneFocus:
 
 
 class FocusWatcher(threading.Thread):
-    """Rewrites focus.json when gamescope's focus properties change, and every few seconds when
-    the windows do (a window can change without any root property moving)."""
 
     def __init__(self, path):
         super().__init__(daemon=True, name="focus")
@@ -418,18 +391,26 @@ class FocusWatcher(threading.Thread):
                         x.close()
             except (OSError, AgentError) as e:
                 log("focus snapshot failed: %s" % e)
+                self.publish({})
                 time.sleep(2)
                 continue
             if tag_game_windows(snap):
                 self.changed.set()
                 continue
-            body = {k: v for k, v in snap.items() if k != "t"}
-            if body == self.last:
-                continue
-            self.last = body
-            self.seq += 1
-            snap["seq"] = self.seq
-            write_json(self.path, snap)
+            self.publish(snap)
+
+    def publish(self, snap):
+        body = {k: v for k, v in snap.items() if k != "t"}
+        if body == self.last:
+            return
+        try:
+            write_json(self.path, dict(snap, seq=self.seq + 1))
+        except OSError as e:
+            log("focus publication failed: %s" % e)
+            self.changed.set()
+            return
+        self.seq += 1
+        self.last = body
 
     def listen(self):
         while True:
@@ -450,9 +431,8 @@ class FocusWatcher(threading.Thread):
 
 
 class WebSocket:
-    """A minimal RFC 6455 client: text frames out, text frames in. Enough for CDP."""
 
-    def __init__(self, url, timeout):
+    def __init__(self, url, timeout, bounded=False):
         target = urllib.parse.urlsplit(url)
         if (target.scheme != "ws" or target.hostname not in ("127.0.0.1", "::1", "localhost")
                 or target.username is not None or target.password is not None or target.fragment):
@@ -462,6 +442,7 @@ class WebSocket:
         if target.query:
             path += "?" + target.query
         host = "127.0.0.1" if target.hostname == "localhost" else target.hostname
+        self.deadline = time.monotonic() + timeout if bounded else None
         self.s = socket.create_connection((host, target.port or 80), timeout=timeout)
         try:
             self._handshake(path, hostport)
@@ -477,6 +458,7 @@ class WebSocket:
         ).encode())
         head = b""
         while b"\r\n\r\n" not in head:
+            self._wait()
             chunk = self.s.recv(4096)
             if not chunk:
                 raise OSError("DevTools closed the connection during the handshake")
@@ -488,8 +470,17 @@ class WebSocket:
             raise OSError("DevTools refused the WebSocket: " + status.decode(errors="replace"))
         self.buffer = head.split(b"\r\n\r\n", 1)[1]
 
+    def _wait(self):
+        if self.deadline is None:
+            return
+        left = self.deadline - time.monotonic()
+        if left <= 0:
+            raise socket.timeout("DevTools did not answer in time")
+        self.s.settimeout(left)
+
     def _read(self, n):
         while len(self.buffer) < n:
+            self._wait()
             chunk = self.s.recv(65536)
             if not chunk:
                 raise OSError("DevTools closed the connection")
@@ -549,7 +540,7 @@ def cdp_port(agent_dir):
     try:
         port = (agent_dir / "cdp-port").read_text().strip()
     except OSError:
-        port = os.environ.get("BL_CDP_PORT", "")
+        port = os.environ.get("DD_CDP_PORT", "")
     if not port.isdigit():
         raise AgentError("NO_DEVTOOLS", "The Steam client's DevTools port is not known (no Steam client in this session yet)")
     return int(port)
@@ -567,22 +558,51 @@ def cdp_targets(agent_dir, timeout=5):
         raise AgentError("DEVTOOLS_UNREACHABLE", "Could not reach the client's DevTools at %s: %s" % (url, e))
 
 
-def cdp_eval(agent_dir, expression, target=None, await_promise=True, timeout=15):
-    targets = [t for t in cdp_targets(agent_dir) if t.get("webSocketDebuggerUrl")]
-    want = target or "SharedJSContext"
-    match = [t for t in targets if want in (t.get("title") or "") or want in (t.get("url") or "")]
-    if not match:
-        names = ", ".join(sorted({t.get("title") or t.get("url") or "?" for t in targets}))
-        raise AgentError("NO_TARGET", "No DevTools target matches '%s' (have: %s)" % (want, names))
-    ws = WebSocket(match[0]["webSocketDebuggerUrl"], timeout)
+INSPECTOR_URL = re.compile(r"ws://127\.0\.0\.1:([0-9]{4,5})/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+def inspector_url(url):
+    found = INSPECTOR_URL.fullmatch(url) if isinstance(url, str) else None
+    if not found or not 1024 <= int(found.group(1)) <= 65535:
+        raise AgentError("INVALID_REQUEST", "inspector must be a ws://127.0.0.1 inspector URL with its session id")
+    return url
+
+
+def cdp_eval(agent_dir, expression, target=None, await_promise=True, timeout=15, inspector=None,
+             command_line_api=False):
+    if inspector is not None:
+        url, name = inspector_url(inspector), "inspector"
+    else:
+        targets = [t for t in cdp_targets(agent_dir) if t.get("webSocketDebuggerUrl")]
+        want = target or "SharedJSContext"
+        match = [t for t in targets if want in (t.get("title") or "") or want in (t.get("url") or "")]
+        if not match:
+            names = ", ".join(sorted({t.get("title") or t.get("url") or "?" for t in targets}))
+            raise AgentError("NO_TARGET", "No DevTools target matches '%s' (have: %s)" % (want, names))
+        url, name = match[0]["webSocketDebuggerUrl"], match[0].get("title")
     try:
-        ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate", "params": {
-            "expression": expression, "returnByValue": True, "awaitPromise": await_promise,
-            "userGesture": True,
-        }}))
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            message = json.loads(ws.recv())
+        ws = WebSocket(url, timeout, bounded=True)
+    except socket.timeout:
+        raise AgentError("TIMEOUT", "No answer from DevTools in %ss" % timeout)
+    except OSError as e:
+        raise AgentError("DEVTOOLS_UNREACHABLE", "Could not reach DevTools: %s" % e)
+    try:
+        try:
+            ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate", "params": {
+                "expression": expression, "returnByValue": True, "awaitPromise": await_promise,
+                "userGesture": True, "includeCommandLineAPI": command_line_api,
+            }}))
+        except socket.timeout:
+            raise AgentError("TIMEOUT", "No answer from DevTools in %ss" % timeout)
+        except OSError as e:
+            raise AgentError("DEVTOOLS_UNREACHABLE", "DevTools went away: %s" % e)
+        while True:
+            try:
+                message = json.loads(ws.recv())
+            except socket.timeout:
+                raise AgentError("TIMEOUT", "No answer from DevTools in %ss" % timeout)
+            except OSError as e:
+                raise AgentError("DEVTOOLS_UNREACHABLE", "DevTools went away: %s" % e)
             if message.get("id") != 1:
                 continue
             if "error" in message:
@@ -593,9 +613,8 @@ def cdp_eval(agent_dir, expression, target=None, await_promise=True, timeout=15)
                 text = (details.get("exception") or {}).get("description") or details.get("text") or "exception"
                 raise AgentError("JS_EXCEPTION", text)
             value = result.get("result", {})
-            return {"target": match[0].get("title"), "type": value.get("type"),
+            return {"target": name, "type": value.get("type"),
                     "value": value.get("value"), "description": value.get("description")}
-        raise AgentError("TIMEOUT", "No answer from DevTools in %ss" % timeout)
     finally:
         ws.close()
 
@@ -887,11 +906,6 @@ def steam_selection(agent_dir, timeout=5):
 
 
 def steam_shortcut_app_id(game_id):
-    """Return the 32-bit app id in Steam's shortcut CGameID form, or None for other ids.
-
-    DroidDeck's shortcut IDs are `(appid << 32) | 0x02000000`. The URL still needs that full
-    CGameID for RunGame; the app-details API separately needs the unsigned 32-bit app id.
-    """
     if not isinstance(game_id, str) or not game_id.isascii() or not game_id.isdigit():
         return None
     try:
@@ -907,7 +921,6 @@ def steam_shortcut_app_id(game_id):
 
 
 def wait_for_steam_shortcut_overview(agent_dir, game_id, timeout=45):
-    """Wait until Steam can map a shortcut CGameID to its 32-bit app overview."""
     app_id = steam_shortcut_app_id(game_id)
     if app_id is None:
         return {"supported": False, "ready": False}
@@ -961,9 +974,34 @@ def steam_shortcut_state(agent_dir, game_id, timeout=6):
         time.sleep(min(0.5, max(0, deadline - time.monotonic())))
 
 
+def steam_ready(agent_dir):
+    expression = """(() => {
+        const store = globalThis.appStore;
+        return !!store?.m_bIsInitialized && typeof globalThis.SteamClient?.Apps?.ContinueGameAction === 'function';
+    })()"""
+    return cdp_eval(agent_dir, expression, await_promise=False, timeout=3).get("value") is True
+
+
+def steam_clear_pending_interstitial(agent_dir, app_id):
+    if not isinstance(app_id, str) or not app_id.isascii() or not app_id.isdigit() or int(app_id) <= 0:
+        raise AgentError("INVALID_APP_ID", "appId must be a positive decimal Steam app id")
+    expression = """(async () => {
+        const apps = globalThis.SteamClient?.Apps;
+        if (typeof apps?.GetActiveGameActions !== 'function' || typeof apps.ContinueGameAction !== 'function') return false;
+        const active = await apps.GetActiveGameActions() || [];
+        for (const action of active) {
+            const appid = String(action?.strAppID ?? action?.gameid ?? action?.nAppID ?? '');
+            if (appid === %s && action?.strTaskName === 'ShowInterstitials') {
+                apps.ContinueGameAction(action.nGameActionID, appid, 'ShowInterstitials');
+                return true;
+            }
+        }
+        return false;
+    })()""" % json.dumps(app_id)
+    return cdp_eval(agent_dir, expression, timeout=3).get("value") is True
+
+
 def game_pids(app_id):
-    """Our processes started for this Steam app (Steam sets SteamAppId / SteamGameId in their
-    environment, and Proton's wine processes inherit it)."""
     wanted = [("SteamAppId=%s" % app_id).encode(), ("SteamGameId=%s" % app_id).encode()]
     me = os.getpid()
     pids = []
@@ -1022,8 +1060,6 @@ VR_ACTIONS = ("status", "install", "start", "stop")
 
 
 def steamvr(req):
-    """Cardboard mode's SteamVR: a fixed helper with four actions, unlike exec (no command line from
-    the request). install downloads 571 MB, so it runs detached and status reports it."""
     action = req.get("action", "status")
     if action not in VR_ACTIONS:
         raise AgentError("INVALID_REQUEST", "vr action must be one of " + ", ".join(VR_ACTIONS))
@@ -1160,7 +1196,7 @@ def handle(agent_dir, req):
         if not isinstance(expression, str) or not expression:
             raise AgentError("INVALID_REQUEST", "cdp eval needs an expression")
         return cdp_eval(agent_dir, expression, req.get("target"), bool(req.get("awaitPromise", True)),
-                        request_timeout(req, 15))
+                        request_timeout(req, 15), req.get("inspector"), req.get("commandLineApi") is True)
     if kind == "steam-selection":
         return steam_selection(agent_dir, request_timeout(req, 5))
     if kind == "quit":
@@ -1168,6 +1204,15 @@ def handle(agent_dir, req):
     if kind == "vr":
         return steamvr(req)
     raise AgentError("UNKNOWN_REQUEST", "Unknown agent request '%s'" % kind)
+
+
+def reply(agent_dir, req):
+    try:
+        return dict(handle(agent_dir, req), ok=True)
+    except AgentError as e:
+        return {"ok": False, "error": {"code": e.code, "message": str(e)}}
+    except Exception as e:
+        return {"ok": False, "error": {"code": "AGENT_FAILED", "message": "%s: %s" % (type(e).__name__, e)}}
 
 
 def answer(agent_dir, path):
@@ -1189,12 +1234,7 @@ def answer(agent_dir, path):
         except OSError:
             pass
     if req is not None:
-        try:
-            result = dict(handle(agent_dir, req), ok=True)
-        except AgentError as e:
-            result = {"ok": False, "error": {"code": e.code, "message": str(e)}}
-        except Exception as e:
-            result = {"ok": False, "error": {"code": "AGENT_FAILED", "message": "%s: %s" % (type(e).__name__, e)}}
+        result = reply(agent_dir, req)
     write_json(agent_dir / "resp" / (rid + ".json"), result)
 
 
@@ -1221,9 +1261,16 @@ def serve(agent_dir, focus=True, poll=0.1):
 
 
 def main(argv):
-    base = os.environ.get("BL_LAUNCH_DIR")
+    if argv and argv[0] == "--cdp-inspector":
+        if len(argv) != 4:
+            print("usage: droiddeck-agent --cdp-inspector <inspector url> <seconds> <expression>", file=sys.stderr)
+            return 2
+        print(json.dumps(reply(Path("/"), {"kind": "cdp", "inspector": argv[1], "timeout": argv[2],
+                                            "expression": argv[3], "commandLineApi": True})))
+        return 0
+    base = os.environ.get("DD_LAUNCH_DIR")
     if not base:
-        print("BL_LAUNCH_DIR is not set", file=sys.stderr)
+        print("DD_LAUNCH_DIR is not set", file=sys.stderr)
         return 2
     if argv and argv[0] == "--wait-steam-shortcut-overview":
         if len(argv) not in (2, 3):
@@ -1244,11 +1291,10 @@ def main(argv):
         if len(argv) != 2 or not argv[1].isascii() or not argv[1].isdecimal():
             print("usage: droiddeck-agent --steam-supports-vr <appid>", file=sys.stderr)
             return 2
-        # Optional-VR games (Thumper, VRChat) carry vr_supported without vr_only.
         expression = ("(o => o ? (o.vr_supported === true || o.vr_only === true) : null)"
                       "(window.appStore?.GetAppOverviewByGameID?.(%s))" % json.dumps(argv[1]))
         value = None
-        deadline = time.monotonic() + 12  # Steam's UI is busiest while a game starts.
+        deadline = time.monotonic() + 12
         while value is None and time.monotonic() < deadline:
             try:
                 value = cdp_eval(Path(base) / "agent", expression, await_promise=False, timeout=8).get("value")
@@ -1300,6 +1346,19 @@ def main(argv):
             return 1
         print(state)
         return {"ready": 0, "missing": 4, "not-shortcut": 3}.get(state, 1)
+    if argv and argv[0] == "--steam-ready":
+        try:
+            return 0 if steam_ready(Path(base) / "agent") else 1
+        except (AgentError, OSError, ValueError):
+            return 1
+    if argv and argv[0] == "--steam-clear-pending-interstitial":
+        if len(argv) != 2:
+            print("usage: droiddeck-agent --steam-clear-pending-interstitial <appid>", file=sys.stderr)
+            return 2
+        try:
+            return 0 if steam_clear_pending_interstitial(Path(base) / "agent", argv[1]) else 1
+        except (AgentError, OSError, ValueError):
+            return 1
     serve(Path(base) / "agent", focus="--no-focus" not in argv)
     return 0
 

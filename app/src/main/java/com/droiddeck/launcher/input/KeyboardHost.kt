@@ -26,6 +26,8 @@ class KeyboardHost(
     var imeShowing = false
         private set
     var onImeChanged: ((Boolean) -> Unit)? = null
+    val hideMeansDismissal: Boolean
+        get() = Build.VERSION.SDK_INT < Build.VERSION_CODES.R || (shown && imeShowing)
 
     init {
         isFocusable = false
@@ -89,21 +91,31 @@ class KeyboardHost(
         clearFocus()
     }
 
+    fun type(text: CharSequence?) {
+        if (text.isNullOrEmpty()) return
+        val events = map.getEvents(text.toString().toCharArray())
+        if (events != null) {
+            for (event in events) sendKeyEvent(event)
+        } else {
+            for (ch in text) {
+                val t = System.currentTimeMillis()
+                val down = KeyEvent(t, t, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_UNKNOWN, 0, 0,
+                    KeyCharacterMap.VIRTUAL_KEYBOARD, 0, 0, 0)
+                sendKeyEvent(CharKeyEvent(down, ch))
+                sendKeyEvent(CharKeyEvent(KeyEvent.changeAction(down, KeyEvent.ACTION_UP), ch))
+            }
+        }
+    }
+
+    fun tap(keyCode: Int) {
+        val t = System.currentTimeMillis()
+        sendKeyEvent(KeyEvent(t, t, KeyEvent.ACTION_DOWN, keyCode, 0))
+        sendKeyEvent(KeyEvent(t, t, KeyEvent.ACTION_UP, keyCode, 0))
+    }
+
     private inner class KeyConnection : BaseInputConnection(this, false) {
         override fun commitText(text: CharSequence?, newCursorPosition: Int): Boolean {
-            if (text.isNullOrEmpty()) return true
-            val events = map.getEvents(text.toString().toCharArray())
-            if (events != null) {
-                for (event in events) sendKeyEvent(event)
-            } else {
-                for (ch in text) {
-                    val t = System.currentTimeMillis()
-                    val down = KeyEvent(t, t, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_UNKNOWN, 0, 0,
-                        KeyCharacterMap.VIRTUAL_KEYBOARD, 0, 0, 0)
-                    sendKeyEvent(CharKeyEvent(down, ch))
-                    sendKeyEvent(CharKeyEvent(KeyEvent.changeAction(down, KeyEvent.ACTION_UP), ch))
-                }
-            }
+            type(text)
             return true
         }
 
@@ -121,12 +133,6 @@ class KeyboardHost(
         override fun performEditorAction(actionCode: Int): Boolean {
             tap(KeyEvent.KEYCODE_ENTER)
             return true
-        }
-
-        private fun tap(keyCode: Int) {
-            val t = System.currentTimeMillis()
-            sendKeyEvent(KeyEvent(t, t, KeyEvent.ACTION_DOWN, keyCode, 0))
-            sendKeyEvent(KeyEvent(t, t, KeyEvent.ACTION_UP, keyCode, 0))
         }
 
         override fun getTextBeforeCursor(n: Int, flags: Int): CharSequence = ""

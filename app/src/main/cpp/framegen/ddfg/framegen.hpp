@@ -16,7 +16,6 @@ public:
                 uint32_t synthSlot = 0, bool reuseFlow = false);
     void destroy();
     bool valid() const { return device_ != VK_NULL_HANDLE && ready_; }
-    bool scratchFailed() const { return scratchFailed_; }
     const Config& config() const { return cfg_; }
 
     struct Img { VkImage image = VK_NULL_HANDLE; VkDeviceMemory mem = VK_NULL_HANDLE;
@@ -78,7 +77,6 @@ private:
     Config    cfg_;
     VkExtent2D extent_{};
     bool ready_ = false;
-    bool scratchFailed_ = false;  // the per-size descriptor sets could not be made: generation stays off
     int  flowFinest_ = kFlowFinestDefault;
 
     Pipe pLuma_, pDown_, pFlow_, pFlowM4_, pExpand_, pExpandM4_, pSynth_;

@@ -53,15 +53,7 @@ object SecondaryLibrary {
 
     val CARD_GUESTS = listOf("/mnt/droiddeck-sd", "/mnt/bannerlator-sd")
 
-    /** One migration at a time per process. Each copies through a shared `<target>.migrating` folder; two session
-     * starts at once deleted each other's stage mid-copy (NoSuchFileException), and the newer session
-     * fell back to internal storage only. The second caller now waits for the copy and finds it done. */
-    private val migrationLock = Any()
-
-    fun binds(files: File, library: File, guests: List<String> = CARD_GUESTS, content: File = library): List<String> =
-        synchronized(migrationLock) { bindsLocked(files, library, guests, content) }
-
-    private fun bindsLocked(files: File, library: File, guests: List<String>, content: File): List<String> {
+    fun binds(files: File, library: File, guests: List<String> = CARD_GUESTS, content: File = library): List<String> {
         val private = privateRoot(files, library)
         val apps = File(library, "steamapps")
         val tools = LinkedHashMap(bootstrapTools)

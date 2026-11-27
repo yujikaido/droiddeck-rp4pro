@@ -52,8 +52,8 @@ object DeviceInfo {
     })
 
     private fun gpu(context: Context, gpu: GpuInfo) = Section("GPU", buildList<Pair<String, String>> {
-        add("GPU", gpu.displayName(context))
-        add("Family", gpu.family.label)
+        add("GPU", gpu.name)
+        add("Family", gpu.family.label(gpu.name))
         add("Model found from", when (gpu.modelSource) {
             "kernel" -> "the kernel's GPU name"
             "vulkan" -> "the Vulkan driver (the kernel's name has no model)"
@@ -66,7 +66,7 @@ object DeviceInfo {
         add("Clock range", gpuRange())
         add("Load", read("$kgsl/gpu_busy_percentage")?.let { if (it.endsWith("%")) it else "$it %" })
         add("Temperature", read("$kgsl/temp")?.toLongOrNull()?.let { if (it > 1000) "${it / 1000} °C" else "$it °C" })
-        add("Support", gpu.supportText(com.droiddeck.launcher.core.DeviceSupport.vkBridge(context), com.droiddeck.launcher.core.DeviceSupport.mali()))
+        add("Support", gpu.supportText(SessionPrefs.vkBridge(context)))
     })
 
     private fun cpu() = Section("CPU", buildList<Pair<String, String>> {
@@ -87,20 +87,10 @@ object DeviceInfo {
     private fun ghz(khz: Long) = String.format(Locale.US, "%.2f GHz", khz / 1e6)
 
     private fun gpuRange(): String? {
-        fun mhz(hz: Long) = "${hz / 1_000_000} MHz"
-        val kgsl = read("/sys/class/kgsl/kgsl-3d0/gpu_available_frequencies")
-            ?.split(Regex("\\s+"))?.mapNotNull { it.toLongOrNull() }?.filter { it > 0 }.orEmpty()
-        if (kgsl.isNotEmpty()) return "${mhz(kgsl.min())}–${mhz(kgsl.max())} (${kgsl.size} steps)"
-        read("/sys/class/kgsl/kgsl-3d0/max_gpuclk")?.toLongOrNull()?.let { return "up to ${mhz(it)}" }
-        val node = File("/sys/class/devfreq").listFiles()?.firstOrNull { f ->
-            val n = f.name.lowercase()
-            (n.contains("gpu") || n.contains("mali") || n.contains("kgsl-3d")) && listOf("bus", "bw", "memlat").none { n.contains(it) }
-        } ?: return null
-        val steps = read("${node.path}/available_frequencies")?.split(Regex("\\s+"))?.mapNotNull { it.toLongOrNull() }?.filter { it > 0 }.orEmpty()
-        if (steps.isNotEmpty()) return "${mhz(steps.min())}–${mhz(steps.max())} (${steps.size} steps)"
-        val min = read("${node.path}/min_freq")?.toLongOrNull()
-        val max = read("${node.path}/max_freq")?.toLongOrNull() ?: return null
-        return (if (min != null) "${mhz(min)}–" else "up to ") + mhz(max)
+        GpuLimits.first(GpuLimits.stepSources())?.mhz?.let { return "${it.first()} MHz–${it.last()} MHz (${it.size} steps)" }
+        val max = GpuLimits.first(GpuLimits.maxSources())?.mhz?.last() ?: return null
+        val min = GpuLimits.first(GpuLimits.minSources())?.mhz?.first()
+        return (if (min != null) "$min MHz–" else "up to ") + "$max MHz"
     }
 
     private fun memory(context: Context) = Section("Memory", buildList<Pair<String, String>> {
@@ -145,11 +135,27 @@ object DeviceInfo {
     private fun drivers(context: Context, gpu: GpuInfo) = Section("Drivers DroidDeck uses", buildList<Pair<String, String>> {
         add("Driver mode", SessionPrefs.gpuDriverMode(context))
         val turnip = TurnipDriver(context)
-        val choice = SessionPrefs.androidDriver(context).ifEmpty { turnip.autoId() }
-        add("Display driver", "${turnip.displayName(choice)} ${turnip.driverVersion(choice)}".trim())
+        val choice = turnip.effectiveId()
+        val powerVr = gpu.family == GpuInfo.Family.POWERVR
+        add("Display driver", if (choice == "system") builtinDriverLabel(powerVr, runtime = false)
+            else "${turnip.displayName(choice)} ${turnip.driverVersion(choice)}".trim())
         val linux = LinuxVulkanDriverManager(context)
         val id = SessionPrefs.linuxDriver(context)
-        add("Game driver", if (id.isEmpty()) "the runtime's own Turnip" else "${linux.getDriverName(id)} ${linux.getDriverVersion(id)}".trim())
+        add("Game driver", hostRoute(context) ?: if (id.isEmpty()) builtinDriverLabel(powerVr, runtime = true) else "${linux.getDriverName(id)} ${linux.getDriverVersion(id)}".trim())
         if (gpu.oneUi8Gen2) add("Note", "One UI on an 8 Gen 2: needs the OneUI Turnip build")
     })
+
+    internal fun hostRoute(context: Context): String? = when {
+        com.droiddeck.launcher.session.VenusComponent.wanted(context) -> "Mali (Venus)"
+        com.droiddeck.launcher.core.DeviceSupport.vkBridge(context) -> "the Mali bridge"
+        else -> null
+    }
+
+    /** Shared by the device card and the session report, which are written in English. */
+    internal fun builtinDriverLabel(powerVr: Boolean, runtime: Boolean): String = when {
+        powerVr -> "System PowerVR"
+        runtime -> "the runtime's own Turnip"
+        else -> "System Vulkan"
+    }
+
 }

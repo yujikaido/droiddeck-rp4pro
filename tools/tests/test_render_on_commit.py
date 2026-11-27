@@ -26,7 +26,7 @@ static struct wl_event_source *g_render_idle, *g_fallback_timer;
 static int g_fallback_armed, g_dirty, g_hud_fresh, framegen;
 static void *g_hud_surface;
 static int64_t g_dirty_since_ns, g_last_vsync_ns, g_tick_vsync_ns, g_hud_last_ns, g_rendered_tick_ns;
-static int g_tick_held;
+static int g_tick_held, g_tick_spare, g_scene_queues;
 static int64_t g_hold_missed_ns;
 #define HOLD_RETRY_NS 1000000000LL
 static int64_t g_refresh_ns = 16666667;
@@ -36,10 +36,7 @@ volatile int g_fps_limit;
 static int64_t g_scene_due_ns;
 static atomic_int g_stream_on;
 static struct { unsigned ticks, ticks_late_2ms, commit_renders; int64_t tick_late_ns, tick_late_max_ns; } g_pace;
-static struct { unsigned ticks, held; } g_perf;
-static int frames_fired;
-static void fire_all_frames(void) { frames_fired++; }
-static int wl_display_flush_clients(void *display) { return 0; }
+static struct { unsigned ticks; } g_perf;
 static int64_t now_ns(void) { return clock_ns; }
 static void *wl_display_get_event_loop(void *display) { return display; }
 static struct wl_event_source *wl_event_loop_add_idle(void *loop, void (*func)(void *), void *data) {
@@ -54,6 +51,19 @@ static int vkp_cardboard_pose_changed(void) { return pose_changes; }
 static void render_scene(void) { renders++; g_dirty = 0; g_dirty_since_ns = 0; g_rendered_tick_ns = g_tick_vsync_ns; g_tick_held = 0; }
 static int on_fallback_timer(void *data) { return 0; }
 static void on_commit_idle(void *data);
+volatile int g_bfi;
+volatile int g_bfi_picture_hold;
+static int g_bfi_running, g_scene_layer_only, cardboard, quest, blacks;
+static unsigned g_bfi_phase;
+static const char *g_bfi_blocked;
+static struct { unsigned lit, dark, failed; } g_bfi_stats;
+static int g_scene_w, g_scene_h;
+#define BFI_MIN_REFRESH_MHZ 99000
+static atomic_int g_output_refresh_mhz = 144000;
+static int vkp_cardboard_active(void) { return cardboard; }
+static int vkp_quest_layer_presentation(void) { return quest; }
+static int vkp_render_plain(int w, int h) { blacks++; return 0; }
+static void droiddeck_log(const char *tag, const char *fmt, ...) {}
 '''
 
 CHECKS = r'''
@@ -189,34 +199,70 @@ int main(void) {
         assert(renders - r0 == c + 1);
     }
 
+    /* black frame insertion alternates the scene and black on every tick, and arrivals draw nothing */
+    {
+        const int idles_before = idles_added;
+        const int b0 = blacks;
+        g_bfi = 1;
+        r0 = renders;
+        for (int i = 0; i < 10; i++) {
+            arrive(1 * ms);
+            tick(t += refresh);
+        }
+        assert(g_bfi_running == 1 && idles_added == idles_before);
+        assert(renders - r0 == 5 && blacks - b0 == 5 && g_bfi_stats.lit == 5 && g_bfi_stats.dark == 5);
+
+        /* a capture's picture hold presents only pictures and keeps BFI composing the scene */
+        g_bfi_picture_hold = 1;
+        r0 = renders;
+        const int hb = blacks;
+        for (int i = 0; i < 4; i++) tick(t += refresh);
+        assert(g_bfi_running == 1 && renders - r0 == 4 && blacks == hb);
+        g_bfi_picture_hold = 0;
+        r0 = renders;
+        for (int i = 0; i < 4; i++) tick(t += refresh);
+        assert(renders - r0 == 2 && blacks - hb == 2);
+
+        /* frame generation, a slow screen or a layer-only game make it wait and the tick draws as before */
+        framegen = 1;
+        tick(t += refresh);
+        assert(g_bfi_running == 0 && g_bfi_blocked != NULL);
+        framegen = 0;
+        tick(t += refresh);
+        assert(g_bfi_running == 1);
+        g_output_refresh_mhz = 60000;
+        tick(t += refresh);
+        assert(g_bfi_running == 0);
+        g_output_refresh_mhz = 144000;
+        tick(t += refresh);
+        assert(g_bfi_running == 1);
+        /* late ticks under load do not switch it off while the panel runs fast */
+        g_refresh_ns = 16666667;
+        tick(t += refresh);
+        assert(g_bfi_running == 1);
+        g_refresh_ns = refresh;
+        g_scene_layer_only = 1;
+        tick(t += refresh);
+        assert(g_bfi_running == 0);
+        g_scene_layer_only = 0;
+        g_bfi = 0;
+        tick(t += refresh);
+        assert(g_bfi_running == 0 && g_bfi_blocked == NULL);
+    }
+
     /* without screen ticks the fallback timer still draws */
     clock_ns += 200000000LL;
     schedule_render();
     assert(idles_added == idles && g_fallback_armed == 1 && timers_armed == 1);
-
-    /* Steam's overlay plane up and the game's frame not in yet: the tick holds the scene for the game's
-       frame (one scene per game frame) and still sends every program its frame callback */
-    tick(t += refresh);
-    run_idle();
-    r0 = renders;
-    g_hud_surface = &g_display_storage; g_hud_fresh = 0; g_hud_last_ns = clock_ns;
-    arrive(1 * ms);
-    run_idle();
-    assert(renders == r0);
-    for (int i = 0; i < 3; i++) tick(t += refresh);
-    assert(renders == r0 && g_perf.held >= 1 && frames_fired >= 1);
-    /* the game's frame arrives: drawn */
-    g_hud_fresh = 1;
-    tick(t += refresh);
-    assert(renders == r0 + 1);
-    /* a window change at the tick draws at once even while the overlay waits */
-    g_hud_fresh = 0; g_hud_last_ns = clock_ns;
-    arrive(1 * ms);
-    window_requests = 1;
-    tick(t += refresh);
-    window_requests = 0;
-    assert(renders == r0 + 2);
-    g_hud_surface = NULL;
+    g_rendered_tick_ns = g_tick_vsync_ns;
+    g_tick_spare = 0; g_scene_queues = 1;
+    assert(!tick_takes_scene());
+    g_tick_spare = 1;
+    assert(tick_takes_scene());
+    g_scene_queues = 0;
+    assert(!tick_takes_scene());
+    g_rendered_tick_ns = g_tick_vsync_ns - 1;
+    assert(tick_takes_scene());
     puts("PASS");
     return 0;
 }
@@ -233,7 +279,8 @@ class RenderOnCommitTest(unittest.TestCase):
         render = extract_function(source, 'render_scene')
         self.assertIn('g_rendered_tick_ns = g_tick_vsync_ns;', render)
         self.assertIn('g_tick_held = 0;', render)
-        functions = ('scene_held_for_limit', 'commit_renders_on', 'render_on_commit', 'schedule_render', 'scene_waits_for_game', 'on_commit_idle', 'on_vsync')
+        functions = ('scene_held_for_limit', 'commit_renders_on', 'tick_takes_scene', 'render_on_commit', 'schedule_render', 'scene_waits_for_game', 'on_commit_idle',
+                     'bfi_blocked', 'bfi_update', 'bfi_tick', 'on_vsync')
         harness = PREAMBLE + '\n'.join(extract_function(source, name) for name in functions) + CHECKS
         with tempfile.TemporaryDirectory(prefix='droiddeck-render-on-commit-') as folder:
             path = Path(folder)

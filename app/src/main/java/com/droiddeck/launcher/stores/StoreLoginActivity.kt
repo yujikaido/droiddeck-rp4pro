@@ -47,6 +47,9 @@ class StoreLoginActivity : ComponentActivity() {
                 ?.takeIf { "Chrome/" in it }
                 ?: "Mozilla/5.0 (Linux; Android ${Build.VERSION.RELEASE}; ${Build.MODEL}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.6533.103 Mobile Safari/537.36"
 
+        private const val PAGE_TRIES = 20
+        private const val PAGE_RETRY_MS = 500L
+
         fun generateState(): String {
             val bytes = ByteArray(24)
             java.security.SecureRandom().nextBytes(bytes)
@@ -60,12 +63,17 @@ class StoreLoginActivity : ComponentActivity() {
         fun isRedirect(url: String): Boolean
         fun finish(activity: StoreLoginActivity, view: WebView, url: String): String?
         val readsPage: Boolean get() = false
+        val pageScript: String get() = "(function(){ try { return document.body.innerText; } catch(e){ return ''; } })()"
+        fun pageReady(result: String): Boolean = true
+        fun browserStep(page: String): String? = null
         fun forgetSignIn(done: () -> Unit) = done()
+        fun pageFinished(view: WebView, url: String) {}
     }
 
     private var store: Store? = null
     private var clientUrl: String? = null
     private var flow: Flow? = null
+    private var pendingBrowserStep: String? = null
     private var webViewRef: WebView? = null
     private var popupWebView: WebView? = null
     private lateinit var contentHost: FrameLayout
@@ -99,10 +107,7 @@ class StoreLoginActivity : ComponentActivity() {
             window.setBackgroundDrawable(android.graphics.drawable.ColorDrawable(c))
             @Suppress("DEPRECATION") overridePendingTransition(0, 0)
         }
-        if (flow == null) {
-            store?.let { android.widget.Toast.makeText(this, getString(R.string.stores_engine_missing, it.label), android.widget.Toast.LENGTH_LONG).show() }
-            finish(); return
-        }
+        if (flow == null) { finish(); return }
         val chrome = buildChrome()
         setContentView(chrome)
         if (flooded) {
@@ -186,10 +191,6 @@ class StoreLoginActivity : ComponentActivity() {
         return root
     }
 
-    /**
-     * The activity handles density changes itself so that folding between two displays of different
-     * density keeps the page and the sign-in in progress; the dp-based chrome sizes are applied again.
-     */
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
         if (!::topBar.isInitialized) return
@@ -212,6 +213,7 @@ class StoreLoginActivity : ComponentActivity() {
 
     private fun reloadLogin() {
         dismissPopup(); clearError()
+        pendingBrowserStep = null
         captured.set(false)
         val fresh = generateState()
         oauthState = fresh
@@ -224,7 +226,6 @@ class StoreLoginActivity : ComponentActivity() {
         setBackgroundColor(0xFF0A0B0D.toInt())
         settings.javaScriptEnabled = true
         settings.domStorageEnabled = true
-        // Store sign-in pages are web pages; they never need to read local files or content:// URIs.
         settings.allowFileAccess = false
         settings.allowContentAccess = false
         settings.userAgentString = userAgent
@@ -281,7 +282,12 @@ class StoreLoginActivity : ComponentActivity() {
             if (url != null && view != null && flow?.isRedirect(url) == true && flow?.readsPage != true) complete(view, url)
         }
 
+        override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
+            if (!isPopup && store == Store.GAMEJOLT && url != null && view != null && flow?.isRedirect(url) == true && flow?.readsPage != true) complete(view, url)
+        }
+
         override fun onPageFinished(view: WebView?, url: String?) {
+            if (!isPopup && url != null && view != null) flow?.pageFinished(view, url)
             if (url != null && view != null && flow?.readsPage == true && flow?.isRedirect(url) == true) complete(view, url)
         }
 
@@ -327,6 +333,18 @@ class StoreLoginActivity : ComponentActivity() {
         }
     }
 
+    private fun readPage(view: WebView, f: Flow, left: Int) {
+        view.evaluateJavascript(f.pageScript) { json ->
+            if (flow !== f) return@evaluateJavascript
+            val result = json ?: ""
+            if (!f.pageReady(result) && left > 0) view.postDelayed({ readPage(view, f, left - 1) }, PAGE_RETRY_MS)
+            else {
+                val step = f.browserStep(result)
+                if (step == null || !continueInBrowser(step)) Thread({ settle(f.finish(this, view, result)) }, "store-login").start()
+            }
+        }
+    }
+
     private fun complete(view: WebView, url: String) {
         if (!captured.compareAndSet(false, true)) return
         val f = flow ?: return
@@ -336,11 +354,22 @@ class StoreLoginActivity : ComponentActivity() {
             titleText.text = getString(R.string.stores_login_finishing)
             if (!f.readsPage) view.stopLoading()
         }
-        if (f.readsPage) {
-            view.evaluateJavascript("(function(){ try { return document.body.innerText; } catch(e){ return ''; } })()") { json ->
-                Thread({ settle(f.finish(this, view, json ?: "")) }, "store-login").start()
-            }
-        } else Thread({ settle(f.finish(this, view, url)) }, "store-login").start()
+        if (f.readsPage) readPage(view, f, PAGE_TRIES) else Thread({ settle(f.finish(this, view, url)) }, "store-login").start()
+    }
+
+    private fun continueInBrowser(url: String): Boolean {
+        if (isFinishing || isDestroyed) return false
+        if (!lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.STARTED)) {
+            pendingBrowserStep = url
+            return true
+        }
+        val opened = runCatching { startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, Uri.parse(url))) }
+            .onFailure { Log.w(TAG, "no browser took the sign-in step: ${it.javaClass.simpleName}") }
+            .isSuccess
+        if (!opened) return false
+        titleText.text = getString(R.string.stores_login_title, store?.label ?: "")
+        showError(getString(R.string.stores_login_continue_in_browser, store?.label ?: ""))
+        return true
     }
 
     private fun settle(problem: String?) {
@@ -360,6 +389,10 @@ class StoreLoginActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
+        pendingBrowserStep?.let { step ->
+            pendingBrowserStep = null
+            if (!continueInBrowser(step)) reloadLogin()
+        }
         if (clientUrl != null && !isFinishing) com.droiddeck.launcher.session.SessionService.holdForSignIn(this, true)
     }
 

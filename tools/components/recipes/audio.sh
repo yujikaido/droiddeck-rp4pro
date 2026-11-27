@@ -7,7 +7,7 @@ tar --use-compress-program=unzstd -xf app/src/main/assets/pulseaudio.tzst -C pa-
 test ! -f pa-bundle/modules/arm64/module-aaudio-sink.so
 install -m755 sink-out/module-aaudio-sink.so pa-bundle/modules/arm64/module-aaudio-sink.so
 install -m755 sink-out/module-directaudio-native-sink.so pa-bundle/modules/arm64/module-directaudio-native-sink.so
-(cd pa-bundle && tar --numeric-owner --use-compress-program='zstd -19' -cf ../pulseaudio.tzst .)
+(cd pa-bundle && tar --use-compress-program='zstd -19' -cf ../pulseaudio.tzst .)
 mkdir -p app/build/prepared-assets
 mv pulseaudio.tzst app/build/prepared-assets/pulseaudio.tzst
 tar --use-compress-program=unzstd -tf app/build/prepared-assets/pulseaudio.tzst | grep -c '\.so$'

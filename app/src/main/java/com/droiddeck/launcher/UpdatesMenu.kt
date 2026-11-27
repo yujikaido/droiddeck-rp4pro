@@ -16,8 +16,8 @@ import com.droiddeck.launcher.session.SessionState
 import com.droiddeck.launcher.ui.UpdatesActions
 import com.droiddeck.launcher.ui.UpdatesState
 import com.droiddeck.launcher.update.AppUpdates
-import com.droiddeck.launcher.update.MaliUpdater
 import com.droiddeck.launcher.update.SelfInstaller
+import com.droiddeck.launcher.update.UpdateWatch
 
 internal class UpdatesMenu(private val activity: Activity, private val ui: Handler) {
     var catalog by mutableStateOf<AppUpdates.Catalog?>(null)
@@ -28,13 +28,11 @@ internal class UpdatesMenu(private val activity: Activity, private val ui: Handl
     var percent by mutableIntStateOf(-1)
     var askPermission by mutableStateOf(false)
     private var pending: AppUpdates.Release? = null
-    /** The MaliBridge build follows MaliBridge's releases instead of DroidDeck's catalog. */
-    private val mali = if (MaliUpdater.forThisBuild) MaliUpdatesMenu(activity, ui) else null
     private var lastCheck = 0L
     private var request = 0
     @Volatile private var session = -1
 
-    fun state() = UpdatesState(catalog, follow, checking, error, stage, percent, askPermission, mali?.state())
+    fun state() = UpdatesState(catalog, follow, checking, error, stage, percent, askPermission)
 
     fun actions() = UpdatesActions(
         onCheck = { check(force = true) },
@@ -46,13 +44,12 @@ internal class UpdatesMenu(private val activity: Activity, private val ui: Handl
                 .onFailure { error = activity.getString(R.string.upd_unknown_apps_failed); pending = null }
         },
         onDismissPermission = { askPermission = false; pending = null },
-        mali = mali?.actions() ?: com.droiddeck.launcher.ui.MaliUpdateActions(),
+        onSeen = { r -> UpdateWatch.seen(activity, r) },
     )
 
-    val hasUpdate: Boolean get() = mali?.state()?.hasUpdate ?: AppUpdates.hasUpdate(catalog, follow)
+    val hasUpdate: Boolean get() = AppUpdates.hasUpdate(catalog, follow)
 
     fun onResume() {
-        mali?.let { it.onResume(); return }
         pending?.let { r ->
             if (SelfInstaller.canInstall(activity)) { pending = null; install(r) }
         }
@@ -60,7 +57,6 @@ internal class UpdatesMenu(private val activity: Activity, private val ui: Handl
     }
 
     fun check(force: Boolean) {
-        mali?.let { it.check(manual = force); return }
         if (checking || stage != null) return
         val now = System.currentTimeMillis()
         if (!force && now - lastCheck < 60_000) return
@@ -83,6 +79,7 @@ internal class UpdatesMenu(private val activity: Activity, private val ui: Handl
 
     private fun choose(f: AppUpdates.Follow) {
         AppUpdates.setFollow(activity, f)
+        UpdateWatch.sync(activity, f, catalog?.let { AppUpdates.release(it, f) })
         follow = f
         error = null
     }
@@ -99,7 +96,17 @@ internal class UpdatesMenu(private val activity: Activity, private val ui: Handl
         percent = 0
         Thread({
             val result = runCatching {
-                val file = SelfInstaller.download(activity, apk) { pct -> ui.post { percent = pct } }
+                val file = try {
+                    SelfInstaller.download(activity, apk) { pct -> ui.post { percent = pct } }
+                } catch (e: java.io.IOException) {
+                    // Each push replaces a test build's APK, so a list read before the push names a file that is gone.
+                    if (r.pr <= 0) throw e
+                    val fresh = runCatching { AppUpdates.refresh(activity) }.getOrNull() ?: throw e
+                    ui.post { catalog = fresh }
+                    val newer = fresh.tests.firstOrNull { it.tag == r.tag }?.apk?.takeIf { it.url != apk.url } ?: throw e
+                    ui.post { percent = 0 }
+                    SelfInstaller.download(activity, newer) { pct -> ui.post { percent = pct } }
+                }
                 ui.post { stage = activity.getString(R.string.upd_stage_installing); percent = -1 }
                 SelfInstaller.install(activity, file) { id -> session = id }
             }
@@ -109,7 +116,6 @@ internal class UpdatesMenu(private val activity: Activity, private val ui: Handl
 
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
-            mali?.let { it.onInstallStatus(intent); return }
             if (intent.getIntExtra(PackageInstaller.EXTRA_SESSION_ID, -1).let { it < 0 || it != session }) return
             when (val status = intent.getIntExtra(PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_FAILURE)) {
                 PackageInstaller.STATUS_PENDING_USER_ACTION -> {
@@ -130,17 +136,14 @@ internal class UpdatesMenu(private val activity: Activity, private val ui: Handl
     }
 
     fun start() {
-        if (mali != null) mali.start() else {
-            catalog = AppUpdates.cached(activity)
-            follow = AppUpdates.follow(activity, catalog)
-        }
+        catalog = AppUpdates.cached(activity)
+        follow = AppUpdates.follow(activity, catalog)
         val filter = IntentFilter(SelfInstaller.ACTION_STATUS)
         if (Build.VERSION.SDK_INT >= 33) activity.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
         else activity.registerReceiver(receiver, filter)
     }
 
     fun unregister() {
-        mali?.stop()
         runCatching { activity.unregisterReceiver(receiver) }
     }
 }

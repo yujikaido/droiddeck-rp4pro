@@ -23,9 +23,12 @@ internal class SessionSuspendController(
     private val executor: ExecutorService = Executors.newSingleThreadExecutor(),
     private val zramControl: File? = null,
     private val clockControl: File? = null,
+    private val mapClockControl: (File) -> Unit = {},
     private val nowNanos: () -> Long = System::nanoTime,
     private val pagedOut: (processes: Int, unacknowledged: Int, residentKb: Long, swapKb: Long, swapBeforeKb: Long, millis: Long) -> Unit =
         { _, _, _, _, _, _ -> },
+    private val pagedIn: (processes: Int, swapKb: Long, swapBeforeKb: Long, availableKb: Long, millis: Long) -> Unit =
+        { _, _, _, _, _ -> },
 ) {
     private enum class Role { SESSION_ROOT, SESSION_CHILD, HELPER_ROOT, HELPER_CHILD }
 
@@ -33,9 +36,6 @@ internal class SessionSuspendController(
         val pid: Int,
         val started: Long,
         val role: Role,
-        /** A helper that is not the session's descendant (the Mali bridge's server): stopped after the
-         *  guest's threads and continued before the guest, so its clients find it running again. */
-        val outside: Boolean = false,
     )
 
     private data class ProcessInfo(
@@ -52,6 +52,7 @@ internal class SessionSuspendController(
     @Volatile private var cancelled = false
     private var frozen = emptyList<ProcessRecord>()
     private var frozenSince: Long? = null
+    private var pagedOutTargets = emptyList<ProcessRecord>()
 
     fun freeze(pageOut: Boolean = false, completion: (Boolean) -> Unit) {
         cancelled = false
@@ -70,7 +71,7 @@ internal class SessionSuspendController(
                 for (helper in helpers) {
                     if (records.values.any { it.pid == helper && it.role == Role.HELPER_ROOT }) continue
                     readProcess(helper)?.let {
-                        records[it.pid to it.started] = ProcessRecord(it.pid, it.started, Role.HELPER_ROOT, outside = !descendsFrom(it, root.pid))
+                        records[it.pid to it.started] = ProcessRecord(it.pid, it.started, Role.HELPER_ROOT)
                     }
                 }
                 if (pageOut) pageOut(records, root.pid, helpers)
@@ -110,10 +111,10 @@ internal class SessionSuspendController(
                 if (interrupted) Thread.currentThread().interrupt()
             }
             completion(complete)
+            if (!complete && frozen.isEmpty() && !interrupted) readBack()
         }, { completion(false) })
     }
 
-    // A freeze still queued or paging out stops before its next SIGSTOP pass and rolls back.
     fun cancelFreeze() {
         cancelled = true
     }
@@ -126,6 +127,7 @@ internal class SessionSuspendController(
             val resumed = restoreSafely(records)
             if (resumed) frozen = emptyList()
             completion(resumed)
+            if (resumed) readBack()
         }, { completion(false) })
     }
 
@@ -152,6 +154,7 @@ internal class SessionSuspendController(
         frozenSince = null
         val control = clockControl?.takeIf { it.isFile && it.length() >= Long.SIZE_BYTES } ?: return
         try {
+            mapClockControl(control)
             RandomAccessFile(control, "rw").use { file ->
                 val bytes = ByteArray(Long.SIZE_BYTES)
                 file.readFully(bytes)
@@ -193,10 +196,7 @@ internal class SessionSuspendController(
         }
         byPid[root]?.let { records[it.pid to it.started] = ProcessRecord(it.pid, it.started, Role.SESSION_ROOT) }
         for (helper in liveHelpers) {
-            byPid[helper]?.let {
-                val outside = records[it.pid to it.started]?.outside ?: false
-                records[it.pid to it.started] = ProcessRecord(it.pid, it.started, Role.HELPER_ROOT, outside)
-            }
+            byPid[helper]?.let { records[it.pid to it.started] = ProcessRecord(it.pid, it.started, Role.HELPER_ROOT) }
         }
     }
 
@@ -249,7 +249,6 @@ internal class SessionSuspendController(
     }
 
     private fun stoppedSnapshot(records: List<ProcessRecord>, root: ProcessRecord): Map<TaskIdentity, Long>? {
-        // PRoot can leave the leader stopped while native worker threads keep running.
         val tasks = LinkedHashMap<TaskIdentity, Long>()
         var stopped = true
         for (record in records) {
@@ -276,43 +275,109 @@ internal class SessionSuspendController(
         return tasks.takeIf { stopped && it.isNotEmpty() }
     }
 
-    // A stopped process cannot run libblsession's SIGURG handler, so the page-out has to finish
-    // before the stop. Android's low-memory killer otherwise finds the frozen game resident in RAM
-    // with most of zram still free.
     private fun pageOut(records: MutableMap<Pair<Int, Long>, ProcessRecord>, root: Int, helpers: List<Int>) {
         val control = zramControl?.takeIf { it.isFile } ?: return
+        val hold = holdFile(control)
         try {
-            addSnapshot(records, root, helpers)
-            control.writeText("1")
+            hold.writeText(PAGE_OUT_REQUEST)
+            sleep(PAGE_OUT_POLL_MS)
+            pageOut(control, records, root, helpers)
         } catch (_: IOException) {
-            return
+        } finally {
+            hold.delete()
         }
+    }
+
+    private fun holdFile(control: File) = File(control.parentFile, "${control.name}.hold")
+
+    private fun pageOut(control: File, records: MutableMap<Pair<Int, Long>, ProcessRecord>, root: Int, helpers: List<Int>) {
+        addSnapshot(records, root, helpers)
         val targets = records.values.filter { record ->
             try {
-                File(procRoot, "${record.pid}/maps").useLines { lines -> lines.any { it.endsWith("/libblsession.so") } }
+                File(procRoot, "${record.pid}/maps").useLines { lines -> lines.any { it.endsWith("/libddsession.so") } }
             } catch (_: IOException) {
                 false
             }
         }
         if (targets.isEmpty()) return
+        pagedOutTargets = (pagedOutTargets + targets).distinct()
         val acks = targets.associateWith { File(control.parentFile, "${control.name}.ack.${it.pid}") }
         acks.values.forEach { it.delete() }
         val start = nowMillis()
         val before = memoryKb(targets)
         for (record in targets) send(record, SIGURG)
-        // A program can replace libblsession's SIGURG handler (PyInstaller's bootloader, the Go runtime);
-        // such a process never creates its ack and is not waited for once the start window has passed.
         val waiting = targets.toMutableList()
         while (!closing && !cancelled && nowMillis() - start < PAGE_OUT_TIMEOUT_MS) {
             val started = nowMillis() - start >= PAGE_OUT_START_MS
-            waiting.removeAll { val ack = acks.getValue(it); ack.length() > 0 || (started && !ack.exists()) || isGone(it) }
+            waiting.removeAll { val ack = acks.getValue(it); pagedOut(ack) || (started && !ack.exists()) || isGone(it) }
             if (waiting.isEmpty()) break
             sleep(PAGE_OUT_POLL_MS)
         }
-        val unacknowledged = targets.count { acks.getValue(it).length() == 0L && !isGone(it) }
+        val unacknowledged = targets.count { !pagedOut(acks.getValue(it)) && !isGone(it) }
         acks.values.forEach { it.delete() }
         val after = memoryKb(targets)
         pagedOut(targets.size, unacknowledged, after.first, after.second, before.second, nowMillis() - start)
+    }
+
+    private fun pagedOut(ack: File): Boolean = try {
+        ack.readText().trim() == PAGE_OUT_ACK
+    } catch (_: IOException) {
+        false
+    }
+
+    private fun readBack() {
+        val targets = pagedOutTargets.filterNot { isGone(it) }
+        pagedOutTargets = emptyList()
+        val control = zramControl?.takeIf { it.isFile } ?: return
+        if (targets.isEmpty() || closing) return
+        val before = memoryKb(targets).second
+        val (total, available) = meminfoKb()
+        if (!canTake(before, total, available)) {
+            pagedIn(0, before, before, available, 0)
+            return
+        }
+        val hold = holdFile(control)
+        try {
+            hold.writeText(READ_BACK_REQUEST)
+        } catch (_: IOException) {
+            hold.delete()
+            return
+        }
+        val start = nowMillis()
+        for (record in targets) send(record, SIGURG)
+        var swap = before
+        var unchanged = 0
+        try {
+            while (!closing && nowMillis() - start < READ_BACK_TIMEOUT_MS) {
+                sleep(READ_BACK_POLL_MS)
+                val current = memoryKb(targets).second
+                unchanged = if (current == swap) unchanged + 1 else 0
+                swap = current
+                if (swap == 0L || unchanged >= READ_BACK_STABLE_POLLS) break
+            }
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        } finally {
+            hold.delete()
+        }
+        pagedIn(targets.size, swap, before, available, nowMillis() - start)
+    }
+
+    private fun canTake(swapKb: Long, totalKb: Long, availableKb: Long): Boolean =
+        availableKb >= swapKb * READ_BACK_AVAILABLE_FACTOR &&
+            availableKb - swapKb >= maxOf(READ_BACK_HEADROOM_KB, totalKb / READ_BACK_TOTAL_SHARE)
+
+    private fun meminfoKb(): Pair<Long, Long> = try {
+        val values = HashMap<String, Long>()
+        File(procRoot, "meminfo").forEachLine { line ->
+            val name = line.substringBefore(':')
+            if (name == "MemTotal" || name == "MemAvailable") {
+                line.substringAfter(':').trim().substringBefore(' ').toLongOrNull()?.let { values[name] = it }
+            }
+        }
+        (values["MemTotal"] ?: 0L) to (values["MemAvailable"] ?: 0L)
+    } catch (_: IOException) {
+        0L to 0L
     }
 
     private fun isGone(record: ProcessRecord): Boolean =
@@ -335,26 +400,12 @@ internal class SessionSuspendController(
         return resident to swap
     }
 
-    // PRoot traces every guest. A stop sent while it runs becomes a group stop that it restarts
-    // thread by thread; once it is stopped, each thread that takes a SIGSTOP stays parked in its
-    // signal-delivery stop. So the roots stop first and every guest thread gets its own SIGSTOP.
     private fun stop(records: List<ProcessRecord>) {
         for (record in records.filter { it.role == Role.SESSION_ROOT }) send(record, SIGSTOP)
-        for (record in records.filter { it.role == Role.HELPER_ROOT && !it.outside }) send(record, SIGSTOP)
+        for (record in records.filter { it.role == Role.HELPER_ROOT }) send(record, SIGSTOP)
         for (record in records.filter { it.role == Role.SESSION_CHILD || it.role == Role.HELPER_CHILD }) {
             stopThreads(record)
         }
-        for (record in records.filter { it.role == Role.HELPER_ROOT && it.outside }) send(record, SIGSTOP)
-    }
-
-    private fun descendsFrom(process: ProcessInfo, root: Int): Boolean {
-        var parent = process.parent
-        repeat(64) {
-            if (parent == root) return true
-            if (parent <= 1) return false
-            parent = (try { readProcess(parent) } catch (_: Exception) { null })?.parent ?: return false
-        }
-        return false
     }
 
     private fun stopThreads(record: ProcessRecord) {
@@ -373,7 +424,7 @@ internal class SessionSuspendController(
 
     private fun restore(records: List<ProcessRecord>): Boolean {
         val ordered = records.sortedBy {
-            if (it.role == Role.HELPER_ROOT && it.outside) -1 else when (it.role) {
+            when (it.role) {
                 Role.SESSION_ROOT -> 0
                 Role.HELPER_ROOT -> 1
                 Role.SESSION_CHILD -> 2
@@ -413,7 +464,6 @@ internal class SessionSuspendController(
         val current = try { readProcess(record.pid) } catch (_: Exception) { return false }
         if (current == null || current.started != record.started) return true
         if (current.state == 'T' || current.state == 't') return false
-        // A traced worker in 't' is usually PRoot handling a system call; 'T' is a job-control stop.
         return File(procRoot, "${record.pid}/task").listFiles().orEmpty().none { entry ->
             entry.name.toIntOrNull() != null &&
                 try { readStat(File(entry, "stat"))[0].first() == 'T' } catch (_: IOException) { false }
@@ -424,9 +474,18 @@ internal class SessionSuspendController(
         const val SIGSTOP = 19
         const val SIGCONT = 18
         const val SIGURG = 23
+        const val PAGE_OUT_ACK = "1"
+        const val PAGE_OUT_REQUEST = "1"
+        const val READ_BACK_REQUEST = "0"
         const val PAGE_OUT_POLL_MS = 100L
         const val PAGE_OUT_START_MS = 2_000L
         const val PAGE_OUT_TIMEOUT_MS = 12_000L
+        const val READ_BACK_POLL_MS = 100L
+        const val READ_BACK_STABLE_POLLS = 5
+        const val READ_BACK_TIMEOUT_MS = 5_000L
+        const val READ_BACK_HEADROOM_KB = 1_048_576L
+        const val READ_BACK_AVAILABLE_FACTOR = 2L
+        const val READ_BACK_TOTAL_SHARE = 10L
         const val RESTORE_CHECKS = 80
         const val FREEZE_TIMEOUT_MS = 8_000L
         const val FREEZE_MAX_PASSES = 256

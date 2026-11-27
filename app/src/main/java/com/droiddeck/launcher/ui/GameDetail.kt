@@ -1,5 +1,9 @@
 package com.droiddeck.launcher.ui
 
+import androidx.compose.foundation.interaction.collectIsPressedAsState
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import android.widget.Toast
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.LocalIndication
 import androidx.compose.ui.semantics.Role
 import androidx.compose.runtime.CompositionLocalProvider
@@ -35,7 +39,10 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Favorite
+import androidx.compose.material.icons.filled.FavoriteBorder
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.outlined.Download
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.VideogameAsset
@@ -48,6 +55,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
@@ -67,13 +75,16 @@ import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInParent
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
@@ -86,7 +97,13 @@ import coil.compose.AsyncImage
 import com.droiddeck.launcher.R
 import com.droiddeck.launcher.frontend.GameRemoval
 import com.droiddeck.launcher.frontend.Library
+import com.droiddeck.launcher.runtime.CurseForgeApp
+import com.droiddeck.launcher.runtime.UserApps
+import com.droiddeck.launcher.runtime.WowAddonCatalog
+import com.droiddeck.launcher.runtime.WowAddons
+import com.droiddeck.launcher.store.UserAppsState
 import com.droiddeck.launcher.session.GameSaves
+import com.droiddeck.launcher.session.SessionState
 import com.droiddeck.launcher.stores.CatalogItem
 import com.droiddeck.launcher.stores.CloudSaves
 import com.droiddeck.launcher.stores.InstalledStoreGame
@@ -98,6 +115,7 @@ import com.droiddeck.launcher.stores.StoreInstallRoot
 import com.droiddeck.launcher.stores.StoreLanguage
 import com.droiddeck.launcher.stores.StoreSizes
 import com.droiddeck.launcher.stores.StoresState
+import com.droiddeck.launcher.stores.gamejolt.GameJoltApi
 import com.droiddeck.launcher.stores.battlenet.BattleNetInstall
 import com.droiddeck.launcher.stores.download.DownloadQueue
 import com.droiddeck.launcher.stores.download.DownloadState
@@ -114,8 +132,10 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.getValue
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.foundation.layout.offset
 
-/** What a game page shows: `app:<appId>` for a game in the library, `[app:]<store>:<id>` for a store product. */
 internal class GameRef(val appId: Int?, val store: Store?, val storeId: String?) {
     fun game(games: List<Library.SteamGame>): Library.SteamGame? = when {
         appId != null -> games.firstOrNull { it.appId == appId }
@@ -136,16 +156,16 @@ internal class GameRef(val appId: Int?, val store: Store?, val storeId: String?)
     }
 }
 
-internal enum class GameTab { ABOUT, ACHIEVEMENTS, LAUNCH, SAVES, INSTALL }
+internal enum class GameTab { ABOUT, ACHIEVEMENTS, LAUNCH, SAVES, ADDONS, INSTALL }
 
 @Composable
 internal fun GameDetail(
-    key: String, s: FrontEndState, a: FrontEndActions, lead: FocusRequester, backLabel: String, hopRail: String?, onBack: () -> Unit,
+    key: String, s: FrontEndState, a: FrontEndActions, lead: FocusRequester, backLabel: String, hopRail: String?, onBack: () -> Unit, inStore: Boolean = false,
 ) {
     val narrow = LocalNarrowPane.current
     val stacked = narrow || LocalConfiguration.current.screenWidthDp < 700
     val ref = remember(key) { GameRef.parse(key) }
-    val games = s.steamGames + rememberXboxCloudRows(s)
+    val games = s.steamGames + rememberXboxCloudRows(s) + if (s.soundtracksEnabled) emptyList() else s.soundtracks
     val found = ref.game(games)
     val known = remember(key) { arrayOfNulls<Pair<Store, String>>(1) }
     val store = ref.store ?: Store.byId(found?.source) ?: known[0]?.first
@@ -162,6 +182,7 @@ internal fun GameDetail(
     if (nothing) return
     val source = game?.source ?: store?.id ?: Library.SOURCE_STEAM
     val title = game?.name ?: item?.title ?: installed?.sidecar?.title ?: id.orEmpty()
+    val favoriteKey = if (store != null && id != null) "${store.id}:$id" else game?.let { GameRef.key(it) } ?: key
     val scores = if (source != Library.ADDED) rememberGameScores(title.takeIf { it.isNotBlank() && it != id }) else null
     val achievements = remember(store, id, item?.accessible, installed) {
         when {
@@ -180,12 +201,14 @@ internal fun GameDetail(
         .takeUnless { it.trim().equals(title.trim(), ignoreCase = true) }.orEmpty()
     val scored = scores != null && (scores.metacritic != Lookup.None || scores.hltb != Lookup.None)
     val prefix = game?.protonPrefix?.takeIf { it.isDirectory }
+    val addonTargets = remember(game?.gameId, game?.gameFiles) { game?.let(WowAddons::targets).orEmpty() }
     val tabs = buildList {
         if (description.isNotBlank() || developer.isNotBlank() || publisher.isNotBlank() || releaseDate.isNotBlank() || scored || (!s.shortcutPicker && title.isNotBlank() && title != id)) add(GameTab.ABOUT)
         if (achievementState != null) add(GameTab.ACHIEVEMENTS)
         val cloud = game?.library == Library.XBOX_CLOUD
         if (game != null && !cloud) add(GameTab.LAUNCH)
         if (game != null && game.library == Library.ADDED && prefix != null) add(GameTab.SAVES)
+        if (addonTargets.isNotEmpty()) add(GameTab.ADDONS)
         if ((game != null && !cloud) || installed != null) add(GameTab.INSTALL)
     }
     var picked by remember(key) { mutableStateOf<GameTab?>(null) }
@@ -195,7 +218,6 @@ internal fun GameDetail(
     var inPage by remember(key) { mutableStateOf(false) }
     var onStrip by remember(key) { mutableStateOf(false) }
     var dropped by remember(key) { mutableStateOf(0) }
-    // A tab's content is swapped or refreshed under the focused row; focus goes back to the tabs, not to the rail.
     LaunchedEffect(dropped) {
         if (dropped == 0) return@LaunchedEffect
         androidx.compose.runtime.withFrameNanos { }
@@ -209,7 +231,6 @@ internal fun GameDetail(
     }
     val art: Any? = game?.hero ?: item?.imageUrl ?: installed?.sidecar?.hero ?: installed?.sidecar?.cover
     val artModel: Any? = if (art is String) cardArtRequest(art, item?.tallImageUrl) else art
-    val inSteam = !s.shortcutPicker && source != Library.SOURCE_STEAM && (game != null || installed != null) && !(game?.library == Library.XBOX_CLOUD && installed == null)
     val inset = LocalDetailInset.current
     GameBackdrop(artModel, art ?: game?.art, hueOf(title), fadeTop = inset.top < 8.dp, onArtPlaced = { StoresMotion.heroAt = it }) {
         Column(Modifier.fillMaxWidth().padding(horizontal = inset.horizontal).padding(top = inset.top).onFocusChanged { inPage = it.hasFocus }.bumpers(onPrevious = { cycle(-1) }, onNext = { cycle(1) })) {
@@ -220,6 +241,8 @@ internal fun GameDetail(
                     if (!s.shortcutPicker) CompositionLocalProvider(LocalPillButtons provides true) {
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             if (installed != null && installed.sidecar.store == Store.ITCH) ItchCheckButton(installed)
+                            if (installed != null && installed.sidecar.store == Store.GAMEJOLT) GameJoltCheckButton(installed)
+                            FavoriteButton(favoriteKey)
                             RemoveButton(title, game, installed, a)
                         }
                     }
@@ -227,19 +250,26 @@ internal fun GameDetail(
             }
             val header: @Composable () -> Unit = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    GameStatusLine(source, game, item, installed, download?.location ?: failed?.location, inSteam)
+                    Spacer(Modifier.height(if (narrow) 8.dp else 20.dp))
                     GameTitle(title, game?.logo ?: item?.logoUrl, if (narrow) 30.sp else 40.sp)
+                    GameStatusLine(source, game, item, installed, download?.location ?: failed?.location)
                     if (!failed?.error.isNullOrBlank()) Text(
                         failed!!.error!!, fontSize = 13.sp, lineHeight = 17.sp, fontWeight = FontWeight.Medium,
                         color = MaterialTheme.colorScheme.error, maxLines = 3, overflow = TextOverflow.Ellipsis,
                     )
                     Spacer(Modifier.height(2.dp))
-                    GameCapsule(scores) { GameActions(store, id, game, item, installed, s, a, Modifier.focusRequester(lead), compactMenu = stacked) }
+                    Column {
+                        CompositionLocalProvider(LocalPillButtons provides true, LocalGradientOutline provides true) {
+                            GameActions(store, id, game, item, installed, s, a, Modifier.focusRequester(lead), compactMenu = stacked, inStore = inStore, part = ActionPart.LEAD)
+                        }
+                        Spacer(Modifier.height(LeadGap - ActionGap))
+                        GameCapsule(scores) { GameActions(store, id, game, item, installed, s, a, Modifier, compactMenu = stacked, inStore = inStore, part = ActionPart.REST) }
+                    }
                 }
             }
             if (StoresMotion.heroLands) header() else Rise(1) { header() }
             if (tab != null) Rise(2) {
-                Column(Modifier.fillMaxWidth().padding(top = 14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Column(Modifier.fillMaxWidth().padding(top = ActionGap), verticalArrangement = Arrangement.spacedBy(ActionGap)) {
                     val labels = tabs.map { t ->
                         when (t) {
                             GameTab.ABOUT -> stringResource(R.string.game_tab_about)
@@ -247,7 +277,8 @@ internal fun GameDetail(
                                 stringResource(R.string.game_tab_achievements_count, stringResource(R.string.achievements_title), achievementState.done, list.size)
                             } ?: stringResource(R.string.achievements_title)
                             GameTab.LAUNCH -> stringResource(R.string.game_tab_launch)
-                            GameTab.SAVES -> stringResource(if (Store.byId(source).let { it == Store.GOG || it == Store.EPIC }) R.string.game_tab_saves_cloud else R.string.games_saves)
+                            GameTab.SAVES -> stringResource(if (CloudSaves.supports(Store.byId(source))) R.string.game_tab_saves_cloud else R.string.games_saves)
+                            GameTab.ADDONS -> stringResource(R.string.game_tab_addons)
                             GameTab.INSTALL -> stringResource(R.string.game_tab_install)
                         }
                     }
@@ -256,14 +287,17 @@ internal fun GameDetail(
                         focusRequesters = tabs.map { tabFocus.getValue(it) }, bumpers = tabs.size > 1, compact = stacked,
                     )
                     Box(Modifier.fillMaxWidth().onFocusChanged { if (inPanel && !it.hasFocus) dropped++; inPanel = it.hasFocus }.testTag("game-tab-${tab.name.lowercase()}")) {
-                        when (tab) {
-                            GameTab.ABOUT -> AboutTab(developer, publisher, releaseDate, description, scores, stacked) {
-                                if (!s.shortcutPicker) GameResourcesRow(title.takeUnless { it == id }.orEmpty(), game)
+                        CompositionLocalProvider(LocalRevealChecked provides false) {
+                            when (tab) {
+                                GameTab.ABOUT -> AboutTab(developer, publisher, releaseDate, description, scores, stacked) {
+                                    if (!s.shortcutPicker) GameResourcesRow(title.takeUnless { it == id }.orEmpty(), game)
+                                }
+                                GameTab.ACHIEVEMENTS -> achievementState?.let { st -> AchievementsTab(StoreAchievements.forSource(store?.id)?.label.orEmpty(), st) }
+                                GameTab.LAUNCH -> if (game != null) LaunchTab(game, s, a, hopRail)
+                                GameTab.SAVES -> if (game != null && prefix != null) SavesTab(game, prefix, a)
+                                GameTab.ADDONS -> if (game != null) AddonsTab(game, addonTargets, s.sessionRunning, a)
+                                GameTab.INSTALL -> InstallTab(game, installed, item, store)
                             }
-                            GameTab.ACHIEVEMENTS -> achievementState?.let { st -> AchievementsTab(StoreAchievements.forSource(store?.id)?.label.orEmpty(), st) }
-                            GameTab.LAUNCH -> if (game != null) LaunchTab(game, s, a, hopRail)
-                            GameTab.SAVES -> if (game != null && prefix != null) SavesTab(game, prefix, a)
-                            GameTab.INSTALL -> InstallTab(game, installed, item, store)
                         }
                     }
                 }
@@ -273,7 +307,7 @@ internal fun GameDetail(
 }
 
 @Composable
-private fun SourceBadge(source: String) {
+internal fun SourceBadge(source: String) {
     val c = sourceColours(source)
     Row(
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp),
@@ -285,16 +319,16 @@ private fun SourceBadge(source: String) {
 }
 
 @Composable
-private fun GameStatusLine(source: String, game: Library.SteamGame?, item: CatalogItem?, installed: InstalledStoreGame?, downloadAt: String?, inSteam: Boolean) {
+private fun GameStatusLine(source: String, game: Library.SteamGame?, item: CatalogItem?, installed: InstalledStoreGame?, downloadAt: String?) {
     val ctx = LocalContext.current
     val colors = MaterialTheme.colorScheme
     val pal = LocalPalette.current
     val folder = installed?.folder ?: game?.gameFiles
     val passName = item?.includedWith.orEmpty()
     val state = when {
-        installed != null -> listOf(stringResource(R.string.stores_eyebrow_installed), StoreInstallRoot.labelFor(ctx, installed.folder))
+        installed != null -> listOf(StoreInstallRoot.labelFor(ctx, installed.folder))
         game?.library == Library.XBOX_CLOUD -> listOf(libraryLabel(game))
-        game != null -> listOf(stringResource(R.string.stores_eyebrow_installed), libraryLabel(game))
+        game != null -> listOf(libraryLabel(game))
         !downloadAt.isNullOrBlank() -> listOf(stringResource(R.string.stores_eyebrow_library), downloadAt)
         item?.owned == true -> listOf(stringResource(R.string.stores_eyebrow_library))
         item?.subscription == true -> listOf(passName.ifBlank { stringResource(R.string.stores_game_pass) })
@@ -302,32 +336,46 @@ private fun GameStatusLine(source: String, game: Library.SteamGame?, item: Catal
         item?.accessible == true -> listOf(stringResource(R.string.stores_eyebrow_library))
         else -> listOf(stringResource(R.string.stores_eyebrow_store))
     }
-    val size = if (folder != null && (installed != null || game != null)) diskSize(installed, folder) else (item?.sizeBytes ?: 0L).takeIf { it > 0 }
-    val line = (state + listOfNotNull(size?.let { formatBytes(it) })).filter { it.isNotBlank() }.joinToString(" · ").replaceFirstChar { it.uppercase() }
-    val muted = colors.onBackground.copy(alpha = 0.78f)
-    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+    val size = if (folder != null && (installed != null || game != null)) diskSize(installed, folder) else catalogSize(item).takeIf { it > 0 }
+    val where = state.filter { it.isNotBlank() }.joinToString(" · ").replaceFirstChar { it.uppercase() }
+    Row(
+        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp),
+        modifier = Modifier.horizontalScroll(androidx.compose.foundation.rememberScrollState()),
+    ) {
         SourceBadge(source)
-        Text(line, fontSize = 12.sp, color = muted, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
-        if (inSteam) {
-            Text("·", fontSize = 12.sp, color = muted.copy(alpha = 0.5f))
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                Icon(Icons.Outlined.VideogameAsset, contentDescription = null, tint = muted, modifier = Modifier.size(15.dp))
-                Text(stringResource(R.string.stores_in_steam_label), fontSize = 12.sp, color = muted, maxLines = 1)
-                Icon(Icons.Filled.Check, contentDescription = null, tint = pal.good, modifier = Modifier.size(14.dp))
-            }
-        }
+        if (where.isNotBlank()) StatusChip(where)
+        if (size != null) StatusChip(formatBytes(size))
     }
 }
 
-/** One frosted pill that holds the game's actions and its headline scores. */
+@Composable
+private fun StatusChip(text: String, icon: androidx.compose.ui.graphics.vector.ImageVector? = null, tint: Color? = null) {
+    val colors = MaterialTheme.colorScheme
+    Row(
+        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp),
+        modifier = Modifier.glass(CircleShape, 0.06f).padding(horizontal = 10.dp, vertical = 4.dp),
+    ) {
+        if (icon != null) Icon(icon, contentDescription = null, tint = tint ?: colors.onBackground.copy(alpha = 0.85f), modifier = Modifier.size(13.dp))
+        Text(text, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = colors.onBackground.copy(alpha = 0.9f), maxLines = 1)
+    }
+}
+
+private val ActionGap = 12.dp
+private val LeadGap = 20.dp
+
 @Composable
 private fun GameCapsule(scores: GameScores?, actions: @Composable () -> Unit) {
+    var noActions by remember { mutableStateOf(false) }
+    val shown = scores?.takeIf { it.metacritic != Lookup.None || it.hltb != Lookup.None }
+    val empty = noActions && shown == null
     Row(
         verticalAlignment = Alignment.CenterVertically,
-        modifier = Modifier.fillMaxWidth().glass(RoundedCornerShape(30.dp)).padding(6.dp),
+        modifier = Modifier.fillMaxWidth().then(if (empty) Modifier else Modifier.padding(top = ActionGap).glass(RoundedCornerShape(30.dp)).padding(6.dp)),
     ) {
-        CompositionLocalProvider(LocalPillButtons provides true) { Box(Modifier.weight(1f)) { actions() } }
-        if (scores != null) CapsuleScores(scores, Modifier.padding(start = 8.dp, end = 10.dp))
+        CompositionLocalProvider(LocalPillButtons provides true) {
+            Box(Modifier.weight(1f).onSizeChanged { noActions = it.height == 0 }) { actions() }
+        }
+        shown?.let { CapsuleScores(it, Modifier.padding(start = 8.dp, end = 10.dp)) }
     }
 }
 
@@ -339,32 +387,109 @@ private fun GameTabBar(
 ) {
     val colors = MaterialTheme.colorScheme
     val pal = LocalPalette.current
+    val scroll = rememberScrollState()
+    val spans = remember(tabs.size) { androidx.compose.runtime.mutableStateListOf<IntRange?>(*arrayOfNulls<IntRange>(tabs.size)) }
+    var tabHeight by remember { mutableStateOf(0) }
+    var viewport by remember { mutableStateOf(0) }
+    LaunchedEffect(selected, viewport) {
+        val span = spans.getOrNull(selected) ?: return@LaunchedEffect
+        if (viewport > 0) scroll.animateScrollTo((span.first + span.last) / 2 - viewport / 2)
+    }
     Row(modifier.fillMaxWidth().glass(CircleShape).padding(4.dp), verticalAlignment = Alignment.CenterVertically) {
-        if (bumpers) BumperKey("LB", stringResource(R.string.widgets_prev_tab)) { onSelect((selected + tabs.size - 1) % tabs.size) }
-        tabs.forEachIndexed { i, label ->
-            val on = i == selected
-            val src = remember { MutableInteractionSource() }
-            val hot = rememberHot(src)
-            val pick = { onSelect(i) }
-            Box(
-                contentAlignment = Alignment.Center,
-                modifier = Modifier.weight(1f)
-                    .testTag("tab-$i")
-                    .then(focusRequesters?.getOrNull(i)?.let { Modifier.focusRequester(it) } ?: Modifier)
-                    .clip(CircleShape)
-                    .background(if (on) pal.signal.copy(alpha = 0.3f) else if (hot) pal.signal.copy(alpha = 0.14f) else Color.Transparent)
-                    .glideBorder(hot, CircleShape, pal.signal, if (on) pal.signal.copy(alpha = 0.5f) else Color.Transparent)
-                    .hoverable(src).selectable(selected = on, interactionSource = src, indication = null, role = Role.Tab, onClick = pick)
-                    .controllerConfirm(onClick = pick)
-                    .padding(horizontal = 6.dp, vertical = if (compact) 8.dp else 10.dp),
-            ) {
-                Text(
-                    label, fontSize = if (compact) 13.sp else 14.sp, fontWeight = if (on) FontWeight.Bold else FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis,
-                    color = if (on || hot) colors.onBackground else colors.onSurfaceVariant,
-                )
+        if (bumpers) TabBarBumper("LB", stringResource(R.string.widgets_prev_tab), leading = true) { onSelect((selected + tabs.size - 1) % tabs.size) }
+        androidx.compose.foundation.layout.BoxWithConstraints(Modifier.weight(1f).clip(if (bumpers) RoundedCornerShape(BumperFlat) else CircleShape).onSizeChanged { viewport = it.width }) {
+            val share = maxWidth / tabs.size.coerceAtLeast(1)
+            Box(Modifier.horizontalScroll(scroll)) {
+                spans.getOrNull(selected)?.takeIf { tabHeight > 0 }?.let { span ->
+                    TabHighlight(span, tabHeight, flatStart = bumpers && selected == 0, flatEnd = bumpers && selected == tabs.lastIndex)
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    tabs.forEachIndexed { i, label ->
+                        val on = i == selected
+                        val src = remember { MutableInteractionSource() }
+                        val hot = rememberHot(src)
+                        val pick = { onSelect(i) }
+                        val shape = tabShape(flatStart = bumpers && i == 0, flatEnd = bumpers && i == tabs.lastIndex)
+                        Box(
+                            contentAlignment = Alignment.Center,
+                            modifier = Modifier.widthIn(min = share)
+                                .onGloballyPositioned { c -> val x = c.positionInParent().x.toInt(); val r = x..(x + c.size.width); if (spans[i] != r) spans[i] = r; tabHeight = c.size.height }
+                                .testTag("tab-$i")
+                                .then(focusRequesters?.getOrNull(i)?.let { Modifier.focusRequester(it) } ?: Modifier)
+                                .clip(shape)
+                                .background(if (hot && !on) pal.signal.copy(alpha = 0.14f) else Color.Transparent)
+                                .glideBorder(hot, shape, pal.signal)
+                                .hoverable(src).selectable(selected = on, interactionSource = src, indication = null, role = Role.Tab, onClick = pick)
+                                .controllerConfirm(onClick = pick)
+                                .padding(horizontal = 12.dp, vertical = if (compact) 8.dp else 10.dp),
+                        ) {
+                            Text(
+                                label, fontSize = if (compact) 13.sp else 14.sp, fontWeight = if (on) FontWeight.Bold else FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                                color = if (on || hot) colors.onBackground else colors.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
             }
         }
-        if (bumpers) BumperKey("RB", stringResource(R.string.widgets_next_tab)) { onSelect((selected + 1) % tabs.size) }
+        if (bumpers) TabBarBumper("RB", stringResource(R.string.widgets_next_tab), leading = false) { onSelect((selected + 1) % tabs.size) }
+    }
+}
+
+private val BumperFlat = 7.dp
+
+@Composable
+private fun TabHighlight(span: IntRange, height: Int, flatStart: Boolean, flatEnd: Boolean) {
+    val pal = LocalPalette.current
+    val density = LocalDensity.current
+    val spring = Motion.sp<Float>(0.8f, Spring.StiffnessMediumLow)
+    val x by animateFloatAsState(span.first.toFloat(), spring, label = "tabX")
+    val width by animateFloatAsState((span.last - span.first).toFloat(), spring, label = "tabWidth")
+    val start by animateFloatAsState(if (flatStart) 1f else 0f, spring, label = "tabFlatStart")
+    val end by animateFloatAsState(if (flatEnd) 1f else 0f, spring, label = "tabFlatEnd")
+    with(density) {
+        val round = (height / 2f).toDp()
+        val shape = RoundedCornerShape(
+            topStart = androidx.compose.ui.unit.lerp(round, BumperFlat, start), topEnd = androidx.compose.ui.unit.lerp(round, BumperFlat, end),
+            bottomEnd = androidx.compose.ui.unit.lerp(round, BumperFlat, end), bottomStart = androidx.compose.ui.unit.lerp(round, BumperFlat, start),
+        )
+        Box(
+            Modifier.offset { androidx.compose.ui.unit.IntOffset(x.toInt(), 0) }
+                .size(width.toDp(), height.toDp())
+                .clip(shape).background(pal.signal.copy(alpha = 0.3f)).border(1.dp, pal.signal.copy(alpha = 0.5f), shape),
+        )
+    }
+}
+
+private fun tabShape(flatStart: Boolean, flatEnd: Boolean): androidx.compose.ui.graphics.Shape {
+    if (!flatStart && !flatEnd) return CircleShape
+    val flat = androidx.compose.foundation.shape.CornerSize(BumperFlat)
+    val round = androidx.compose.foundation.shape.CornerSize(50)
+    val start = if (flatStart) flat else round
+    val end = if (flatEnd) flat else round
+    return RoundedCornerShape(topStart = start, topEnd = end, bottomEnd = end, bottomStart = start)
+}
+
+@Composable
+private fun TabBarBumper(label: String, description: String, leading: Boolean, onClick: () -> Unit) {
+    val colors = MaterialTheme.colorScheme
+    val pal = LocalPalette.current
+    val round = 22.dp
+    val flat = BumperFlat
+    val cap = if (leading) RoundedCornerShape(round, flat, flat, round) else RoundedCornerShape(flat, round, round, flat)
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier = Modifier.padding(start = if (leading) 0.dp else 3.dp, end = if (leading) 3.dp else 0.dp)
+            .size(width = 46.dp, height = 44.dp)
+            .clip(cap).background(colors.surfaceVariant).border(1.dp, pal.line2, cap)
+            .focusProperties { canFocus = false }
+            .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null, role = Role.Button, onClick = onClick)
+            .semantics { contentDescription = description },
+    ) {
+        Text(
+            label, fontSize = 12.sp, fontWeight = FontWeight.Bold, color = colors.onSurfaceVariant,
+            modifier = Modifier.padding(start = if (leading) 4.dp else 0.dp, end = if (leading) 0.dp else 4.dp),
+        )
     }
 }
 
@@ -374,7 +499,7 @@ private fun GameTitle(title: String, logo: Any?, titleSize: TextUnit) {
     if (logo != null && !failed) AsyncImage(
         model = logo, contentDescription = title, contentScale = ContentScale.Fit, alignment = Alignment.CenterStart,
         onError = { failed = true },
-        modifier = Modifier.padding(vertical = 4.dp).height((titleSize.value * 1.5f).dp).widthIn(max = (titleSize.value * 7f).dp).clip(RoundedCornerShape(10.dp)).testTag("game-logo"),
+        modifier = Modifier.padding(vertical = 4.dp).height((titleSize.value * 2.3f).dp).widthIn(max = (titleSize.value * 10f).dp).clip(RoundedCornerShape(10.dp)).testTag("game-logo"),
     ) else Text(
         title, fontSize = titleSize, lineHeight = titleSize * 1.12f, fontWeight = FontWeight.Black,
         color = MaterialTheme.colorScheme.onBackground, maxLines = 2, overflow = TextOverflow.Ellipsis,
@@ -382,125 +507,156 @@ private fun GameTitle(title: String, logo: Any?, titleSize: TextUnit) {
     )
 }
 
+internal enum class ActionPart { ALL, LEAD, REST }
+
 @Composable
 internal fun GameActions(
     store: Store?, id: String?, game: Library.SteamGame?, item: CatalogItem?, installed: InstalledStoreGame?,
-    s: FrontEndState, a: FrontEndActions, leadOn: Modifier, compactMenu: Boolean = false,
+    s: FrontEndState, a: FrontEndActions, leadOn: Modifier, compactMenu: Boolean = false, inStore: Boolean = false,
+    part: ActionPart = ActionPart.ALL,
 ) {
     val ctx = LocalContext.current
+    val lead = part != ActionPart.REST
+    val rest = part != ActionPart.LEAD
     val storeKey = if (store != null && id != null) "${store.id}:$id" else null
     val rawDownload = storeKey?.let { StoresState.download(it) }
     val download = rawDownload?.takeIf { it.isActive }
     val failed = rawDownload?.takeIf { it.state == DownloadState.FAILED }
     val cloud = game?.library == Library.XBOX_CLOUD && installed == null
+    val downloadBytes = catalogSize(item)
     Actions {
         when {
             s.shortcutPicker && game != null -> {
-                PrimaryButton(stringResource(R.string.game_shortcut_choose), enabled = !s.busy, main = true, icon = Icons.Filled.PlayArrow, modifier = leadOn) { a.onSteamGame(game) }
-                FileButtons(game, a)
+                if (lead) PrimaryButton(stringResource(R.string.game_shortcut_choose), enabled = !s.busy, main = true, icon = Icons.Filled.PlayArrow, modifier = leadOn) { a.onSteamGame(game) }
+                if (rest) FileButtons(game, a)
             }
             !cloud && (game != null || installed != null) -> {
                 val gone = storeKey?.let { StoresState.uninstalling[it] }
                 val xboxBusy = store == Store.XBOX && id != null && XboxContent.busy(id)
-                PrimaryButton(
-                    stringResource(R.string.stores_play), enabled = !s.busy && gone == null && download == null && !xboxBusy && (store != Store.GOG || installed?.sidecar?.isInstalled != false),
+                val preparing = (game?.launchKey ?: storeKey)?.let { it in s.preparingGames } == true
+                if (lead) PrimaryButton(
+                    stringResource(if (preparing) R.string.store_starting else R.string.stores_play),
+                    enabled = !s.busy && !preparing && gone == null && download == null && !xboxBusy && (store != Store.GOG || installed?.sidecar?.isInstalled != false),
                     main = true, icon = Icons.Filled.PlayArrow, modifier = leadOn,
                 ) {
-                    if (game != null) a.onSteamGame(game) else if (store != null && id != null) launchStoreGame(ctx, store, id, s, a)
+                    if (game != null) a.onSteamGame(game) else if (store != null && id != null) launchStoreGame(store, id, s, a)
                 }
-                if (game != null) {
-                    if (compactMenu) GameMoreMenu(game, a) else {
-                        FileButtons(game, a)
-                        GameShortcutMenu(game, a)
+                if (rest) {
+                    if (game != null) {
+                        if (compactMenu) GameMoreMenu(game, a) else {
+                            FileButtons(game, a)
+                            GameShortcutMenu(game, a)
+                        }
+                    }
+                    if (store == Store.ITCH && installed != null) ItchUpdateButton(installed, download == null && StoresState.uninstalling[installed.key] == null)
+                    if (store == Store.GAMEJOLT && installed != null) GameJoltUpdateButton(installed, download == null && StoresState.uninstalling[installed.key] == null)
+                    if (store == Store.GAMEJOLT && installed != null) GameJoltVersionButton(installed, download == null && StoresState.uninstalling[installed.key] == null)
+                    if (inStore && store == Store.GAMEJOLT && installed != null) {
+                        SecondaryButton(stringResource(R.string.stores_view_on, Store.GAMEJOLT.shortLabel)) {
+                            openUrl(ctx, item?.storeUrl.orEmpty().ifBlank { GameJoltApi.pageUrl("game", installed.sidecar.id) })
+                        }
+                    }
+                    if (store == Store.EA && installed != null) EaUpdateButton(installed, download == null && StoresState.uninstalling[installed.key] == null)
+                    if (store == Store.GOG && installed != null) GogMaintenanceActions(installed)
+                    if (store == Store.XBOX && id != null) XboxInstalledStream(id, game?.name ?: item?.title.orEmpty(), item)
+                    if (store == Store.XBOX && installed != null && id != null) {
+                        SecondaryButton(stringResource(R.string.stores_xbox_update), enabled = download == null && !XboxRuntime.isActive(id)) {
+                            runCatching { XboxBackend.update(ctx, installed) }
+                                .onFailure { StoresState.problems[Store.XBOX] = it.message ?: ctx.getString(R.string.stores_xbox_close_first) }
+                        }
+                        SecondaryButton(stringResource(R.string.stores_xbox_manage), enabled = download == null) { XboxContent.manage(ctx, installed) }
+                    }
+                    if (store == Store.BATTLENET) {
+                        if (installed != null && id != null) {
+                            LaunchedEffect(id) { BattleNetInstall.checkUpdate(ctx, installed) }
+                            if (download != null) {
+                                SteadyDownloadChip(download)
+                                if (download.state != DownloadState.PAUSED) SecondaryButton(stringResource(R.string.stores_dl_pause)) { DownloadQueue.pause(download.key) }
+                                else SecondaryButton(stringResource(R.string.stores_dl_resume)) { DownloadQueue.resume(ctx, download.key) }
+                            } else if (BattleNetInstall.updates[id] == true) {
+                                SecondaryButton(stringResource(R.string.bnet_update)) { BattleNetInstall.update(ctx, installed) }
+                            }
+                        }
+                        SecondaryButton(stringResource(R.string.bnet_open)) { a.onBattleNet() }
+                    }
+                    if (game != null && !compactMenu) {
+                        HideButton(hideKey(game), game)
                         EditArtButton(game)
                     }
                 }
-                if (store == Store.ITCH && installed != null) ItchUpdateButton(installed, download == null && StoresState.uninstalling[installed.key] == null)
-                if (store == Store.GOG && installed != null) GogMaintenanceActions(installed)
-                if (store == Store.XBOX && id != null) XboxInstalledStream(id, game?.name ?: item?.title.orEmpty(), item)
-                if (store == Store.XBOX && installed != null && id != null) {
-                    SecondaryButton(stringResource(R.string.stores_xbox_update), enabled = download == null && !XboxRuntime.isActive(id)) {
-                        runCatching { XboxBackend.update(ctx, installed) }
-                            .onFailure { StoresState.problems[Store.XBOX] = it.message ?: ctx.getString(R.string.stores_xbox_close_first) }
-                    }
-                    SecondaryButton(stringResource(R.string.stores_xbox_manage), enabled = download == null) { XboxContent.manage(ctx, installed) }
-                }
-                if (store == Store.BATTLENET) {
-                    if (installed != null && id != null) {
-                        LaunchedEffect(id) { BattleNetInstall.checkUpdate(ctx, installed) }
-                        if (download != null) {
-                            ActionChip(downloadLabel(download), ok = false)
-                            if (download.state != DownloadState.PAUSED) SecondaryButton(stringResource(R.string.stores_dl_pause)) { DownloadQueue.pause(download.key) }
-                            else SecondaryButton(stringResource(R.string.stores_dl_resume)) { DownloadQueue.resume(ctx, download.key) }
-                        } else if (BattleNetInstall.updates[id] == true) {
-                            SecondaryButton(stringResource(R.string.bnet_update)) { BattleNetInstall.update(ctx, installed) }
-                        }
-                    }
-                    SecondaryButton(stringResource(R.string.bnet_open)) { a.onBattleNet() }
-                }
             }
             download != null -> {
-                ActionChip(downloadLabel(download), ok = false)
-                if (download.state != DownloadState.PAUSED) SecondaryButton(stringResource(R.string.stores_dl_pause), modifier = leadOn) { DownloadQueue.pause(download.key) }
-                else PrimaryButton(stringResource(R.string.stores_dl_resume), main = true, modifier = leadOn) { DownloadQueue.resume(ctx, download.key) }
-                ConfirmButton(stringResource(R.string.stores_dl_cancel), stringResource(R.string.stores_dl_cancel_confirm)) { DownloadQueue.cancel(ctx, download.key) }
+                if (rest) SteadyDownloadChip(download)
+                if (lead) {
+                    if (download.state != DownloadState.PAUSED) SecondaryButton(stringResource(R.string.stores_dl_pause), modifier = leadOn) { DownloadQueue.pause(download.key) }
+                    else PrimaryButton(stringResource(R.string.stores_dl_resume), main = true, modifier = leadOn) { DownloadQueue.resume(ctx, download.key) }
+                }
+                if (rest) ConfirmButton(stringResource(R.string.stores_dl_cancel), stringResource(R.string.stores_dl_cancel_confirm)) { DownloadQueue.cancel(ctx, download.key) }
             }
             failed != null -> {
-                ActionChip(stringResource(R.string.stores_dl_failed), ok = false)
-                PrimaryButton(stringResource(R.string.stores_dl_resume), main = true, modifier = leadOn) {
+                if (rest) ActionChip(stringResource(R.string.stores_dl_failed), ok = false)
+                if (lead) PrimaryButton(stringResource(R.string.stores_dl_resume), main = true, modifier = leadOn) {
                     if (item != null) StoresState.requestInstall(ctx, item) else DownloadQueue.retry(ctx, failed.key)
                 }
-                ConfirmButton(stringResource(R.string.stores_dl_clear), stringResource(R.string.stores_dl_cancel_confirm), compact = true) { DownloadQueue.clear(ctx, failed.key) }
+                if (rest) ConfirmButton(stringResource(R.string.stores_dl_clear), stringResource(R.string.stores_dl_cancel_confirm), compact = true) { DownloadQueue.clear(ctx, failed.key) }
             }
             cloud -> {
                 val cloudId = game.storeId.orEmpty()
-                XboxStreamButton(cloudId, game.name, main = true, modifier = leadOn)
-                if (item?.installable == true && item.xboxPc) {
+                if (lead) XboxStreamButton(cloudId, game.name, main = true, modifier = leadOn)
+                if (rest && item?.installable == true && item.xboxPc) {
                     SecondaryButton(
                         if (StoresState.isUnfinished(item)) stringResource(R.string.stores_resume_install)
-                        else if (item.sizeBytes > 0) stringResource(R.string.stores_install_size, formatBytes(item.sizeBytes))
+                        else if (downloadBytes > 0) stringResource(R.string.stores_install_size, formatBytes(downloadBytes))
                         else stringResource(R.string.stores_install),
                     ) { StoresState.requestInstall(ctx, item) }
                 }
-                if (item != null && StoresState.isUnfinished(item)) ConfirmButton(stringResource(R.string.stores_dl_clear), stringResource(R.string.stores_dl_cancel_confirm), compact = true) { StoresState.clearUnfinished(ctx, item) }
-                XboxLibraryButton(cloudId, item)
+                if (rest && item != null && StoresState.isUnfinished(item)) ConfirmButton(stringResource(R.string.stores_dl_clear), stringResource(R.string.stores_dl_cancel_confirm), compact = true) { StoresState.clearUnfinished(ctx, item) }
+                if (rest) XboxLibraryButton(cloudId, item)
             }
-            store == Store.BATTLENET && item != null -> InstallButton(stringResource(R.string.stores_install), leadOn) { StoresState.requestInstall(ctx, item) }
+            store == Store.BATTLENET && item != null -> if (lead) InstallButton(stringResource(R.string.stores_install), leadOn) { StoresState.requestInstall(ctx, item) }
             store == Store.XBOX && item != null && !item.xboxPc && item.xboxCloud -> {
-                XboxStreamButton(item.id, item.title, main = true, modifier = leadOn)
-                XboxLibraryButton(item.id, item)
+                if (lead) XboxStreamButton(item.id, item.title, main = true, modifier = leadOn)
+                if (rest) XboxLibraryButton(item.id, item)
             }
             item?.installable == true && StoresState.isUnfinished(item) -> {
-                InstallButton(stringResource(R.string.stores_resume_install), leadOn) { StoresState.requestInstall(ctx, item) }
-                ConfirmButton(stringResource(R.string.stores_dl_clear), stringResource(R.string.stores_dl_cancel_confirm), compact = true) { StoresState.clearUnfinished(ctx, item) }
+                if (lead) InstallButton(stringResource(R.string.stores_resume_install), leadOn) { StoresState.requestInstall(ctx, item) }
+                if (rest) ConfirmButton(stringResource(R.string.stores_dl_clear), stringResource(R.string.stores_dl_cancel_confirm), compact = true) { StoresState.clearUnfinished(ctx, item) }
             }
             item?.installable == true -> {
-                InstallButton(
-                    if (item.sizeBytes > 0) stringResource(R.string.stores_install_size, formatBytes(item.sizeBytes)) else stringResource(R.string.stores_install),
+                if (lead) InstallButton(
+                    if (downloadBytes > 0) stringResource(R.string.stores_install_size, formatBytes(downloadBytes)) else stringResource(R.string.stores_install),
                     leadOn,
                 ) { StoresState.requestInstall(ctx, item) }
-                if (store == Store.XBOX && item.xboxCloud) {
+                if (rest && store == Store.XBOX && item.xboxCloud) {
                     XboxStreamButton(item.id, item.title)
                     XboxLibraryButton(item.id, item)
                 }
-                if (!item.accessible) SecondaryButton(buyLabel(item)) { openStoreUrl(ctx, item) }
+                if (rest && !item.accessible) SecondaryButton(buyLabel(item)) { openStoreUrl(ctx, item) }
             }
-            item != null && item.store == Store.ITCH && item.isFree -> {
-                InstallButton(stringResource(R.string.stores_install), leadOn) { StoresState.requestInstall(ctx, item) }
-                SecondaryButton(stringResource(R.string.stores_view_on, item.store.shortLabel)) { openStoreUrl(ctx, item) }
+            item != null && (item.store == Store.ITCH || item.store == Store.GAMEJOLT) && item.isFree -> {
+                if (lead) InstallButton(stringResource(R.string.stores_install), leadOn) { StoresState.requestInstall(ctx, item) }
+                if (rest) SecondaryButton(stringResource(R.string.stores_view_on, item.store.shortLabel)) { openStoreUrl(ctx, item) }
             }
-            item != null && item.isFree -> PrimaryButton(stringResource(R.string.stores_get_free), main = true, modifier = leadOn) { openStoreUrl(ctx, item) }
-            item != null -> PrimaryButton(buyLabel(item), main = true, modifier = leadOn) { openStoreUrl(ctx, item) }
+            item != null && item.isFree -> if (lead) {
+                val adding = StoresState.claiming[item.key] == true
+                PrimaryButton(stringResource(if (adding) R.string.stores_claiming else R.string.stores_get_free), enabled = !adding, main = true, modifier = leadOn) {
+                    if (StoresState.canClaim(item)) StoresState.claim(ctx, item) { openStoreUrl(ctx, item) } else openStoreUrl(ctx, item)
+                }
+            }
+            item != null -> if (lead) PrimaryButton(buyLabel(item), main = true, modifier = leadOn) { openStoreUrl(ctx, item) }
         }
-        if (cloud && (download != null || failed != null)) {
-            XboxStreamButton(game.storeId.orEmpty(), game.name)
-            XboxLibraryButton(game.storeId.orEmpty(), item)
+        if (rest) {
+            val entryKey = game?.let(::hideKey) ?: storeKey
+            if (!s.shortcutPicker && entryKey != null && (game == null || cloud)) HideButton(entryKey, game)
+            if (cloud && (download != null || failed != null)) {
+                XboxStreamButton(game.storeId.orEmpty(), game.name)
+                XboxLibraryButton(game.storeId.orEmpty(), item)
+            }
+            BusyChip(s)
         }
-        BusyChip(s)
     }
 }
 
-/** Xbox Cloud Gaming rows the user added to the Library, for games not installed here. */
 @Composable
 internal fun rememberXboxCloudRows(s: FrontEndState): List<Library.SteamGame> {
     val ctx = LocalContext.current
@@ -535,7 +691,6 @@ private fun XboxInstalledStream(id: String, title: String, item: CatalogItem?) {
 private fun XboxLibraryButton(id: String, item: CatalogItem?) {
     val ctx = LocalContext.current
     LaunchedEffect(Unit) { XboxCloudGames.load(ctx) }
-    // Add and Remove replace each other; the controller focus moves to the new button instead of getting lost.
     val slot = remember { FocusRequester() }
     val inputMode = androidx.compose.ui.platform.LocalInputModeManager.current
     val scope = rememberCoroutineScope()
@@ -554,13 +709,13 @@ private fun buyLabel(item: CatalogItem): String = when {
 }
 
 @Composable
-private fun FileButtons(game: Library.SteamGame, a: FrontEndActions) {
+internal fun FileButtons(game: Library.SteamGame, a: FrontEndActions) {
     game.gameFiles?.takeIf { it.isDirectory }?.let { dir -> SecondaryButton(stringResource(R.string.games_files), compact = true) { a.onBrowseFiles(dir) } }
     game.protonPrefix?.takeIf { it.isDirectory }?.let { dir -> SecondaryButton(stringResource(R.string.games_prefix), compact = true) { a.onBrowseFiles(dir) } }
 }
 
 @Composable
-private fun GameShortcutMenu(g: Library.SteamGame, a: FrontEndActions) {
+internal fun GameShortcutMenu(g: Library.SteamGame, a: FrontEndActions) {
     var open by remember(g.gameId) { mutableStateOf(false) }
     Box {
         SecondaryButton(stringResource(R.string.game_shortcut), compact = true) { open = !open }
@@ -572,9 +727,8 @@ private fun GameShortcutMenu(g: Library.SteamGame, a: FrontEndActions) {
     }
 }
 
-/** The pencil opens the editor each kind of game always had: the shortcut editor for added games, art for the rest. */
 @Composable
-private fun rememberEditArt(g: Library.SteamGame): (() -> Unit)? {
+internal fun rememberEditArt(g: Library.SteamGame): (() -> Unit)? {
     val ctx = LocalContext.current
     val folder = g.gameFiles
     return when {
@@ -587,17 +741,31 @@ private fun rememberEditArt(g: Library.SteamGame): (() -> Unit)? {
     }
 }
 
+internal fun hideKey(g: Library.SteamGame): String = g.storeId?.let { "${g.source}:$it" } ?: GameRef.key(g)
+
 @Composable
-private fun EditArtButton(g: Library.SteamGame) {
+internal fun HideButton(key: String, g: Library.SteamGame?) {
+    val ctx = LocalContext.current
+    rememberHiddenSync()
+    val hidden = LibraryHidden.isHidden(key, g)
+    val failed = stringResource(R.string.game_hide_failed)
+    SecondaryButton(stringResource(if (hidden) R.string.game_unhide else R.string.common_hide), compact = true) { if (!LibraryHidden.set(ctx, key, g, !hidden)) Toast.makeText(ctx, failed, Toast.LENGTH_LONG).show() }
+}
+
+@Composable
+internal fun EditArtButton(g: Library.SteamGame) {
     val open = rememberEditArt(g) ?: return
     IconAction(Icons.Outlined.Edit, stringResource(R.string.game_edit_art), "game:edit", onClick = open)
 }
 
-/** Narrow screens keep one More button in the capsule instead of a row of small ones. */
 @Composable
 private fun GameMoreMenu(g: Library.SteamGame, a: FrontEndActions) {
     var open by remember(g.gameId) { mutableStateOf(false) }
     val edit = rememberEditArt(g)
+    val ctx = LocalContext.current
+    rememberHiddenSync()
+    val hidden = LibraryHidden.isHidden(hideKey(g), g)
+    val failed = stringResource(R.string.game_hide_failed)
     Box {
         SecondaryButton(stringResource(R.string.game_more)) { open = !open }
         AnchoredMenu(open, onDismiss = { open = false }, title = stringResource(R.string.game_more), compact = true) { first ->
@@ -608,13 +776,15 @@ private fun GameMoreMenu(g: Library.SteamGame, a: FrontEndActions) {
             MenuItem(stringResource(R.string.game_shortcut_add), checked = false, focusRequester = take()) { open = false; a.onGameShortcut(g) }
             MenuItem(stringResource(R.string.game_file_export), checked = false) { open = false; a.onExportGameFile(g) }
             MenuItem(stringResource(R.string.game_link_copy), checked = false) { open = false; a.onCopyGameLink(g) }
+            val hideKey = hideKey(g)
+            MenuItem(stringResource(if (hidden) R.string.game_unhide else R.string.common_hide), checked = false) { open = false; if (!LibraryHidden.set(ctx, hideKey, g, !hidden)) Toast.makeText(ctx, failed, Toast.LENGTH_LONG).show() }
             edit?.let { run -> MenuItem(stringResource(R.string.game_edit_art), checked = false) { open = false; run() } }
         }
     }
 }
 
 @Composable
-internal fun IconAction(icon: androidx.compose.ui.graphics.vector.ImageVector, label: String, id: String, danger: Boolean = false, enabled: Boolean = true, frosted: Boolean = false, onClick: () -> Unit) {
+internal fun IconAction(icon: androidx.compose.ui.graphics.vector.ImageVector, label: String, id: String, danger: Boolean = false, enabled: Boolean = true, frosted: Boolean = false, tint: Color? = null, onClick: () -> Unit) {
     val colors = MaterialTheme.colorScheme
     val pill = LocalPillButtons.current
     val shape = if (pill) CircleShape else Shape12
@@ -639,14 +809,26 @@ internal fun IconAction(icon: androidx.compose.ui.graphics.vector.ImageVector, l
                 .controllerConfirm(enabled = enabled, onClick = onClick)
                 .semantics { contentDescription = label },
         ) {
-            Icon(icon, contentDescription = null, tint = if (danger && hot) colors.error else if (danger && !pill) Color.White else colors.onBackground, modifier = Modifier.size(18.dp))
+            Icon(icon, contentDescription = null, tint = tint ?: if (danger && hot) colors.error else if (danger && !pill) Color.White else colors.onBackground, modifier = Modifier.size(18.dp))
         }
     }
     if (frosted) Box(Modifier.glass(CircleShape)) { button() } else button()
 }
 
 @Composable
-private fun RemoveButton(title: String, game: Library.SteamGame?, installed: InstalledStoreGame?, a: FrontEndActions) {
+internal fun FavoriteButton(key: String) {
+    val ctx = LocalContext.current
+    remember { LibraryFavorites.load(ctx) }
+    val on = key in LibraryFavorites.keys
+    IconAction(
+        if (on) Icons.Filled.Favorite else Icons.Filled.FavoriteBorder,
+        stringResource(if (on) R.string.fm_favorite_remove else R.string.fm_favorite_add),
+        "game:favorite", frosted = true, tint = if (on) FavoritesColours.dot else null,
+    ) { LibraryFavorites.toggle(ctx, key) }
+}
+
+@Composable
+internal fun RemoveButton(title: String, game: Library.SteamGame?, installed: InstalledStoreGame?, a: FrontEndActions) {
     val ctx = LocalContext.current
     val colors = MaterialTheme.colorScheme
     if ((installed?.sidecar?.store?.id ?: game?.source) == Store.BATTLENET.id && installed?.sidecar?.id?.let(BattleNetInstall::product) == null) return
@@ -799,10 +981,17 @@ private fun LaunchTab(game: Library.SteamGame, s: FrontEndState, a: FrontEndActi
     val host = rememberMenuHost()
     Column(verticalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
         LaunchSettings(s, a, host, game, hopRail ?: GameRef.key(game))
+        if (canEditSteamLaunchOptions(game, s.shortcutPicker)) {
+            SteamLaunchOptionsPanel(game.appId)
+            SteamInputOverridePanel(game.appId)
+        }
         val folder = game.gameFiles
         if (game.library == Library.ADDED && game.source == Library.ADDED && !s.shortcutPicker && folder != null) ShortcutFields(game, folder)
     }
 }
+
+internal fun canEditSteamLaunchOptions(game: Library.SteamGame, shortcutPicker: Boolean): Boolean =
+    !shortcutPicker && game.source == Library.SOURCE_STEAM && game.library != Library.ADDED
 
 @Composable
 private fun ShortcutFields(game: Library.SteamGame, folder: File) {
@@ -820,8 +1009,10 @@ private fun ShortcutFields(game: Library.SteamGame, folder: File) {
 
 @Composable
 private fun SavesTab(g: Library.SteamGame, prefix: File, a: FrontEndActions) {
-    val saves by produceState<List<GameSaves.SaveDir>?>(null, g.gameId) {
-        value = withContext(Dispatchers.IO) { runCatching { GameSaves.locate(prefix, g) }.getOrDefault(emptyList()) }
+    val context = LocalContext.current.applicationContext
+    var synced by remember(g.gameId) { mutableStateOf(0) }
+    val saves by produceState<List<GameSaves.SaveDir>?>(null, g.gameId, synced) {
+        value = withContext(Dispatchers.IO) { runCatching { GameSaves.saves(context, prefix, g) }.getOrDefault(emptyList()) }
     }
     val found = saves
     val summary = when {
@@ -839,9 +1030,9 @@ private fun SavesTab(g: Library.SteamGame, prefix: File, a: FrontEndActions) {
     }
     Column(Modifier.fillMaxWidth().tabPanel(), verticalArrangement = Arrangement.spacedBy(2.dp)) {
         Text(summary, fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(bottom = 6.dp).readable().padding(4.dp))
-        if (Store.byId(g.source).let { it == Store.GOG || it == Store.EPIC }) {
+        if (CloudSaves.supports(Store.byId(g.source))) {
             SectionLabel(stringResource(R.string.store_cloud_saves))
-            CloudRows(g)
+            CloudRows(g) { synced++ }
             SectionLabel(stringResource(R.string.games_saves))
         }
         MenuItem(stringResource(R.string.games_import_saves), checked = false) { a.onSaveImport(g) }
@@ -856,14 +1047,147 @@ private fun SavesTab(g: Library.SteamGame, prefix: File, a: FrontEndActions) {
 }
 
 @Composable
-private fun CloudRows(g: Library.SteamGame) {
+private fun AddonsTab(g: Library.SteamGame, targets: List<WowAddons.Target>, sessionRunning: Boolean, a: FrontEndActions) {
+    var browsing by remember(g.gameId) { mutableStateOf<WowAddons.Target?>(null) }
+    val curseForge = CurseForgeApp.find(UserAppsState.items)
+    val link = rememberCurseLink(curseForge, sessionRunning)
+    browsing?.let { AddonBrowserDialog(targets, it, curseForge, link) { browsing = null } }
+    Column(Modifier.fillMaxWidth().tabPanel(), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        CurseForgeEntry(a)
+        targets.forEach { target ->
+            val names by produceState(emptyList<WowAddons.Installed>(), target.addOns, WowAddons.imports) {
+                value = withContext(Dispatchers.IO) { WowAddons.details(target) }
+            }
+            val context = LocalContext.current
+            val updates by produceState(emptyMap<String, WowAddonCatalog.Addon>(), names) {
+                value = withContext(Dispatchers.IO) { WowAddonCatalog.updates(context, names, target) }
+            }
+            val scanKey = link?.generation to WowAddons.imports
+            val managed by produceState(emptyMap<String, CurseForgeApp.Project>(), link, target.addOns, scanKey) {
+                value = if (link == null) emptyMap() else withContext(Dispatchers.IO) {
+                    runCatching { CurseForgeApp.byFolder(link.installed(context, target, scanKey)) }.getOrDefault(emptyMap())
+                }
+            }
+            if (targets.size > 1) SectionLabel(target.flavor)
+            MenuItem(stringResource(R.string.addons_download), checked = false) { browsing = target }
+            MenuItem(
+                stringResource(R.string.games_import_addons), checked = false,
+                detail = pluralStringResource(R.plurals.games_addons_count, names.size, names.size),
+            ) { a.onAddonImport(g, target) }
+            MenuItem(stringResource(R.string.games_open_addons_folder), checked = false) {
+                target.addOns.mkdirs()
+                a.onBrowseFiles(target.addOns)
+            }
+            names.forEach { item -> key(target.addOns, item.name) { AddonRow(item, updates[item.name], target, a, link?.let { l -> managed[item.name.lowercase()]?.let { it to l } }) } }
+        }
+    }
+}
+
+@Composable
+private fun CurseForgeEntry(a: FrontEndActions) {
+    val ctx = LocalContext.current
+    val name = stringResource(R.string.addons_source_curse)
+    LaunchedEffect(Unit) { UserAppsState.refresh(ctx) }
+    val app = CurseForgeApp.find(UserAppsState.items)
+    val idle = UserAppsState.working == null
+    if (app == null) {
+        MenuItem(stringResource(R.string.content_install_named, name), checked = false, enabled = idle && !SessionState.running) {
+            UserAppsState.add(ctx, CurseForgeApp.request(), name)
+        }
+    } else {
+        var asking by remember(app.key) { mutableStateOf(false) }
+        var checked by remember { mutableStateOf<String?>(null) }
+        val checkKey = app.key + "@" + app.version
+        LaunchedEffect(checkKey, UserAppsState.checking) {
+            if (UserAppsState.checking == null && checked != checkKey) {
+                checked = checkKey
+                UserAppsState.checkUpdate(ctx, app)
+            }
+        }
+        val update = (UserAppsState.updates[app.key] as? UserApps.UpdateCheck.Available)?.release
+        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+            MenuItem(
+                stringResource(R.string.user_apps_open, name), checked = false, enabled = idle,
+                detail = app.version, modifier = Modifier.weight(1f),
+            ) { a.onUserApp(app) }
+            DeleteButton(name, enabled = idle && !SessionState.running) { asking = true }
+        }
+        if (update != null) MenuItem(stringResource(R.string.user_apps_update_to, update.tag), checked = false, enabled = idle && !SessionState.running) {
+            UserAppsState.update(ctx, app, update)
+        }
+        (UserAppsState.updates[app.key] as? UserApps.UpdateCheck.Failed)?.let { failed ->
+            MenuItem(stringResource(R.string.user_apps_check_updates), checked = false, enabled = idle && UserAppsState.checking == null, detail = failed.message) {
+                UserAppsState.checkUpdate(ctx, app)
+            }
+        }
+        if (asking) ConfirmDialog(
+            title = stringResource(R.string.flathub_remove_title, name),
+            text = stringResource(R.string.flathub_remove_note),
+            confirm = stringResource(R.string.user_apps_remove),
+            onConfirm = { asking = false; UserAppsState.remove(ctx, app) },
+            onDismiss = { asking = false },
+        )
+    }
+    if (UserAppsState.working == name || (UserAppsState.lastError?.startsWith(name) == true)) UserAppsProgress()
+}
+
+@Composable
+internal fun AddonRow(item: WowAddons.Installed, wowiUpdate: WowAddonCatalog.Addon?, target: WowAddons.Target, a: FrontEndActions, curse: Pair<CurseForgeApp.Project, CurseLink>? = null) {
+    val name = item.name
+    val update = wowiUpdate.takeIf { curse == null }
+    val outdated = update != null || curse?.first?.update == true
+    var asking by remember(target.addOns, name) { mutableStateOf(false) }
+    var progress by remember(target.addOns, name) { mutableStateOf<Int?>(null) }
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val delete = stringResource(R.string.common_delete)
+    val colors = MaterialTheme.colorScheme
+    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth().padding(start = 16.dp, top = 2.dp, bottom = 2.dp)) {
+        Column(Modifier.weight(1f)) {
+            Text(name, fontSize = 14.sp, color = colors.onBackground, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            val detail = listOfNotNull(item.version, if (outdated) stringResource(R.string.upd_available) else null).joinToString(" · ")
+            if (detail.isNotEmpty()) Text(
+                progress?.let { stringResource(R.string.ctrl_percent, it) } ?: detail, fontSize = 12.sp,
+                color = if (outdated) LocalPalette.current.signal else colors.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis,
+            )
+        }
+        if (outdated && !SessionState.running) IconAction(Icons.Outlined.Download, stringResource(R.string.common_update), "addon:update:${target.flavor}:$name", enabled = progress == null) {
+            progress = 0
+            scope.launch {
+                val message = withContext(Dispatchers.IO) {
+                    if (curse != null) {
+                        val (project, link) = curse
+                        val done = runCatching { link.change(context, target) { CurseForgeApp.update(context, it.inspector, it.guid, project.id) } }.getOrDefault(false)
+                        WowAddons.changed()
+                        if (done) context.getString(R.string.user_apps_updated, name) else context.getString(R.string.stores_dl_failed_reason, name)
+                    } else update?.let { installAddon(context, it, target) { pct -> scope.launch { progress = pct } }.first }
+                }
+                progress = null
+                if (message != null) android.widget.Toast.makeText(context, message, android.widget.Toast.LENGTH_LONG).show()
+            }
+        }
+        if (!SessionState.running) IconAction(Icons.Outlined.Delete, if (curse != null) stringResource(R.string.common_uninstall) else delete, "addon:delete:${target.flavor}:$name", danger = true) { asking = true }
+    }
+    if (asking) ConfirmDialog(
+        title = if (curse != null) stringResource(R.string.stores_uninstall_title, name) else stringResource(R.string.games_delete_addon_title, name),
+        text = stringResource(R.string.games_delete_addon_body),
+        confirm = if (curse != null) stringResource(R.string.common_uninstall) else delete,
+        onConfirm = { a.onAddonDelete(target, name) },
+        onDismiss = { asking = false },
+    )
+}
+
+@Composable
+private fun CloudRows(g: Library.SteamGame, onSynced: () -> Unit = {}) {
     val store = Store.byId(g.source)?.takeIf { it != Store.AMAZON } ?: return
     val id = g.storeId ?: return
     val context = LocalContext.current.applicationContext
     var busy by remember(g.gameId) { mutableStateOf<String?>(null) }
     var tick by remember(g.gameId) { mutableStateOf(0) }
+    var refreshing by remember(g.gameId) { mutableStateOf(false) }
     val status by produceState<CloudSaves.Status?>(null, g.gameId, tick) {
         value = withContext(Dispatchers.IO) { runCatching { CloudSaves.status(context, store, id) }.getOrNull() }
+        refreshing = false
     }
     val folder = g.gameFiles
     var enabled by remember(g.gameId) { mutableStateOf(folder?.let { StoreGameSidecar.read(it)?.cloud } ?: true) }
@@ -875,7 +1199,7 @@ private fun CloudRows(g: Library.SteamGame) {
         busy = if (up) "up" else "down"
         Thread({
             val r = if (up) CloudSaves.upload(context, store, id, force) else CloudSaves.download(context, store, id, force)
-            StoresState.post { busy = null; tick++; android.widget.Toast.makeText(context, cloudMessage(context, r), android.widget.Toast.LENGTH_SHORT).show() }
+            StoresState.post { refreshing = true; busy = null; tick++; onSynced(); android.widget.Toast.makeText(context, cloudMessage(context, r), android.widget.Toast.LENGTH_SHORT).show() }
         }, "cloud-manual").start()
     }
     MenuItem(stringResource(R.string.store_cloud_saves), checked = enabled && supported, enabled = supported,
@@ -887,11 +1211,13 @@ private fun CloudRows(g: Library.SteamGame) {
             StoresState.post { enabled = written?.cloud ?: enabled }
         }, "cloud-switch").start()
     }
-    val ready = st != null && supported && enabled && busy == null
+    val ready = st != null && supported && enabled && busy == null && !refreshing && st.folder != null && st.signedIn
     val pending = stringResource(R.string.cloud_pending)
     val summary = when {
         st == null || busy != null -> pending
         !supported -> stringResource(R.string.cloud_none)
+        !st.signedIn || st.reason == "not-signed-in" -> stringResource(R.string.cloud_signed_out)
+        st.folder == null -> stringResource(R.string.cloud_not_synced)
         conflict -> stringResource(R.string.cloud_conflict_files, st.conflicts.size)
         st.lastSync > 0 -> stringResource(R.string.cloud_last_sync, android.text.format.DateUtils.getRelativeTimeSpanString(st.lastSync).toString())
         else -> stringResource(R.string.cloud_never)
@@ -932,7 +1258,6 @@ private fun InstallTab(game: Library.SteamGame?, installed: InstalledStoreGame?,
     }
 }
 
-/** Text a controller has to land on to bring it into view: focusable, with the focus ring. */
 @Composable
 internal fun Modifier.readable(): Modifier {
     val pal = LocalPalette.current
@@ -953,7 +1278,13 @@ internal fun FactRow(label: String, value: String, labelWidth: androidx.compose.
     }
 }
 
-/** Store installs are measured by [StoreSizes]; Steam and added games by walking their folder once. */
+@Composable
+internal fun catalogSize(item: CatalogItem?): Long {
+    val ctx = LocalContext.current
+    if (item != null) LaunchedEffect(item.key, item.accessible) { StoreSizes.request(ctx, item) }
+    return item?.let { StoreSizes.size(it) } ?: 0L
+}
+
 @Composable
 internal fun diskSize(installed: InstalledStoreGame?, folder: File): Long? {
     val ctx = LocalContext.current
@@ -968,6 +1299,15 @@ internal fun diskSize(installed: InstalledStoreGame?, folder: File): Long? {
 internal object FolderSizes {
     val known = androidx.compose.runtime.mutableStateMapOf<String, Long>()
     private val asked = java.util.Collections.synchronizedSet(HashSet<String>())
+    private var saved: android.content.SharedPreferences? = null
+
+    // The last walk of each folder shows at once after a restart; a fresh walk still replaces it.
+    fun load(context: android.content.Context) {
+        if (saved != null) return
+        val p = context.applicationContext.getSharedPreferences("folder_sizes", android.content.Context.MODE_PRIVATE)
+        saved = p
+        p.all.forEach { (path, bytes) -> if (bytes is Long && path !in known) known[path] = bytes }
+    }
 
     fun request(folder: File) {
         if (!asked.add(folder.path)) return
@@ -982,7 +1322,54 @@ internal object FolderSizes {
                     override fun visitFileFailed(file: java.nio.file.Path, exc: java.io.IOException): java.nio.file.FileVisitResult = java.nio.file.FileVisitResult.CONTINUE
                 })
             }.isSuccess
-            if (walked) StoresState.post { known[folder.path] = total } else asked.remove(folder.path)
+            if (walked) {
+                saved?.edit()?.putLong(folder.path, total)?.apply()
+                StoresState.post { known[folder.path] = total }
+            } else asked.remove(folder.path)
         }, "folder-size").start()
+    }
+}
+
+@Composable
+private fun SteadyDownloadChip(download: com.droiddeck.launcher.stores.download.DownloadEntry) {
+    val progress = steadyProgress(download)
+    val label = steadyLabel(download, progress)
+    val show = LocalShowSection.current
+    val colors = MaterialTheme.colorScheme
+    val pal = LocalPalette.current
+    val shape = if (LocalPillButtons.current) androidx.compose.foundation.shape.CircleShape else Shape12
+    val src = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
+    val hot = rememberHot(src)
+    val pressed by src.collectIsPressedAsState()
+    val scale by androidx.compose.animation.core.animateFloatAsState(if (pressed) 0.955f else if (hot) 1.02f else 1f, Motion.sp(0.5f, androidx.compose.animation.core.Spring.StiffnessMedium), label = "dlScale")
+    val placed = remember { arrayOfNulls<androidx.compose.ui.layout.LayoutCoordinates>(1) }
+    val description = stringResource(R.string.stores_tab_downloads)
+    val open = {
+        placed[0]?.takeIf { it.isAttached }?.boundsInRoot()?.let { StoresMotion.fly(it) }
+        show("downloads")
+    }
+    Box(
+        contentAlignment = Alignment.CenterStart,
+        modifier = Modifier.paneItem("detail-download").testTag("detail-download")
+            .onGloballyPositioned { placed[0] = it }
+            .widthIn(min = 200.dp).heightIn(min = 48.dp)
+            .graphicsLayer { scaleX = scale; scaleY = scale }.clip(shape)
+            .background(Color.White.copy(alpha = 0.04f))
+            .glideBorder(hot, shape, pal.signal, pal.line2)
+            .hoverable(src)
+            .clickable(interactionSource = src, indication = androidx.compose.foundation.LocalIndication.current, role = androidx.compose.ui.semantics.Role.Button, onClickLabel = description, onClick = open)
+            .controllerConfirm(onClick = open),
+    ) {
+        ChipFill(progress, download.key, pal.signal.copy(alpha = 0.42f))
+        Row(
+            verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween,
+            modifier = Modifier.widthIn(min = 200.dp).padding(start = 16.dp, end = 10.dp),
+        ) {
+            Text(
+                label, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, letterSpacing = 0.5.sp, color = colors.onBackground, maxLines = 1,
+                style = androidx.compose.ui.text.TextStyle(fontFeatureSettings = "tnum"), modifier = Modifier.padding(end = 8.dp),
+            )
+            Icon(androidx.compose.material.icons.Icons.AutoMirrored.Filled.KeyboardArrowRight, description, tint = if (hot) colors.onBackground else colors.onSurfaceVariant, modifier = Modifier.size(20.dp))
+        }
     }
 }

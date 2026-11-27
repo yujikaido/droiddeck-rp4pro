@@ -29,45 +29,7 @@ class BuildWatermarkTest {
     fun localBuildShowsBranch() {
         assertEquals(
             listOf("LOCAL | abcdef0", "feat/thing"),
-            BuildWatermark.lines(pr = 0, ci = false, commit = "abcdef0123", title = "", branch = "feat/thing", maliStable = false, maliRelease = ""),
-        )
-    }
-
-    @Test
-    fun maliBridgeReleaseBuildHasNoWatermark() {
-        assertNull(
-            BuildWatermark.lines(
-                pr = 0, ci = false, commit = "abcdef0123", title = "", branch = "hotfix/compat-tool-respect", maliStable = true,
-            ),
-        )
-    }
-
-    @Test
-    fun maliBridgeTestBuildHasNoWatermark() {
-        assertNull(
-            BuildWatermark.lines(
-                pr = 0, ci = false, commit = "abcdef0123", title = "", branch = "rel/v0.5.5.3-t4", maliStable = false,
-                maliRelease = "v0.5.5.3-test4",
-            ),
-        )
-    }
-
-    @Test
-    fun localDeveloperBuildKeepsWatermark() {
-        assertEquals(
-            listOf("LOCAL | abcdef0", "hotfix/compat-tool-respect"),
-            BuildWatermark.lines(
-                pr = 0, ci = false, commit = "abcdef0123", title = "", branch = "hotfix/compat-tool-respect", maliStable = false,
-                maliRelease = "",
-            ),
-        )
-    }
-
-    @Test
-    fun prBuildKeepsWatermarkEvenWithReleaseFlag() {
-        assertEquals(
-            listOf("PR-12 | abcdef0", "Fix"),
-            BuildWatermark.lines(pr = 12, ci = true, commit = "abcdef0123", title = "Fix", branch = "", maliStable = true),
+            BuildWatermark.lines(pr = 0, ci = false, commit = "abcdef0123", title = "", branch = "feat/thing"),
         )
     }
 }

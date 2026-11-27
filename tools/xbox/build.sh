@@ -14,14 +14,11 @@ if [[ $(uname -m) = aarch64 ]]; then export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_G
 cd "$source_dir"
 cargo build --locked --release --no-default-features --target aarch64-unknown-linux-gnu -p xodus-cli -p xodus-service
 if [[ $(uname -m) = aarch64 || -n ${CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER:-} ]]; then
-    # Under qemu-user (an x86_64 host, tools/xbox/cross.Dockerfile) a test that starts its own executable cannot run:
-    # the child is an aarch64 ELF that nothing emulates (no binfmt_misc in the container). The same test runs on a native arm64 build.
-    skip_spawn=()
-    [[ ${CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER:-} != qemu-* ]] || \
-        skip_spawn=(-- --skip chat_session_policy_lookup_keeps_stdout_machine_readable)
-    cargo test --locked --release --no-default-features --target aarch64-unknown-linux-gnu -p xodus-cli "${skip_spawn[@]}"
+    cargo test --locked --release --no-default-features --target aarch64-unknown-linux-gnu -p xodus-cli
     cargo test --locked --release --no-default-features --target aarch64-unknown-linux-gnu -p xodus credential_
-    cargo test --locked --release --no-default-features --target aarch64-unknown-linux-gnu -p msixvc streaming_
+    msixvc_env=()
+    [[ $(uname -m) = aarch64 ]] || msixvc_env=(RUST_TEST_THREADS=1)
+    env "${msixvc_env[@]}" cargo test --locked --release --no-default-features --target aarch64-unknown-linux-gnu -p msixvc streaming_
 fi
 for binary in xodus-cli xodus-service; do
     install -m755 "$CARGO_TARGET_DIR/aarch64-unknown-linux-gnu/release/$binary" "$out/$binary"

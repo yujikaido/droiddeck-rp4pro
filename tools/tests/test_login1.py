@@ -1,14 +1,10 @@
-"""Real login1 sleep handshakes; run with dbus-run-session and python3-gi."""
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import signal
 import tempfile
 import time
 import unittest
-
-from inotify_slots import NO_SLOT
 
 try:
     import gi
@@ -27,11 +23,8 @@ IFACE = NAME + ".Manager"
 class SleepHandshakeTest(unittest.TestCase):
     ARGS = []
     AGENT_EXIT = None
-    PRELOAD = None
 
     def setUp(self):
-        if NO_SLOT and not self.PRELOAD:
-            self.skipTest("the helper's directory watch: %s. PollingFallbackTest covers the same handshakes" % NO_SLOT)
         self.directory = tempfile.TemporaryDirectory()
         self.dir = Path(self.directory.name)
         self.signals = []
@@ -42,7 +35,7 @@ class SleepHandshakeTest(unittest.TestCase):
         self.subscription = self.bus.signal_subscribe(
             NAME, IFACE, "PrepareForSleep", ROOT, None, Gio.DBusSignalFlags.NONE,
             lambda bus, sender, path, interface, name, body: self.signals.append(body.unpack()[0]))
-        env = dict(os.environ, BL_LAUNCH_DIR=str(self.dir),
+        env = dict(os.environ, DD_LAUNCH_DIR=str(self.dir),
                    DBUS_SYSTEM_BUS_ADDRESS=os.environ["DBUS_SESSION_BUS_ADDRESS"])
         script = SCRIPT
         if self.AGENT_EXIT is not None:
@@ -53,11 +46,8 @@ class SleepHandshakeTest(unittest.TestCase):
             agent = bin_dir / "droiddeck-agent"
             agent.write_text("#!/bin/sh\necho \"$@\" >> \"%s\"\nexit %d\n" % (self.dir / "agent-calls", self.AGENT_EXIT))
             agent.chmod(0o755)
-        if self.PRELOAD:
-            env["LD_PRELOAD"] = str(self.PRELOAD)
-        self.stderr = (self.dir.parent / (self.dir.name + ".stderr")).open("w+")
         self.process = subprocess.Popen(["/usr/bin/python3", str(script), *self.ARGS], env=env,
-                                        stdout=subprocess.DEVNULL, stderr=self.stderr)
+                                        stdout=subprocess.DEVNULL)
         self.wait_for(lambda: (self.dir / "steam-sleep-ready").exists())
 
     def tearDown(self):
@@ -66,13 +56,7 @@ class SleepHandshakeTest(unittest.TestCase):
         self.process.wait(timeout=5)
         self.bus.signal_unsubscribe(self.subscription)
         self.bus.close_sync(None)
-        self.stderr.close()
-        os.unlink(self.stderr.name)
         self.directory.cleanup()
-
-    def helper_stderr(self):
-        self.stderr.seek(0)
-        return self.stderr.read()
 
     def wait_for(self, condition, timeout=8):
         deadline = time.monotonic() + timeout
@@ -248,7 +232,6 @@ class SleepHandshakeTest(unittest.TestCase):
 
 class FakeAgentCase(unittest.TestCase):
     ARGS = []
-    PRELOAD = None
     setUp = SleepHandshakeTest.setUp
     tearDown = SleepHandshakeTest.tearDown
     wait_for = SleepHandshakeTest.wait_for
@@ -340,43 +323,6 @@ class AsleepSteamTest(FakeAgentCase):
         self.wait_for(lambda: self.asked()[-1:] == ["off"])
         self.assertEqual(["--steam-idle-inhibit", "on", "--steam-idle-suspend-seconds",
                           "--steam-idle-inhibit", "off"], self.asked())
-
-
-# inotify_init fails the way it does once the uid's instances are used up (on a phone every DroidDeck
-# process shares the app's uid). GIO then has no local directory monitor at all.
-NO_INOTIFY = r"""
-#include <errno.h>
-int inotify_init(void) { errno = EMFILE; return -1; }
-int inotify_init1(int flags) { (void)flags; errno = EMFILE; return -1; }
-"""
-
-
-@unittest.skipUnless(shutil.which("cc"), "needs a C compiler")
-class PollingFallbackTest(SleepHandshakeTest):
-    """Every handshake above again, with no inotify instance for the helper: it checks the files on a timer."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.build = Path(tempfile.mkdtemp())
-        (cls.build / "no_inotify.c").write_text(NO_INOTIFY)
-        cls.PRELOAD = cls.build / "no_inotify.so"
-        subprocess.run(["cc", "-shared", "-fPIC", "-o", str(cls.PRELOAD), str(cls.build / "no_inotify.c")], check=True)
-
-    @classmethod
-    def tearDownClass(cls):
-        shutil.rmtree(cls.build, True)
-
-    def test_falls_back_once_and_says_so(self):
-        self.request_wake()
-        self.wait_for(lambda: self.signals == [True, False])
-        self.signals.clear()
-        token = self.suspend()
-        self.state(token, "awake")
-        self.wait_for(lambda: self.signals == [True, False])
-        lines = [line for line in self.helper_stderr().splitlines() if "cannot watch the session directory" in line]
-        self.assertEqual(1, len(lines), self.helper_stderr())
-        self.assertIn("every 250 ms instead", lines[0])
-        self.assertNotIn("already exported", self.helper_stderr())
 
 
 class WithNetworkManagerTest(SleepHandshakeTest):

@@ -21,6 +21,8 @@ object FrameGen {
     private const val PREFS = "frame_gen"
 
     data class Mode(val engine: String, val multiplier: Int = 2, val target: Int = 0) {
+        val outputFactor: Int get() = if (engine == ENGINE_OFF) 1 else multiplier
+
         companion object {
             val OFF = Mode(ENGINE_OFF)
         }
@@ -28,33 +30,48 @@ object FrameGen {
 
     fun engine(context: Context): String = mode(context).engine
 
-    /** Steam's own window (the client in Big Picture), as the app id gamescope reports it. */
-    const val STEAM_CLIENT_APP = 769L
+    fun mode(context: Context): Mode = mode(context, null)
 
-    /** True while the Steam client is what has focus and no game does: the focused app is the client, or nothing
-     *  is focused and the client is the only window. */
-    fun steamClientFocused(focusedApp: Long?, focusableApps: List<Long>): Boolean =
-        focusedApp == STEAM_CLIENT_APP ||
-            (focusedApp == null && focusableApps.isNotEmpty() && focusableApps.all { it == STEAM_CLIENT_APP })
-
-    /** What the compositor is armed with: the chosen mode, except off in a picture-in-picture window, in the
-     *  desktop (generated frames on the KDE desktop are pointless; a player log) and in a Steam session while no game
-     *  has focus (the Steam menu runs near 1 fps and generating frames for it only heats the phone; a player log). */
-    fun armedMode(sessionMode: String?, pip: Boolean, chosen: Mode, steamClientFocused: Boolean = false): Mode =
-        if (pip || sessionMode == com.droiddeck.launcher.session.SessionService.MODE_DESKTOP ||
-            (sessionMode == com.droiddeck.launcher.session.SessionService.MODE_STEAM && steamClientFocused)) Mode.OFF else chosen
-
-    fun mode(context: Context): Mode {
+    fun mode(context: Context, appId: String?): Mode {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val engine = prefs.getString("engine", ENGINE_OFF).let { if (it == LEGACY_ENGINE_WINFG) ENGINE_DDFG else it ?: ENGINE_OFF }
-        val target = prefs.getInt("target", 0)
+        val gamePrefix = appId?.takeIf { it.isNotBlank() }?.let { "game.$it." }
+            ?.takeIf { prefs.contains(it + "engine") } ?: ""
+        val engine = prefs.getString(gamePrefix + "engine", ENGINE_OFF)
+            .let { if (it == LEGACY_ENGINE_WINFG) ENGINE_DDFG else it ?: ENGINE_OFF }
+        val target = prefs.getInt(gamePrefix + "target", 0)
         if (engine == ENGINE_LSFG && target in ADAPTIVE_TARGETS) return Mode(engine, target = target)
-        return Mode(engine, prefs.getInt("multiplier", 2).coerceIn(2, 4))
+        return Mode(engine, prefs.getInt(gamePrefix + "multiplier", 2).coerceIn(2, 4))
+    }
+
+    fun hasGameOverride(context: Context, appId: String): Boolean =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).contains("game.$appId.engine")
+
+    fun setForGame(context: Context, appId: String, mode: Mode) {
+        val prefix = "game.$appId."
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putString(prefix + "engine", mode.engine)
+            .putInt(prefix + "multiplier", mode.multiplier)
+            .putInt(prefix + "target", mode.target)
+            .apply()
+    }
+
+    fun clearGame(context: Context, appId: String) {
+        val prefix = "game.$appId."
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .remove(prefix + "engine")
+            .remove(prefix + "multiplier")
+            .remove(prefix + "target")
+            .apply()
     }
 
     fun set(context: Context, mode: Mode) {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
             .putString("engine", mode.engine).putInt("multiplier", mode.multiplier).putInt("target", mode.target).apply()
+    }
+
+    fun clearGlobal(context: Context) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .remove("engine").remove("multiplier").remove("target").apply()
     }
 
     fun label(context: Context): String = label(context, mode(context))
@@ -66,15 +83,32 @@ object FrameGen {
         else -> context.getString(R.string.frame_gen_off)
     }
 
-    fun apply(context: Context, refreshHz: Float): String? = apply(context, mode(context), refreshHz)
+    data class PreparedApply internal constructor(
+        val mode: Mode,
+        internal val lsfgStatus: Int? = null,
+        internal val lsfgCachePath: String? = null,
+    )
 
-    /** Arms [mode] in this process's compositor; the cloud player passes its own mode and frame-rate cap. */
-    fun apply(context: Context, mode: Mode, refreshHz: Float): String? {
+    fun prepareApply(context: Context, mode: Mode): PreparedApply {
+        if (mode.engine != ENGINE_LSFG) return PreparedApply(mode)
+        val status = Lossless.sync(context)
+        val cachePath = Lossless.cacheFile(context)?.absolutePath
+        return PreparedApply(mode, status, cachePath)
+    }
+
+    fun apply(context: Context, refreshHz: Float): String? =
+        apply(context, mode(context), refreshHz)
+
+    fun apply(context: Context, mode: Mode, refreshHz: Float): String? =
+        applyPrepared(context, prepareApply(context, mode), refreshHz)
+
+    fun applyPrepared(context: Context, prepared: PreparedApply, refreshHz: Float): String? {
+        val mode = prepared.mode
         when (mode.engine) {
             ENGINE_LSFG -> {
-                val status = Lossless.sync(context)
-                val cache = Lossless.cacheFile(context)
-                if (status != LsfgNative.STATUS_OK || cache == null) {
+                val status = prepared.lsfgStatus ?: LsfgNative.STATUS_NOT_INSTALLED
+                val cachePath = prepared.lsfgCachePath
+                if (status != LsfgNative.STATUS_OK || cachePath == null) {
                     WaylandCompositor.nativeSetFrameGenArmed(false, 0, 0)
                     val problem = context.getString(
                         if (status == LsfgNative.STATUS_NOT_INSTALLED) R.string.lsfg_problem_missing else R.string.lsfg_problem_failed,
@@ -83,7 +117,7 @@ object FrameGen {
                     return problem
                 }
                 WaylandCompositor.nativeSetFrameGenEngine(WaylandCompositor.FG_ENGINE_LSFG)
-                WaylandCompositor.nativeSetLsfgCachePath(cache.absolutePath)
+                WaylandCompositor.nativeSetLsfgCachePath(cachePath)
                 WaylandCompositor.nativeSetFrameGenTuning(FLOW_SCALE_LSFG, refreshHz)
                 WaylandCompositor.nativeSetFrameGenArmed(true, mode.multiplier, mode.target)
             }

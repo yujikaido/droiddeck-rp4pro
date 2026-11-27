@@ -118,12 +118,18 @@ object HomeWidgets {
         if (live.size != parsed.size) save(context)
     }
 
+    private val listeners: MutableSet<Any> = java.util.Collections.newSetFromMap(java.util.IdentityHashMap())
+
     fun startListening(context: Context) {
+        listeners.add(context)
         load(context)
         runCatching { host(context).startListening() }
     }
 
+    // A restarted launcher starts before the old one stops; the host keeps listening until the last owner stops.
     fun stopListening(context: Context) {
+        listeners.remove(context)
+        if (listeners.isNotEmpty()) return
         runCatching { host(context).stopListening() }
     }
 
@@ -197,7 +203,6 @@ object HomeWidgets {
         if (pendingId == AppWidgetManager.INVALID_APPWIDGET_ID) add(activity, provider.info, null)
     }
 
-    /** Places a widget another app asked for; its own app has already configured it. */
     fun addPinned(activity: Activity, request: LauncherApps.PinItemRequest): Boolean {
         if (pendingId != AppWidgetManager.INVALID_APPWIDGET_ID) return false
         val info = request.getAppWidgetProviderInfo(activity) ?: return false

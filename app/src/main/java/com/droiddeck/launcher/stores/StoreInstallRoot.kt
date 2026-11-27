@@ -3,8 +3,10 @@ package com.droiddeck.launcher.stores
 import android.content.Context
 import android.os.StatFs
 import android.os.storage.StorageManager
+import com.droiddeck.launcher.frontend.AddedGames
 import com.droiddeck.launcher.runtime.LinuxRuntime
 import com.droiddeck.launcher.session.GameStorage
+import com.droiddeck.launcher.session.SecondaryLibrary
 import com.droiddeck.launcher.session.SessionPrefs
 import java.io.File
 import java.util.zip.CRC32
@@ -12,6 +14,7 @@ import java.util.zip.CRC32
 object StoreInstallRoot {
     const val SPACE_UNKNOWN = -1L
     private const val INTERNAL = "root/Games/Stores"
+    const val INTERNAL_GUEST = "/$INTERNAL"
     private const val ON_VOLUME = "Games"
     const val GUEST_EXTERNAL = "/mnt/droiddeck-stores"
 
@@ -39,7 +42,6 @@ object StoreInstallRoot {
         } catch (e: Exception) {
             StoresState.logLine("storage: StatFs failed for store install target (${e.javaClass.simpleName})")
             try {
-                // File's zero also means an unavailable measurement; only StatFs establishes zero.
                 usableBytes(existing).takeIf { it > 0L } ?: SPACE_UNKNOWN
             } catch (fallback: Exception) {
                 StoresState.logLine("storage: usable-space fallback failed for store install target (${fallback.javaClass.simpleName})")
@@ -51,19 +53,12 @@ object StoreInstallRoot {
     @JvmStatic
     fun insufficientSpace(required: Long, available: Long): Boolean = required > 0L && available >= 0L && available < required
 
-    /**
-     * The catalog size is the known minimum for an install. Epic's actual chunk-cache requirement
-     * is determined from its manifest before chunk downloads begin.
-     */
     fun estimatedBytesNeeded(item: CatalogItem): Long = StoreSizes.size(item).coerceAtLeast(0L)
 
-    /** Pre-install storage check to detect insufficient space before starting. */
     fun checkStorage(context: Context, item: CatalogItem, targetRoot: File): StorageCheck {
         val size = estimatedBytesNeeded(item)
         val existing = existingFolder(context, item.store, item.id, item.title)
         val freeTarget = availableBytes(existing ?: targetRoot)
-        // Backends account for completed files on resume; the catalog cannot describe remaining work.
-        // Comparing the full catalog size to remaining free space would reject valid resumes.
         if (item.store == Store.EPIC || existing != null) return StorageCheck(enough = true, requiredBytes = size, availableBytes = freeTarget)
         if (size <= 0L) return StorageCheck(enough = true, requiredBytes = 0L, availableBytes = freeTarget)
         if (insufficientSpace(size, freeTarget)) {
@@ -93,7 +88,6 @@ object StoreInstallRoot {
 
     fun customTarget(context: Context): Target? {
         val folder = defaultStorageFolder(context) ?: return null
-        // Writes are probed when the folder is chosen; File.canWrite() is unreliable on FUSE volumes.
         if (!folder.isDirectory) return null
         val label = SessionPrefs.defaultStorageFolderLabel(context).ifBlank { folderLabel(context, folder) }
         return Target(File(folder, ON_VOLUME), label, removable = true, folder = true)
@@ -106,19 +100,24 @@ object StoreInstallRoot {
 
     fun installRoot(context: Context): File = internalRoot(context)
 
-    fun externalTarget(context: Context): Target? =
-        if (SessionPrefs.defaultStorageFolder(context).isNotBlank()) customTarget(context)
-        else detectedExternalTarget(context)
+    fun externalTarget(context: Context): Target? = when {
+        SessionPrefs.defaultStorageFolder(context).isNotBlank() -> customTarget(context)
+        GameStorage.disconnected(context) -> null
+        else -> detectedExternalTarget(context)
+    }
 
     internal fun externalTarget(targets: List<Target>, internalRoot: File): Target? =
         targets.firstOrNull { it.folder && it.root.absolutePath != internalRoot.absolutePath }
             ?: targets.firstOrNull { it.removable && it.root.absolutePath != internalRoot.absolutePath }
 
     fun defaultTarget(context: Context): Target? = when (SessionPrefs.defaultStorage(context)) {
-        SessionPrefs.DEFAULT_STORAGE_INTERNAL -> Target(internalRoot(context), context.getString(com.droiddeck.launcher.R.string.games_internal), removable = false)
-        SessionPrefs.DEFAULT_STORAGE_EXTERNAL -> externalTarget(context)
+        SessionPrefs.DEFAULT_STORAGE_INTERNAL -> internalTarget(context)
+        SessionPrefs.DEFAULT_STORAGE_EXTERNAL -> externalTarget(context) ?: internalTarget(context)
         else -> null
     }
+
+    private fun internalTarget(context: Context) =
+        Target(internalRoot(context), context.getString(com.droiddeck.launcher.R.string.games_internal), removable = false)
 
     fun libraryRoot(context: Context): File? = GameStorage.effective(context)?.let { File(it.path, ON_VOLUME) }
 
@@ -163,7 +162,6 @@ object StoreInstallRoot {
         }
     }
 
-    /** Xodus has its own PRoot mount table and cannot see the selected Steam library's SD bind. */
     fun externalRootsForXodus(context: Context): List<Pair<File, String>> {
         val roots = externalRoots(context)
         val selectedLibrary = GameStorage.effective(context)?.let { File(it.path, ON_VOLUME) }
@@ -183,6 +181,24 @@ object StoreInstallRoot {
 
     fun externalBindSpecsForXodus(context: Context): List<String> =
         externalBindSpecs(externalRootsForXodus(context), LinuxRuntime.rootDir(context))
+
+    fun guestBinds(context: Context): List<String> {
+        val out = ArrayList<String>(externalBindSpecs(context))
+        val root = LinuxRuntime.rootDir(context)
+        GameStorage.effective(context)?.takeIf { File(it.path).isDirectory }?.let { library ->
+            val content = SecondaryLibrary.contentPath(File(library.path)).path
+            for (guest in SecondaryLibrary.CARD_GUESTS) {
+                File(root, guest.removePrefix("/")).mkdirs()
+                out += "$content:$guest"
+            }
+        }
+        for (folder in AddedGames.roots(context)) {
+            if (!folder.host.isDirectory || !folder.host.canRead()) continue
+            File(root, folder.guest.removePrefix("/")).mkdirs()
+            out += folder.host.path + ":" + folder.guest
+        }
+        return out
+    }
 
     internal fun externalBindSpecs(roots: List<Pair<File, String>>, guestRoot: File): List<String> =
         roots.mapNotNull { (host, guest) ->
@@ -228,7 +244,7 @@ object StoreInstallRoot {
 
     fun isRemovable(context: Context, folder: File): Boolean = !folder.absolutePath.startsWith(internalRoot(context).absolutePath + "/")
 
-    fun storeDir(root: File, store: Store): File = File(root, store.shortLabel)
+    fun storeDir(root: File, store: Store): File = File(root, store.folder)
 
     fun gameFolders(context: Context): List<File> = roots(context).flatMap { root ->
         Store.entries.flatMap { store ->
@@ -256,7 +272,7 @@ object StoreInstallRoot {
                 val sidecar = StoreGameSidecar.read(folder)
                 when {
                     sidecar == null -> Unfinished(store, null, folder)
-                    store == Store.GOG && sidecar.state == StoreGameSidecar.STATE_UPDATING -> null
+                    sidecar.state == StoreGameSidecar.STATE_UPDATING -> null
                     !sidecar.isInstalled -> Unfinished(store, sidecar.id, folder)
                     else -> null
                 }

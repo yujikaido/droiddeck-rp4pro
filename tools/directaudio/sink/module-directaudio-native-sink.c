@@ -1,24 +1,5 @@
 /*
- * module-directaudio-native-sink: a PulseAudio 13 sink that is DirectAudio's AAudio engine,
- * in-process. For the native Linux Steam client on Android (DroidDeck, Bannerlator's Linux
- * session), whose sound can only ever reach a PulseAudio daemon: this module is where that
- * daemon's mixed output meets Android, one step away from AudioFlinger, with the same engine the
- * game driver has - adaptive device buffer that grows a burst on every xrun, optional decay with a
- * remembered floor, a primed ring with fades instead of clicks, route-change / error reopen on a
- * fresh stream, and a stall watchdog.
- *
- * It is the relay helper's per-client OUTPUT engine (directaudio-relay.c) with the socket and the
- * shared-memory ring replaced by a ring in this process, fed by the sink's IO thread exactly as
- * module-directaudio-sink feeds the relay. Compared with that module there is no second process
- * and no 40 ms proot safety margin: the ring here only has to cover the IO thread's own
- * scheduling jitter, so it starts at two bursts and grows only if a callback finds it short.
- *
- * The daemon must run on the Android side (the host app's process), not inside proot, for AAudio
- * to be reachable at all - which is where both host apps already run it.
- *
- * Field fixes carried from the relay (MaxsTechReview, Droid-Deck/DroidDeck#338): prime before
- * playing, fade on an underrun, one consumer per ring across a reopen, a device buffer of at
- * least two bursts.
+ * Derived from the AAudio engine of DirectAudio's relay helper (directaudio-relay.c) by The412Banner.
  *
  * SPDX-License-Identifier: LGPL-2.1-or-later
  */
@@ -52,7 +33,7 @@
 #include <pulsecore/thread-mq.h>
 #include <pulsecore/thread.h>
 
-#include "da_relay_proto.h"   /* struct da_ring + the ring helpers; nothing of the socket protocol */
+#include "da_relay_proto.h"
 
 PA_MODULE_AUTHOR("The412Banner");
 PA_MODULE_DESCRIPTION("Android audio output: DirectAudio's AAudio engine, in-process");
@@ -77,7 +58,6 @@ PA_MODULE_USAGE(
 #define WATCHDOG_TICK_USEC (1 * PA_USEC_PER_SEC)
 #define AUDIO_NICE (-16)
 
-/* ---- tunables: the in-process driver's, same defaults ----------------------- */
 #define DA_KNEE               0.75f
 #define DA_DEFAULT_MS         12
 #define DA_DEFAULT_MAX_MS     100
@@ -85,6 +65,7 @@ PA_MODULE_USAGE(
 #define DA_RING_CAP_MS_LOCAL  250
 #define DA_FREEZE_GAP_NS      500000000ull
 #define DA_CB_STALL_NS        1000000000ull
+#define DA_HOST_RESTART_STALLS 3
 #define DA_DECAY_QUIET_NS     10000000000ull
 #define DA_DECAY_PUNISH_NS    5000000000ull
 #define DA_DECAY_MAX_BACKOFF  32
@@ -112,29 +93,26 @@ struct userdata {
     pa_sample_spec ss;
     size_t frame_size;
 
-    /* configuration */
     aaudio_performance_mode_t perf;
     int32_t target_ms, max_ms, ring_ms;
     bool adaptive, decay, limiter, watchdog_on;
 
-    /* the ring: this process's, same layout as the relay's so the engine is shared */
     struct da_ring *ring;
     int32_t burst;
     int32_t ring_max_target;
 
-    /* the one OUTPUT stream and its adaptive state (the relay's struct client, minus the socket) */
     AAudioStream *aq;
     pthread_mutex_t lock;
     int32_t last_xrun;
     uint64_t last_cb_ns, last_xrun_ns, last_decay_ns, wd_last_tick_ns;
     int32_t base_buf_frames, decay_floor;
     unsigned int decay_backoff, cb_count, wd_last_cb;
+    uint64_t stall_state;
     int reopen_running, reopen_redo;
     int consuming, primed, starved;
     int suspended;
     volatile int dead;
 
-    /* what the IO thread last logged, so engine changes made on the AAudio thread get a line */
     int32_t seen_target, seen_hw_buf;
     uint32_t seen_underruns;
     pa_usec_t next_watchdog, settled_at, stats_at;
@@ -152,8 +130,6 @@ static uint64_t now_ns(void) {
 
 static void request_reopen(struct userdata *u, const char *why);
 
-/* ---- the engine: the relay's out_cb / open_output / reopen / watchdog, on a local ring ---- */
-
 static void fade(float *p, uint32_t frames, int in) {
     uint32_t i, ch;
 
@@ -165,8 +141,6 @@ static void fade(float *p, uint32_t frames, int in) {
     }
 }
 
-/* The driver's soft-knee limiter: below DA_KNEE the signal is untouched, so ordinary material is
- * bit-identical; above it a smooth knee folds the overshoot back under full scale. */
 static void limit(float *p, uint32_t samples) {
     uint32_t i;
 
@@ -182,6 +156,13 @@ static void limit(float *p, uint32_t samples) {
     }
 }
 
+static void record_callback(struct userdata *u) {
+    uint64_t state = __atomic_load_n(&u->stall_state, __ATOMIC_SEQ_CST);
+
+    while (!__atomic_compare_exchange_n(&u->stall_state, &state,
+            ((state >> 32) + 1) << 32, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {}
+}
+
 static aaudio_data_callback_result_t out_cb(AAudioStream *aq, void *user, void *audioData, int32_t numFrames) {
     struct userdata *u = user;
     struct da_ring *r = u->ring;
@@ -193,11 +174,12 @@ static aaudio_data_callback_result_t out_cb(AAudioStream *aq, void *user, void *
     int fade_in = 0, short_read = 0, starving = 0;
     uint64_t now;
 
-    /* Only the promoted stream reads the ring; an outgoing one during a reopen plays silence. */
     if ((live && aq != live) || __atomic_exchange_n(&u->consuming, 1, __ATOMIC_ACQUIRE)) {
         memset(out, 0, (size_t) frames * DA_RING_CHANNELS * sizeof(float));
         return AAUDIO_CALLBACK_RESULT_CONTINUE;
     }
+
+    record_callback(u);
 
     ridx = __atomic_load_n(&r->ridx, __ATOMIC_ACQUIRE);
     avail = __atomic_load_n(&r->widx, __ATOMIC_ACQUIRE) - ridx;
@@ -248,8 +230,6 @@ static aaudio_data_callback_result_t out_cb(AAudioStream *aq, void *user, void *
     __atomic_add_fetch(&u->cb_count, 1, __ATOMIC_SEQ_CST);
     __atomic_store_n(&r->cb_count, u->cb_count, __ATOMIC_RELAXED);
 
-    /* The ring's own adaptive step: a short ring means the IO thread did not get scheduled in
-     * time - an xrun one stage earlier - so keep one more burst queued. Only grows. */
     if (short_read)
         __atomic_add_fetch(&r->underruns, 1, __ATOMIC_RELAXED);
     if ((short_read || starving) && u->adaptive) {
@@ -262,8 +242,6 @@ static aaudio_data_callback_result_t out_cb(AAudioStream *aq, void *user, void *
             __atomic_store_n(&r->target_frames, want, __ATOMIC_RELEASE);
     }
 
-    /* The device buffer: grow a burst per xrun; decay a burst after a quiet spell, never below
-     * the floor a punished decay taught us. */
     if (u->adaptive) {
         int32_t xruns = AAudioStream_getXRunCount(aq);
         int32_t burst = AAudioStream_getFramesPerBurst(aq);
@@ -312,8 +290,6 @@ static void out_error_cb(AAudioStream *aq, void *user, aaudio_result_t error) {
 
     if (aq != __atomic_load_n(&u->aq, __ATOMIC_SEQ_CST)) return;
     if (__atomic_load_n(&u->suspended, __ATOMIC_SEQ_CST)) return;
-    /* A disconnected stream (headphones plugged or unplugged, a Bluetooth route coming or going)
-     * can never be restarted: it has to be closed and a new one opened on the current route. */
     if (error != AAUDIO_ERROR_DISCONNECTED &&
         error != AAUDIO_ERROR_INVALID_STATE &&
         error != AAUDIO_ERROR_INVALID_HANDLE &&
@@ -322,8 +298,6 @@ static void out_error_cb(AAudioStream *aq, void *user, aaudio_result_t error) {
     request_reopen(u, "stream error");
 }
 
-/* 48 kHz / float / stereo, buffer from the ms form rounded up to a burst and never below two,
- * capacity from the ceiling. The ring target floor is two bursts or ring_ms, whichever is more. */
 static aaudio_result_t open_output(struct userdata *u, AAudioStream **out) {
     AAudioStreamBuilder *builder = NULL;
     AAudioStream *aq = NULL;
@@ -446,14 +420,15 @@ static void request_reopen(struct userdata *u, const char *why) {
     }
 }
 
-/* Ticked once a second from the IO thread: a callback silent for a second is a dead stream. */
 static void watchdog(struct userdata *u) {
     uint64_t now = now_ns(), last_cb, prev_tick;
     unsigned int cb;
+    uint64_t stalled;
 
     if (!u->watchdog_on) return;
     if (!__atomic_load_n(&u->aq, __ATOMIC_SEQ_CST)) return;
 
+    stalled = __atomic_load_n(&u->stall_state, __ATOMIC_SEQ_CST);
     prev_tick = u->wd_last_tick_ns;
     u->wd_last_tick_ns = now;
     cb = __atomic_load_n(&u->cb_count, __ATOMIC_SEQ_CST);
@@ -469,6 +444,13 @@ static void watchdog(struct userdata *u) {
     if (!last_cb || now - last_cb < DA_CB_STALL_NS) return;
 
     __atomic_store_n(&u->last_cb_ns, now, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&u->cb_count, __ATOMIC_SEQ_CST) != cb) return;
+    if (!__atomic_compare_exchange_n(&u->stall_state, &stalled, stalled + 1, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) return;
+    if ((uint32_t) (stalled + 1) >= DA_HOST_RESTART_STALLS) {
+        pa_log("directaudio-native-sink: no data callback after %u stream recoveries; restarting the audio host", (unsigned int) (stalled + 1));
+        _exit(EXIT_FAILURE);
+        return;
+    }
     request_reopen(u, "data callback stalled");
 }
 
@@ -484,12 +466,9 @@ static void close_output(struct userdata *u) {
         AAudioStream_requestStop(aq);
         AAudioStream_close(aq);
     }
-    /* A reopen still in flight sees u->dead and stops; give it a moment to let go of u. */
     while (__atomic_load_n(&u->reopen_running, __ATOMIC_SEQ_CST))
         usleep(10000);
 }
-
-/* ---- the PulseAudio side: module-directaudio-sink's producer, on the local ring ---- */
 
 static pa_usec_t frames_to_usec(const struct userdata *u, int64_t frames) {
     return (pa_usec_t) (frames * (int64_t) PA_USEC_PER_SEC / (int64_t) u->ss.rate);
@@ -528,7 +507,6 @@ static void produce(struct userdata *u, uint32_t frames) {
     __atomic_store_n(&r->widx, w + frames, __ATOMIC_RELEASE);
 }
 
-/* Tops the ring up to the engine's target and narrates what the engine changed. */
 static void service_ring(struct userdata *u) {
     struct da_ring *r = u->ring;
     uint32_t avail, space;
@@ -587,8 +565,6 @@ static int sink_process_msg(pa_msgobject *o, int code, void *data, int64_t offse
     return pa_sink_process_msg(o, code, data, offset, chunk);
 }
 
-/* A started AAudio stream keeps audioserver's AudioMix wake lock held, so the device never
- * suspends while the session sleeps: stop it, and the IO thread's timer, until the sink reopens. */
 static int sink_set_state_in_io_thread_cb(pa_sink *s, pa_sink_state_t new_state, pa_suspend_cause_t new_suspend_cause) {
     struct userdata *u = s->userdata;
     aaudio_result_t res = AAUDIO_OK;
@@ -629,9 +605,6 @@ static void thread_func(void *userdata) {
     for (;;) {
         int ret;
 
-        /* Half a burst between visits, never blocking on the stream: clients' audio reaches this
-         * thread as messages pa_rtpoll_run handles, and a thread stuck in a write or a wait lets
-         * them run dry (the crackle #338 fixed). */
         if (!u->suspended) {
             service_ring(u);
             pa_rtpoll_set_timer_relative(u->rtpoll, PA_MAX(frames_to_usec(u, u->burst) / 2, PA_USEC_PER_MSEC));
@@ -719,7 +692,6 @@ int pa__init(pa_module *m) {
     pthread_mutex_init(&u->lock, NULL);
     pa_channel_map_init_stereo(&map);
 
-    /* The ring: the relay's layout in this process's memory. */
     cap_frames = DA_RING_CAP_MS_LOCAL * DA_RING_RATE / 1000;
     u->ring = pa_xmalloc0(da_ring_bytes(cap_frames));
     u->ring->magic = DA_RING_MAGIC;
@@ -774,8 +746,6 @@ int pa__init(pa_module *m) {
     pa_sink_set_asyncmsgq(u->sink, u->thread_mq.inq);
     pa_sink_set_rtpoll(u->sink, u->rtpoll);
     pa_sink_set_max_request(u->sink, (size_t) u->ring->target_frames * u->frame_size);
-    /* What clients should keep queued on their side: the ring's starting target plus the device
-     * buffer. Grows are reported live through GET_LATENCY. */
     pa_sink_set_fixed_latency(u->sink, frames_to_usec(u, (int64_t) u->ring->target_frames + u->base_buf_frames));
 
     if (!(u->thread = pa_thread_new("directaudio-native-sink", thread_func, u))) {

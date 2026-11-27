@@ -223,9 +223,7 @@ class BridgeDxvkTest {
         undoAuto: (String, String) -> String = { id, comp -> error("undo $id $comp") },
     ) = ComponentsManager.ensureForcedPackages(
         context, mali,
-        // The listing carries the build MaliBridge pinned (CatalogPinGoldenTest covers one that moved).
-        lookup = { file, release -> ComponentsManager.CatalogItem(file, "dxvk", release, "https://example.invalid/$file", 4,
-            "sha256:" + (com.droiddeck.launcher.core.CatalogPins.nightlySha256(release, file) ?: "ab".repeat(32))) },
+        lookup = { file, release -> ComponentsManager.CatalogItem(file, "dxvk", release, "https://example.invalid/$file", 4, "sha256:" + "ab".repeat(32)) },
         fetch = {},
         apply = { id, file -> error("non-automatic apply $id $file") },
         vulkan = vk, bridgeSession = bridge, applyAuto = applyAuto, undoAuto = undoAuto, keepProtonDxvk = keep,

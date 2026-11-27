@@ -8,7 +8,6 @@ import unittest
 
 PRELOAD = Path(__file__).resolve().parents[1] / "linuxfs/preload"
 
-# Stands in for libfakeinput.so, which ld.so.preload lists after libblsession.so.
 SHIM = r"""
 #include <linux/input.h>
 #include <stdarg.h>
@@ -68,7 +67,7 @@ class WinebusRumblePreloadTest(unittest.TestCase):
         build.mkdir()
         for name, text in (("shim.c", SHIM), ("upload.c", UPLOAD), ("program.c", PROGRAM)):
             (build / name).write_text(text)
-        cls.lib = cls.dir / "libblsession.so"
+        cls.lib = cls.dir / "libddsession.so"
         subprocess.run(["cc", "-shared", "-fPIC", "-O2", "-Wall", "-pthread", "-o", str(cls.lib),
                         *map(str, sorted(PRELOAD.glob("*.c"))), "-ldl"], check=True)
         cls.shim = cls.dir / "libshim.so"

@@ -2,6 +2,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -64,26 +65,26 @@ UBISOFT_SCRIPT = r'''"installscript"
 }
 '''
 
-
-# An EA game's step that installs the EA app (Titanfall 2): marked as run, a fresh prefix never got
-# the EA app and the game closed seconds after Play without a window.
 EA_SCRIPT = r'''"installscript"
 {
 	"Run Process"
 	{
 		"EADesktopSetup"
 		{
-			"Process 1"		"%INSTALLDIR%\\__Installer\\Origin\\redist\\internal\\EAappInstaller.exe"
-			"Command 1"		"EAX_LAUNCH_CLIENT=0 IGNORE_INSTALLED=1"
+			"process 1"		"%INSTALLDIR%\\__Installer\\Origin\\redist\\internal\\EAappInstaller.exe"
+			"command 1"		"EAX_LAUNCH_CLIENT=0 IGNORE_INSTALLED=1"
 			"HasRunStringKey"		"HKEY_LOCAL_MACHINE\\SOFTWARE\\Electronic Arts\\EA Desktop\\InstallSuccessful"
 			"HasRunStringValue"		"true"
 			"RunType"		"1"
 		}
-		"vcredist2010"
+		"Windows6.1-KB2670838-x64.msu"
 		{
-			"HasRunKey"		"HKEY_LOCAL_MACHINE\\Software\\Valve\\Steam\\Apps\\1237970"
-			"Process 1"		"%INSTALLDIR%\\__Installer\\vc\\vc2010sp1\\redist\\vcredist_x64.exe"
-			"Command 1"		"/q"
+			"process 1"		"%INSTALLDIR%\\__Installer\\customcomponent\\patch_KB2670838_x64\\Windows6.1-KB2670838-x64.msu"
+			"command 1"		"/quiet"
+			"Requirement_OS"
+			{
+				"OSType"		"Windows 7"
+			}
 		}
 	}
 }
@@ -127,6 +128,67 @@ class SeedRedistsTest(unittest.TestCase):
         self.game(library=sd)
         self.run_seed(str(sd))
         self.assertIn('"VCRedist2022"=dword:00000001', self.reg.read_text())
+
+    def manifest(self, name, build):
+        path = self.steam / "steamapps/appmanifest_77.acf"
+        path.write_text('"AppState"\n{\n\t"installdir"\t\t"%s"\n\t"buildid"\t\t"%s"\n}\n' % (name, build))
+        return path
+
+    def test_a_game_is_searched_again_only_when_its_build_changes(self):
+        late = self.steam / "steamapps/common/Late Game/installscript.vdf"
+        late.parent.mkdir(parents=True)
+        manifest = self.manifest("Late Game", "1")
+        self.run_seed()
+        late.write_text(GAME_SCRIPT)
+        manifest.write_text(manifest.read_text() + "\n")
+        self.run_seed()
+        self.assertNotIn("VCRedist2022", self.reg.read_text())
+        self.manifest("Late Game", "2")
+        self.run_seed()
+        self.assertIn('"VCRedist2022"=dword:00000001', self.reg.read_text())
+
+    def test_one_changed_game_leaves_the_other_games_unsearched(self):
+        other = self.game("Other Game").parent / "installscript_extra.vdf"
+        self.manifest("Late Game", "1")
+        self.run_seed()
+        other.write_text(GAME_SCRIPT.replace("VCRedist2022", "Unsearched"))
+        self.manifest("Late Game", "2")
+        self.run_seed()
+        self.assertNotIn("Unsearched", self.reg.read_text())
+
+    def test_a_call_that_names_its_scripts_does_not_search_the_libraries(self):
+        script = self.game()
+        named = self.tmp / "legacycompat/evaluatorscript_1.vdf"
+        named.parent.mkdir(parents=True)
+        named.write_text(GAME_SCRIPT.replace("VCRedist2022", "Named"))
+        env = dict(os.environ, DROIDDECK_LIBRARIES="", DROIDDECK_SEED_SCRIPTS=str(named))
+        subprocess.run(["bash", str(SCRIPT), str(self.steam)], env=env, capture_output=True, text=True, check=True)
+        reg = self.reg.read_text()
+        self.assertIn('"Named"=dword:00000001', reg)
+        self.assertNotIn("VCRedist2022", reg)
+        self.run_seed()
+        self.assertIn('"VCRedist2022"=dword:00000001', self.reg.read_text())
+        self.assertIn(str(script), (self.steam / ".droiddeck-game-scripts").read_text())
+
+    def test_a_removed_game_leaves_the_list(self):
+        script = self.game()
+        self.run_seed()
+        cache = self.steam / ".droiddeck-game-scripts"
+        self.assertIn(str(script), cache.read_text())
+        for manifest in (self.steam / "steamapps").glob("appmanifest_*.acf"):
+            manifest.unlink()
+        self.run_seed()
+        self.assertEqual("", cache.read_text())
+
+    def test_a_list_from_an_earlier_version_is_taken_over_without_a_search(self):
+        script = self.steam / "steamapps/common/Old Game/a/b/c/d/e/installscript.vdf"
+        script.parent.mkdir(parents=True)
+        script.write_text(GAME_SCRIPT)
+        self.manifest("Old Game", "1")
+        (self.steam / ".droiddeck-game-scripts").write_text("123 456\n%s\n" % script)
+        self.run_seed()
+        self.assertIn('"VCRedist2022"=dword:00000001', self.reg.read_text())
+        self.assertIn("\t%s\n" % script, (self.steam / ".droiddeck-game-scripts").read_text())
 
     def test_current_user_and_machine_markers_go_to_their_own_registries(self):
         self.game(script=GAME_SCRIPT + GAME_SCRIPT.replace("HKEY_LOCAL_MACHINE", "HKEY_CURRENT_USER").replace("VCRedist2022", "UserRedist"))
@@ -214,15 +276,6 @@ class SeedRedistsTest(unittest.TestCase):
         self.assertIn('"VCRedist2022"=dword:00000001', (default / "user.reg").read_text())
         self.assertNotIn('"VCRedist2022"', (default / "system.reg").read_text())
         self.assertIn('"VCRedist2022"=dword:00000001', self.user.read_text())
-
-    def test_without_the_shared_redistributables_the_known_list_covers_vc_2005(self):
-        # Just Cause 2 wants VC++ 2005, and the Common Redistributables may land in the launch's minute.
-        self.run_seed()
-        reg = self.reg.read_text()
-        self.assertIn("[Software\\\\Valve\\\\Steam\\\\Apps\\\\CommonRedist\\\\vcredist\\\\2005]", reg)
-        self.assertIn('"x86"=dword:00000001', reg)
-        self.assertIn('"x64"=dword:00000001', reg)
-        self.assertIn("[Software\\\\Valve\\\\Steam\\\\Apps\\\\CommonRedist\\\\vcredist\\\\2008]", reg)
 
     def test_the_vc_runtime_is_recorded_for_every_architecture_and_view(self):
         self.run_seed()
@@ -335,74 +388,6 @@ class SeedRedistsTest(unittest.TestCase):
         self.run_seed()
         self.assertEqual(int(self.reg.stat().st_mtime), 1_000_000_000)
 
-    def manifest(self, appid, name, library=None, **fields):
-        root = Path(library or self.steam)
-        body = "".join('\t"%s"\t\t"%s"\n' % (key, value) for key, value in
-                       [("appid", appid), ("installdir", name)] + sorted(fields.items()))
-        path = root / "steamapps" / ("appmanifest_%s.acf" % appid)
-        path.write_text('"AppState"\n{\n%s}\n' % body)
-        return path
-
-    def cached_scripts(self):
-        lines = (self.steam / ".droiddeck-game-scripts").read_text().splitlines()
-        self.assertEqual(lines[0], "droiddeck-game-scripts 2")
-        return sorted(line.split("\t")[2] for line in lines[1:] if line.split("\t")[2])
-
-    def test_a_launch_rewriting_last_played_does_not_search_the_game_again(self):
-        sd = self.tmp / "sd"
-        script = self.game(name="Balatro", library=sd)
-        self.manifest("2379780", "Balatro", sd, buildid="100", LastPlayed="1", StateFlags="4")
-        for stale in (sd / "steamapps").glob("appmanifest_*.acf"):
-            if stale.name != "appmanifest_2379780.acf":
-                stale.unlink()
-        self.run_seed(str(sd))
-        self.assertEqual(self.cached_scripts(), [str(script)])
-        script.unlink()
-        self.manifest("2379780", "Balatro", sd, buildid="100", LastPlayed="2", StateFlags="4")
-        self.run_seed(str(sd))
-        self.assertEqual(self.cached_scripts(), [str(script)], "kept: only LastPlayed moved")
-        self.manifest("2379780", "Balatro", sd, buildid="101", LastPlayed="2", StateFlags="4")
-        self.run_seed(str(sd))
-        self.assertEqual(self.cached_scripts(), [], "searched again after an update")
-
-    def test_an_old_cache_and_a_removed_game_are_dropped(self):
-        (self.steam / ".droiddeck-game-scripts").write_text("123 45\n/gone/installscript.vdf\n")
-        script = self.game()
-        self.run_seed()
-        self.assertEqual(self.cached_scripts(), [str(script)])
-        for manifest in (self.steam / "steamapps").glob("appmanifest_*.acf"):
-            manifest.unlink()
-        self.run_seed()
-        self.assertEqual(self.cached_scripts(), [])
-
-    def test_the_shared_redistributables_folder_is_not_read_as_a_game(self):
-        shared = self.game(name="Steamworks Shared")
-        self.run_seed()
-        self.assertNotIn(str(shared), self.cached_scripts())
-
-    def test_a_launch_pass_marks_its_prefix_and_the_stock_ones_without_searching(self):
-        other = self.steam / "steamapps/compatdata/999/pfx/system.reg"
-        other.parent.mkdir(parents=True)
-        other.write_text("WINE REGISTRY Version 2\n")
-        stock = self.steam / "steamapps/common/Proton - Experimental/files/share/default_pfx/system.reg"
-        stock.parent.mkdir(parents=True)
-        stock.write_text("WINE REGISTRY Version 2\n")
-        self.run_seed()
-        self.game()  # not searched by a launch pass: the cache does not know it yet
-        script = self.tmp / "legacycompat/evaluatorscript_1234.vdf"
-        script.parent.mkdir(parents=True)
-        script.write_text('"evaluatorscript"\n{\n\t"1"\n' + "\n".join("\t" + line for line in GAME_SCRIPT.replace("VCRedist2022", "x64 14.99.1.0").splitlines()) + "\n}\n")
-        before = other.read_text()
-        env = dict(os.environ, DROIDDECK_LIBRARIES="", DROIDDECK_SEED_SCRIPTS=str(script),
-                   DROIDDECK_SEED_PREFIX=str(self.reg.parent.parent))
-        subprocess.run(["bash", str(SCRIPT), str(self.steam)], env=env, capture_output=True, text=True, check=True)
-        self.assertIn('"x64 14.99.1.0"=dword:00000001', self.reg.read_text())
-        self.assertIn('"x64 14.99.1.0"=dword:00000001', stock.read_text())
-        self.assertNotIn('"VCRedist2022"=dword:00000001', self.reg.read_text())
-        self.assertEqual(before, other.read_text(), "another game's prefix waits for the session's pass")
-        self.run_seed()
-        self.assertIn('"VCRedist2022"=dword:00000001', other.read_text())
-
     def rdr2(self):
         path = self.steam / "steamapps/common/Red Dead Redemption 2/installscript.vdf"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -416,13 +401,6 @@ class SeedRedistsTest(unittest.TestCase):
         self.assertNotIn("Vulkan111080", reg)
         self.assertIn('"RockstarLauncher"=dword:00000001', reg)
         self.assertNotIn("Vulkan111080", (self.reg.parent / ".droiddeck-redists").read_text())
-
-    def test_the_log_names_the_games_own_steps_marked_once(self):
-        self.rdr2()
-        out = self.run_seed().stdout
-        self.assertIn("(games' own install steps: RockstarLauncher)", out)
-        self.assertNotIn("Vulkan111080", out)
-        self.assertNotIn("seeded redist markers", self.run_seed().stdout)
 
     def test_a_current_user_vulkan_installer_is_left_to_run(self):
         self.game(script=VULKAN_SCRIPT.replace("HKEY_LOCAL_MACHINE", "HKEY_CURRENT_USER"))
@@ -482,13 +460,72 @@ class SeedRedistsTest(unittest.TestCase):
         self.assertEqual(self.reg.read_text().count('"Vulkan111080"'), 2)
 
 
-    def ubisoft(self):
-        script = self.tmp / "legacycompat/evaluatorscript_447040.vdf"
+    def test_a_session_start_leaves_the_library_search_to_a_later_run(self):
+        self.game(script=GAME_SCRIPT.replace("Software\\\\Valve\\\\Steam\\\\Apps\\\\CommonRedist\\\\vcredist\\\\2022", "SOFTWARE\\\\AGEIA Technologies").replace("VCRedist2022", "PhysX Version"))
+        shim = self.tmp / "bin"
+        shim.mkdir()
+        go = self.tmp / "go"
+        (shim / "find").write_text('#!/bin/sh\ncase "$*" in *"installscript*"*) n=0; while [ ! -e "%s" ] && [ $n -lt 600 ]; do sleep 0.1; n=$((n + 1)); done;; esac\nexec %s "$@"\n' % (go, shutil.which("find")))
+        (shim / "find").chmod(0o755)
+        env = dict(os.environ, DROIDDECK_LIBRARIES="", DROIDDECK_SEED_LATER="1", PATH="%s:%s" % (shim, os.environ["PATH"]))
+        marker = '"PhysX Version"=dword:00000001'
+        subprocess.run(["bash", str(SCRIPT), str(self.steam)], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        self.assertNotIn(marker, self.reg.read_text())
+        go.touch()
+        deadline = time.monotonic() + 30
+        while marker not in self.reg.read_text() and time.monotonic() < deadline:
+            time.sleep(0.2)
+        self.assertIn(marker, self.reg.read_text())
+        before = self.reg.read_text()
+        subprocess.run(["bash", str(SCRIPT), str(self.steam)], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        time.sleep(0.5)
+        self.assertEqual(before, self.reg.read_text())
+
+    def test_a_game_whose_search_failed_is_searched_again(self):
+        self.game()
+        broken = self.tmp / "broken"
+        broken.touch()
+        shim = self.tmp / "bin"
+        shim.mkdir()
+        (shim / "find").write_text('#!/bin/sh\n%s "$@"\n[ ! -e "%s" ]\n' % (shutil.which("find"), broken))
+        (shim / "find").chmod(0o755)
+        env = dict(os.environ, DROIDDECK_LIBRARIES="", PATH="%s:%s" % (shim, os.environ["PATH"]))
+        subprocess.run(["bash", str(SCRIPT), str(self.steam)], env=env, capture_output=True, check=True)
+        self.assertNotIn("VCRedist2022", self.reg.read_text())
+        broken.unlink()
+        subprocess.run(["bash", str(SCRIPT), str(self.steam)], env=env, capture_output=True, check=True)
+        self.assertIn('"VCRedist2022"=dword:00000001', self.reg.read_text())
+
+    def test_a_later_run_leaves_the_registry_alone_while_a_wine_server_runs(self):
+        self.game(script=GAME_SCRIPT.replace("Software\\\\Valve\\\\Steam\\\\Apps\\\\CommonRedist\\\\vcredist\\\\2022", "SOFTWARE\\\\AGEIA Technologies").replace("VCRedist2022", "PhysX Version"))
+        shim = self.tmp / "bin"
+        shim.mkdir()
+        (shim / "pgrep").write_text("#!/bin/sh\nexit 0\n")
+        (shim / "pgrep").chmod(0o755)
+        env = dict(os.environ, DROIDDECK_LIBRARIES="", DROIDDECK_SEED_LATER="1", PATH="%s:%s" % (shim, os.environ["PATH"]))
+        subprocess.run(["bash", str(SCRIPT), str(self.steam)], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        cache = self.steam / ".droiddeck-game-scripts"
+        deadline = time.monotonic() + 30
+        while not (cache.exists() and "installscript" in cache.read_text().lower()) and time.monotonic() < deadline:
+            time.sleep(0.2)
+        self.assertIn("installscript", cache.read_text().lower())
+        time.sleep(1)
+        self.assertNotIn("PhysX Version", self.reg.read_text())
+        env.pop("DROIDDECK_SEED_LATER")
+        env["PATH"] = os.environ["PATH"]
+        subprocess.run(["bash", str(SCRIPT), str(self.steam)], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        self.assertIn('"PhysX Version"=dword:00000001', self.reg.read_text())
+
+    def evaluator(self, appid, install_script):
+        script = self.tmp / ("legacycompat/evaluatorscript_%s.vdf" % appid)
         script.parent.mkdir(parents=True)
-        script.write_text('"evaluatorscript"\n{\n\t"appid"\t\t"447040"\n\t"1"\n'
-                          + "\n".join("\t" + line for line in UBISOFT_SCRIPT.splitlines()) + "\n}\n")
+        script.write_text('"evaluatorscript"\n{\n\t"appid"\t\t"%s"\n\t"1"\n' % appid
+                          + "\n".join("\t" + line for line in install_script.splitlines()) + "\n}\n")
         env = dict(os.environ, DROIDDECK_LIBRARIES="", DROIDDECK_SEED_SCRIPTS=str(script))
         return subprocess.run(["bash", str(SCRIPT), str(self.steam)], env=env, capture_output=True, text=True, check=True)
+
+    def ubisoft(self):
+        return self.evaluator("447040", UBISOFT_SCRIPT)
 
     def test_the_ubisoft_connect_installer_is_left_to_run(self):
         self.ubisoft()
@@ -508,36 +545,28 @@ class SeedRedistsTest(unittest.TestCase):
         result = self.ubisoft()
         self.assertNotIn("Ubisoft Connect PC Client", self.reg.read_text())
         self.assertNotIn("Ubisoft Connect PC Client", (self.reg.parent / ".droiddeck-redists").read_text())
-        self.assertIn("Ubisoft Connect markers out", result.stdout)
-
-    def ea(self):
-        script = self.tmp / "legacycompat/evaluatorscript_1237970.vdf"
-        script.parent.mkdir(parents=True)
-        script.write_text('"evaluatorscript"\n{\n\t"appid"\t\t"1237970"\n\t"1"\n'
-                          + "\n".join("\t" + line for line in EA_SCRIPT.splitlines()) + "\n}\n")
-        env = dict(os.environ, DROIDDECK_LIBRARIES="", DROIDDECK_SEED_SCRIPTS=str(script))
-        return subprocess.run(["bash", str(SCRIPT), str(self.steam)], env=env, capture_output=True, text=True, check=True)
+        self.assertIn("Ubisoft Connect and EA app markers out", result.stdout)
 
     def test_the_ea_app_installer_is_left_to_run(self):
-        self.ea()
+        self.evaluator("1238080", EA_SCRIPT)
         reg = self.reg.read_text()
         self.assertNotIn("EADesktopSetup", reg)
+        self.assertEqual(reg.count('"Windows6.1-KB2670838-x64.msu"=dword:00000001'), 2)
         self.assertNotIn("EADesktopSetup", (self.reg.parent / ".droiddeck-redists").read_text())
-        self.assertIn('"vcredist2010"=dword:00000001', reg)
 
     def test_an_ea_app_marker_an_earlier_seeding_wrote_comes_out(self):
-        marker = "HKEY_LOCAL_MACHINE\\\\Software\\\\Valve\\\\Steam\\\\Apps\\\\1237970\tEADesktopSetup"
+        marker = "HKEY_LOCAL_MACHINE\\\\Software\\\\Valve\\\\Steam\\\\Apps\\\\1238080\tEADesktopSetup"
         self.reg.write_text(
             "WINE REGISTRY Version 2\n"
-            "\n[Software\\\\Valve\\\\Steam\\\\Apps\\\\1237970] 1791729070\n"
+            "\n[Software\\\\Valve\\\\Steam\\\\Apps\\\\1238080] 1793680524\n"
             '"EADesktopSetup"=dword:00000001\n'
-            "\n[Software\\\\Wow6432Node\\\\Valve\\\\Steam\\\\Apps\\\\1237970] 1791729070\n"
+            "\n[Software\\\\Wow6432Node\\\\Valve\\\\Steam\\\\Apps\\\\1238080] 1793680524\n"
             '"EADesktopSetup"=dword:00000001\n')
         (self.reg.parent / ".droiddeck-redists").write_text(marker + "\n")
-        result = self.ea()
+        result = self.evaluator("1238080", EA_SCRIPT)
         self.assertNotIn("EADesktopSetup", self.reg.read_text())
         self.assertNotIn("EADesktopSetup", (self.reg.parent / ".droiddeck-redists").read_text())
-        self.assertIn("EA app and Ubisoft Connect markers out", result.stdout)
+        self.assertIn("EA app markers out", result.stdout)
 
 if __name__ == "__main__":
     unittest.main()

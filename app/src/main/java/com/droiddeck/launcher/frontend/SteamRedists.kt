@@ -14,11 +14,18 @@ object SteamRedists {
         "228988" to ("vcredist2019_dll" to "VC++ 2019"),
         "228989" to ("vcredist2022_dll" to "VC++ 2022"),
         "228990" to ("d3dx9" to "DirectX (June 2010)"),
+        // OpenAL 2.0.7.0 (Hotline Miami lists it; without it HotlineGL.exe fails to load, c0000135).
+        "229020" to ("oalinst_dll" to "OpenAL"),
     )
-    /** Redists a game's own install script runs on Windows that its shared depots don't name. */
     val SCRIPTED = mapOf(
         72850 to listOf("xact" to "DirectX XACT audio"),
         489830 to listOf("xact_x64" to "DirectX XACT audio (64-bit)"),
+        // Warband compiles its postFX .fx effects at launch through d3dx9_42; Wine's own d3dcompiler_42 stops with E5017/E5033 on fx_2_0.
+        48700 to listOf("d3dx9" to "DirectX 9 (d3dx9)", "d3dcompiler_42" to "D3DCompiler 42"),
+        // DST's bundled ANGLE compiles SM3 shaders through d3dcompiler_43; DXVK's SM3 parser asserts on what Wine's own one emits.
+        322330 to listOf("d3dcompiler_43" to "D3DCompiler 43"),
+        // EU4 builds its map effects through native d3dx9_43, which calls d3dcompiler_43; Wine's own one fails them with E5005, so the map draws black.
+        236850 to listOf("d3dx9" to "DirectX 9 (d3dx9)", "d3dcompiler_43" to "D3DCompiler 43"),
     )
     private val BLOCK = Regex("\"SharedDepots\"\\s*\\{([^}]*)\\}", RegexOption.IGNORE_CASE)
     private val ENTRY = Regex("\"(\\d+)\"\\s+\"\\d+\"")
@@ -28,7 +35,6 @@ object SteamRedists {
         return File(steamapps, "appmanifest_$appId.acf").takeIf { it.isFile }
     }
 
-    /** Redists the game's own install script has Steam run on Windows, from its "Run Process" entries. */
     fun installScript(gameDir: File?): List<Pair<String, String>> =
         gameDir?.listFiles { f ->
             f.isFile && f.length() < 1L shl 20 && f.name.lowercase().let { it.startsWith("installscript") && it.endsWith(".vdf") }

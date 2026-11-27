@@ -1,4 +1,5 @@
 #!/usr/bin/python3
+import glob
 import os
 
 HOME = os.environ.get("HOME", "/root")
@@ -89,7 +90,6 @@ def rpcs3_shader_mode():
 
 
 def ini_section(lines, name):
-    """(start, end) line indices of [name]'s body, or None."""
     start = None
     for i, l in enumerate(lines):
         t = l.strip()
@@ -102,9 +102,6 @@ def ini_section(lines, name):
 
 
 def patch_ini_section(path, section, body, what, needle="SDL-", require=None, done="Player 1 on the controller"):
-    """Add body's lines to [section] of an ini the emulator wrote itself, unless the section
-    already binds a controller (needle). Missing file: nothing - the emulator writes its own
-    defaults on first run and this runs again."""
     if not os.path.isfile(path):
         return
     with open(path, encoding="utf-8", errors="replace") as f:
@@ -178,7 +175,6 @@ def ini_get(path, section, key):
 
 
 def ini_set(path, section, key, value):
-    """Sets one key (the first of that name) in [section], adding either as needed."""
     with open(path, encoding="utf-8", errors="replace") as f:
         lines = f.read().splitlines()
     span = ini_section(lines, section)
@@ -440,9 +436,6 @@ def armsx2():
 
 
 def armsx2_bios(ini):
-    """PCSX2 boots the one BIOS file named in [Filenames] BIOS (inside [Folders] Bios); its first-time
-    setup is what names it. With that skipped, the first dump in the folder is named here - a US one
-    first - while none is named or the named one is gone. A choice made in ARMSX2 is kept."""
     folder = ini_get(ini, "Folders", "Bios") or ps2_bios_folder()
     if not os.path.isabs(folder):
         folder = os.path.join(os.path.dirname(os.path.dirname(ini)), folder)
@@ -518,12 +511,6 @@ DOLPHIN_DATA = "/usr/share/dolphin-emu"
 
 
 def dolphin_data():
-    """The Dolphin build in the catalog finds its own data - the GameCube fonts, the per-game fixes
-    (GameSettings: GUT.ini puts Ultimate Spider-Man on the MMU), its icons and shaders - only at the
-    fixed /usr/share/dolphin-emu it was built for; there is no setting or variable to move it. Here it
-    runs from a copy unpacked under /tmp (no FUSE), so it found none of it: a GameCube game stopped
-    on "Windows-1252 fonts are not loaded", another on an invalid write the missing game fix would
-    have prevented. So the folder is unpacked from the AppImage to that path, once per AppImage."""
     import shutil, subprocess, tempfile
     try:
         st = os.stat(DOLPHIN_APPIMAGE)
@@ -707,7 +694,7 @@ def melonds_geometry():
     import base64, struct
     w, h = 512, 288
     try:
-        screen_w = int(os.environ.get("BL_WIDTH", "1920"))
+        screen_w = int(os.environ.get("DD_WIDTH", "1920"))
     except ValueError:
         screen_w = 1920
     rect = (0, 0, w - 1, h - 1)
@@ -716,7 +703,6 @@ def melonds_geometry():
 
 
 def toml_get(lines, table, key):
-    """The raw value of key in [table], or None."""
     inside = False
     for l in lines:
         t = l.strip()
@@ -728,7 +714,6 @@ def toml_get(lines, table, key):
 
 
 def toml_set(lines, table, key, value):
-    """key = value in [table]; the table is added at the end when missing."""
     start = None
     for i, l in enumerate(lines):
         t = l.strip()
@@ -920,25 +905,103 @@ input_r_y_minus_axis = "-3"
 """
 
 
+RETROARCH_SYSTEM_CFG = "/etc/retroarch.cfg"
+RETROARCH_PACKAGED = {
+    "assets_directory": "~/.config/retroarch/assets",
+    "libretro_directory": "~/.config/retroarch/cores",
+    "libretro_info_path": "~/.config/retroarch/cores",
+    "menu_show_core_updater": "true",
+}
+
+
+def cfg_value(line):
+    key, sep, value = line.partition("=")
+    return key.strip(), value.strip().strip('"') if sep else None
+
+
+def retroarch_system_values():
+    try:
+        with open(RETROARCH_SYSTEM_CFG, encoding="utf-8", errors="replace") as f:
+            pairs = [cfg_value(l) for l in f if not l.lstrip().startswith("#")]
+    except OSError:
+        return {}
+    return {k: v for k, v in pairs if k in RETROARCH_PACKAGED and v is not None}
+
+
+def retroarch_has_cores(directory):
+    return bool(glob.glob(os.path.join(os.path.expanduser(directory), "*.so")))
+
+
+def retroarch_installed_cores(d):
+    for directory in (os.path.join(d, "cores"), RETROARCH_PACKAGED["libretro_directory"]):
+        if retroarch_has_cores(directory):
+            return directory
+    return None
+
+
 def retroarch():
     d = os.path.join(CONFIG, "retroarch")
     seed(os.path.join(d, "autoconfig/sdl2/Xbox 360 Controller.cfg"), RETROARCH_PROFILE, "RetroArch (profile)")
     cfg = os.path.join(d, "retroarch.cfg")
+    system = retroarch_system_values()
     if not os.path.isfile(cfg):
-        seed(cfg, 'input_joypad_driver = "sdl2"\ninput_autodetect_enable = "true"\n', "RetroArch")
+        if retroarch_installed_cores(d):
+            system.pop("libretro_directory", None)
+        text = 'input_joypad_driver = "sdl2"\ninput_autodetect_enable = "true"\n'
+        text += "".join(f'{k} = "{v}"\n' for k, v in system.items())
+        seed(cfg, text, "RetroArch")
         return
     with open(cfg, encoding="utf-8", errors="replace") as f:
         lines = f.read().splitlines()
     changed = False
+    paths = {}
+    for i, line in enumerate(lines):
+        key, value = cfg_value(line)
+        if key in system and key != "menu_show_core_updater" and value is not None:
+            paths.setdefault(key, []).append((i, value))
+    for key, entries in paths.items():
+        if not any(value == "" for _, value in entries):
+            continue
+        fallback = system[key]
+        if key == "libretro_directory":
+            fallback = retroarch_installed_cores(d) or fallback
+        value = next((value for _, value in entries if value), fallback)
+        first = entries[0][0]
+        replacement = f'{key} = "{value}"'
+        if lines[first] != replacement or len(entries) > 1:
+            changed = True
+        lines[first] = replacement
+        for i, _ in entries[1:]:
+            lines[i] = None
+    lines = [line for line in lines if line is not None]
+    seen = set()
     for i, l in enumerate(lines):
         if l.replace(" ", "").startswith('input_joypad_driver="udev"'):
             lines[i] = 'input_joypad_driver = "sdl2"'
+            changed = True
+        key, value = cfg_value(l)
+        if key in system and value is not None:
+            seen.add(key)
+        if (
+            key == "libretro_directory"
+            and value == RETROARCH_PACKAGED[key]
+            and (retroarch_has_cores(value) or retroarch_has_cores(os.path.join(d, "cores")))
+        ):
+            continue
+        if key in system and key != "menu_show_core_updater" and value == RETROARCH_PACKAGED[key] and system[key] != value:
+            lines[i] = f'{key} = "{system[key]}"'
+            changed = True
+    for key, value in system.items():
+        if key not in seen:
+            if key == "libretro_directory" and retroarch_installed_cores(d):
+                continue
+            lines.append(f'{key} = "{value}"')
             changed = True
     if changed:
         with open(cfg + ".tmp", "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
         os.replace(cfg + ".tmp", cfg)
-        print(f"droiddeck-pad-defaults: RetroArch: joypad driver udev -> sdl2 ({cfg})")
+        print(f"droiddeck-pad-defaults: RetroArch: controller driver and packaged paths ({cfg})")
 
 
 SWITCH_PAD = "engine:sdl,port:0,guid:030000005e0400008e02000010010000,"

@@ -36,13 +36,14 @@ object CloudPlan {
         return Plan(transfer, conflicts, same)
     }
 
-    fun up(local: Map<String, Local>, remote: Map<String, Remote>, baseline: Map<String, Entry>?): Plan {
+    fun up(local: Map<String, Local>, remote: Map<String, Remote>, baseline: Map<String, Entry>?, deleted: Set<String> = emptySet()): Plan {
         if (baseline == null) return Plan(emptyList(), emptyList(), emptyList(), refused = "no-baseline")
         val transfer = ArrayList<String>(); val conflicts = ArrayList<String>(); val same = ArrayList<String>()
         for ((name, l) in local) {
             val r = remote[name]
             val b = baseline[name]
             when {
+                r == null && name in deleted && !localChanged(l, b) -> Unit
                 r == null -> transfer += name
                 same(l, r) -> same += name
                 localChanged(l, b) && cloudChanged(r, b) -> conflicts += name
@@ -50,6 +51,19 @@ object CloudPlan {
             }
         }
         return Plan(transfer, conflicts, same)
+    }
+
+    /**
+     * Files to send. GOG objects uploaded by older builds are raw while their cloud hash is still the
+     * local raw MD5, so they appear in [Plan.same]; resending them stores the gzip form Galaxy reads.
+     * A forced GOG upload is the manual repair path and sends every local file, including unchanged
+     * ones the service gives no hash for; once rewritten the cloud hash is the compressed MD5.
+     */
+    fun upSend(plan: Plan, force: Boolean, repairRawGog: Boolean, allLocal: Collection<String> = emptyList()): List<String> {
+        if (force) {
+            return (plan.transfer + plan.conflicts + if (repairRawGog) allLocal else emptyList()).distinct()
+        }
+        return (plan.transfer + if (repairRawGog) plan.same else emptyList()).distinct()
     }
 
     fun toJson(baseline: Map<String, Entry>): String = JSONObject().apply {

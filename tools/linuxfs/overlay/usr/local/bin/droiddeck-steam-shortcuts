@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Import added games while Steam is closed, preserving user-created shortcuts.
 
 Usage: droiddeck-steam-shortcuts <steam_root> <added-games.json>
@@ -15,52 +15,31 @@ import sys
 TAG = "droiddeck-app"
 
 
-STEAM64_BASE = 76561197960265728
-
-
-def login_users(steam_root):
-    """loginusers.vdf's accounts: (SteamID64, {key in lower case: value})."""
-    try:
-        with open(os.path.join(steam_root, "config", "loginusers.vdf"), encoding="utf-8", errors="replace") as f:
-            text = f.read()
-    except OSError:
-        return []
-    users = []
-    for block in re.finditer(r'"(\d{5,})"\s*\{([^}]*)\}', text):
-        keys = {k.lower(): v for k, v in re.findall(r'"([^"]+)"\s*"([^"]*)"', block.group(2))}
-        users.append((int(block.group(1)), keys))
-    return users
-
-
 def account_dir(steam_root):
-    """The signed-in account's userdata folder.
-
-    loginusers.vdf's account marked MostRecent, else AllowAutoLogin, else the one with the newest
-    Timestamp; without any of those, the userdata folder whose localconfig.vdf was written last,
-    else the only one that is not 0.
-    """
-    best, rank = None, None
-    for steamid, keys in login_users(steam_root):
-        stamp = keys.get("timestamp", "")
-        r = (keys.get("mostrecent") == "1", "1" in (keys.get("allowautologin"), keys.get("autologin")), int(stamp) if stamp.isdigit() else 0)
-        if any(r) and steamid > STEAM64_BASE and (rank is None or r > rank):
-            best, rank = steamid, r
+    users = os.path.join(steam_root, "config", "loginusers.vdf")
+    recent, best = None, None
+    try:
+        with open(users, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+        for block in re.finditer(r'"(\d{5,})"\s*\{([^}]*)\}', text):
+            stamp = re.search(r'"timestamp"\s*"(\d+)"', block.group(2))
+            rank = (bool(re.search(r'"MostRecent"\s*"1"', block.group(2))),
+                    bool(re.search(r'"AutoLogin"\s*"1"', block.group(2))),
+                    int(stamp.group(1)) if stamp else 0)
+            if any(rank) and (best is None or rank >= best):
+                recent, best = int(block.group(1)), rank
+    except OSError:
+        pass
     userdata = os.path.join(steam_root, "userdata")
-    if best is not None:
-        return os.path.join(userdata, str(best - STEAM64_BASE))
+    if recent is not None:
+        acct = recent - 76561197960265728
+        return os.path.join(userdata, str(acct))
     try:
         dirs = [d for d in os.listdir(userdata) if d.isdigit() and d != "0"]
     except OSError:
         dirs = []
-    written = []
-    for d in dirs:
-        try:
-            written.append((os.path.getmtime(os.path.join(userdata, d, "config", "localconfig.vdf")), d))
-        except OSError:
-            pass
-    if written:
-        return os.path.join(userdata, max(written)[1])
     return os.path.join(userdata, dirs[0]) if len(dirs) == 1 else None
+
 
 
 def parse(data):
@@ -146,6 +125,14 @@ RECORD = ".droiddeck-shortcuts.json"
 AWAY_LIMIT = 256
 FIELDS = ("AppName", "Exe", "StartDir", "icon", "LaunchOptions")
 FOLLOWED = ("StartDir", "LaunchOptions")
+# Guest mountpoints whose contents live on storage the user can unplug. The app creates
+# the mountpoint before binding it, so it outlives a removed card; libraries, store
+# volumes and added game folders get one mountpoint each under these families.
+REMOVABLE_ROOTS = ("/mnt/droiddeck-sd", "/mnt/bannerlator-sd")
+REMOVABLE_FAMILIES = ("/mnt/droiddeck-lib", "/mnt/droiddeck-stores", "/root/Games")
+# Guest trees the app always has, whatever storage is in the device. A target that is
+# missing from one of these is gone even when its whole folder was removed.
+INTERNAL_ROOTS = ("/root/Games/Stores", "/root/.local/share/Steam")
 
 
 def unquoted(value):
@@ -167,6 +154,46 @@ def read_record(path):
     }
 
 
+def under(path, root):
+    return path == root or path.startswith(root + "/")
+
+
+def internal_target(target):
+    path = os.path.normpath(target)
+    return any(under(path, root) for root in INTERNAL_ROOTS)
+
+
+def removable_mount(target):
+    """The guest mountpoint holding target, when it is storage the user can unplug."""
+    path = os.path.normpath(target)
+    for root in REMOVABLE_ROOTS:
+        if under(path, root):
+            return root
+    for family in REMOVABLE_FAMILIES:
+        prefix = family + "/"
+        if path.startswith(prefix):
+            return prefix + path[len(prefix):].split("/", 1)[0]
+    return None
+
+
+def storage_mounted(target):
+    """Whether the storage holding target is there this session.
+
+    The app creates a guest mountpoint before binding storage to it, so a mountpoint that
+    lists nothing is one a removed card or volume left behind. A target under it may work
+    again when that storage returns, so its absence is not proof the file is gone.
+    """
+    if internal_target(target):
+        return True
+    mount = removable_mount(target)
+    if mount is None:
+        return True
+    try:
+        return bool(os.listdir(mount))
+    except OSError:
+        return False
+
+
 def merge(fresh, current, state, seen):
     state = state if isinstance(state, dict) else {}
     rev = state.get("rev") if isinstance(state.get("rev"), int) else 0
@@ -179,7 +206,16 @@ def merge(fresh, current, state, seen):
     entry = dict(current)
     entry["appid"] = fresh["appid"]
     exe = unquoted(fresh["Exe"])
-    if exe != unquoted(current.get("Exe")) and (exe != unquoted(base.get("Exe")) or seen == rev):
+    target = unquoted(current.get("Exe"))
+    # A target Steam still points at after the file is gone starts nothing, so it is not
+    # an edit to keep: the app's own exe replaces it (#694: a hand-typed Target outlived
+    # the game update that removed the file, and every launch died before the game ran).
+    # Only when its storage is mounted and it is missing from a tree the app always has or
+    # from a folder that is still there. An absent folder under a mountpoint can equally be
+    # unplugged storage, and that target may work again next session.
+    gone = (bool(target) and not os.path.isfile(target) and storage_mounted(target) and
+            (internal_target(target) or os.path.isdir(os.path.dirname(target))))
+    if exe != target and (gone or exe != unquoted(base.get("Exe")) or seen == rev):
         entry["Exe"], entry["StartDir"] = fresh["Exe"], fresh["StartDir"]
     for field in ("AppName", "icon"):
         if current.get(field) == base.get(field):
@@ -263,9 +299,6 @@ ART_SLOTS = (("p", "p"), ("header", ""), ("hero", "_hero"), ("logo", "_logo"))
 
 
 def install_art(acct, games):
-    """Copies each game's art into the client's grid folder under the names it looks for. A file
-    the client already has that this script did not write (art the user set in the client) is
-    left alone; ours are replaced when the source changed and removed when the game lost its art."""
     grid = os.path.join(acct, "config", "grid")
     os.makedirs(grid, exist_ok=True)
     manifest_path = os.path.join(grid, ART_MANIFEST)
@@ -369,19 +402,19 @@ def main():
         cfg = os.path.join(steam_root, "config", "config.vdf")
         if os.path.isfile(cfg) and (ours or routes):
             tools = os.path.join(steam_root, "compatibilitytools.d")
-            x64_tool = os.environ.get("BL_COMPAT_TOOL")
+            x64_tool = os.environ.get("DD_COMPAT_TOOL")
             own = {}
             if x64_tool:
                 protect = {compat.first_key(os.path.join(tools, e, "compatibilitytool.vdf"), ["compatibilitytools", "compat_tools"]) or e: e
                            for e in (os.listdir(tools) if os.path.isdir(tools) else [])}
-                # Its own state: the arm64 client's state.json lists which of that client's titles follow its default.
                 own = {"default": x64_tool,
                        "directory": os.path.join(os.path.dirname(os.path.abspath(steam_root)), "droiddeck-compat"),
                        "linux_tool": "droiddeck-direct"}
             else:
                 protect = compat.adopt_extras(tools)
-            used = compat.register_default(cfg, apps=[str(int(g["appid"]) & 0xFFFFFFFF) for g in games if g.get("exe") and not g.get("native")] + [str(appid) for appid in set(routes.values())],
-                                           protect=protect, **own)
+            owned = [str(int(g["appid"]) & 0xFFFFFFFF) for g in games if g.get("exe") and not g.get("native")]
+            used = compat.register_default(cfg, apps=owned + [str(appid) for appid in set(routes.values())],
+                                           protect=protect, owned=owned, **own)
             print("droiddeck-steam-shortcuts: mapped them to %s" % used)
     except Exception as e:
         print("droiddeck-steam-shortcuts: compat mapping skipped (%s)" % e)

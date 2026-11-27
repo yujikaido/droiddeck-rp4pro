@@ -51,39 +51,33 @@ internal object MemoryReadout {
 
     fun device(): Device? = runCatching { parseMeminfo(File("/proc/meminfo").readText()) }.getOrNull()
 
-    fun split(root: Int = android.os.Process.myPid(), proc: File = File("/proc")): Split {
+    fun split(root: Int = android.os.Process.myPid()): Split {
         val parents = HashMap<Int, Int>()
-        proc.listFiles()?.forEach { entry ->
+        File("/proc").listFiles()?.forEach { entry ->
             val pid = entry.name.toIntOrNull() ?: return@forEach
-            parentOf(proc, pid)?.let { parents[pid] = it }
+            parentOf(pid)?.let { parents[pid] = it }
         }
         val children = parents.entries.groupBy({ it.value }, { it.key })
         var game = 0L
         var droiddeck = 0L
-        // (pid, underGame): a Steam game's launcher (reaper SteamLaunch / waitforexitandrun) and everything below it is the
-        // game, also a native Linux game run through FEX that has no WINEPREFIX. A Wine process outside it counts by its prefix.
-        val queue = ArrayDeque<Pair<Int, Boolean>>().apply { add(root to false) }
+        val queue = ArrayDeque<Int>().apply { add(root) }
         val seen = HashSet<Int>()
         while (queue.isNotEmpty()) {
-            val (pid, underGame) = queue.removeFirst()
+            val pid = queue.removeFirst()
             if (!seen.add(pid)) continue
-            val status = runCatching { File(proc, "$pid/status").readText() }.getOrNull()
-            var isGame = underGame
-            if (pid != root) {
-                if (!isGame) isGame = runCatching { SteamGameProcess.matches(File(proc, "$pid/cmdline").readBytes()) }.getOrDefault(false)
-                if (!isGame) isGame = runCatching { inWinePrefix(File(proc, "$pid/environ").readBytes()) }.getOrDefault(false)
-            }
+            val status = runCatching { File("/proc/$pid/status").readText() }.getOrNull()
             if (status != null) {
                 val kb = residentKb(status)
-                if (isGame) game += kb else droiddeck += kb
+                val windows = pid != root && runCatching { inWinePrefix(File("/proc/$pid/environ").readBytes()) }.getOrDefault(false)
+                if (windows) game += kb else droiddeck += kb
             }
-            children[pid]?.forEach { queue.add(it to isGame) }
+            children[pid]?.let(queue::addAll)
         }
         return Split(game, droiddeck, gpuKb())
     }
 
-    private fun parentOf(proc: File, pid: Int): Int? {
-        val stat = runCatching { File(proc, "$pid/stat").readText() }.getOrNull() ?: return null
+    private fun parentOf(pid: Int): Int? {
+        val stat = runCatching { File("/proc/$pid/stat").readText() }.getOrNull() ?: return null
         val close = stat.lastIndexOf(')')
         if (close < 0 || close + 2 >= stat.length) return null
         return stat.substring(close + 2).split(' ').getOrNull(1)?.toIntOrNull()

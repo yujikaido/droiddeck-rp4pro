@@ -1,10 +1,4 @@
 #!/usr/bin/python3
-"""Steam's login1 sleep notifications, backed by DroidDeck's session pause.
-
-Android owns device power. Suspend here pauses the guest through SessionService;
-the app's Resume action thaws it and completes PrepareForSleep(false). Steam
-must see this service before startup or it can stay black after its idle timer.
-"""
 import importlib.machinery
 import importlib.util
 import os
@@ -30,7 +24,6 @@ AGENT = Path(__file__).resolve().with_name("droiddeck-agent")
 ASLEEP_WAIT = 6
 INHIBIT_WAIT = 12
 RELEASE_RETRIES = 8
-POLL_MS = 250
 INTROSPECTION = """
 <node>
   <interface name="org.freedesktop.login1.Manager">
@@ -69,22 +62,12 @@ class LoginManager:
         self.inhibit_lock = threading.Lock()
         self.release = None
         self.generation = 0
-        self.monitor = None
-        self.poller = None
-        # The watch comes first, so nothing is exported if setting up the session files fails. An
-        # inotify instance can run out: on Android every DroidDeck process shares the app's uid and
-        # its limit (128 by default). Without one, the three files are checked on a short timer.
-        try:
-            self.monitor = Gio.File.new_for_path(str(self.directory)).monitor_directory(Gio.FileMonitorFlags.NONE, None)
-            self.monitor.connect("changed", self.changed)
-        except GLib.Error as error:
-            print("== login1: cannot watch the session directory (%s); checking Steam's sleep files every %d ms instead"
-                  % (error.message, POLL_MS), file=sys.stderr, flush=True)
-            self.poller = GLib.timeout_add(POLL_MS, self.poll)
         info = Gio.DBusNodeInfo.new_for_xml(INTROSPECTION).interfaces[0]
         self.registration = bus.register_object(ROOT, info, self.method, self.property, None)
         upower_info = Gio.DBusNodeInfo.new_for_xml(UPOWER_INTROSPECTION).interfaces[0]
         self.upower_registration = bus.register_object(UPOWER_ROOT, upower_info, self.method, None, None)
+        self.monitor = Gio.File.new_for_path(str(self.directory)).monitor_directory(Gio.FileMonitorFlags.NONE, None)
+        self.monitor.connect("changed", self.changed)
 
     def property(self, connection, sender, path, interface, name):
         if name == "PreparingForSleep":
@@ -238,27 +221,14 @@ class LoginManager:
         return False
 
     def changed(self, monitor, file, other, event):
-        names = {file.get_basename(), other.get_basename() if other else None}
-        if self.native_request.name in names:
+        if file.get_basename() == self.native_request.name or (other and other.get_basename() == self.native_request.name):
             self.prepare_native()
-        if self.wake.name in names:
-            self.take_wake()
-        if self.state.name in names:
+        if file.get_basename() == self.wake.name or (other and other.get_basename() == self.wake.name):
+            if self.wake.exists():
+                self.wake.unlink(missing_ok=True)
+                self.woken()
+        if file.get_basename() == self.state.name or (other and other.get_basename() == self.state.name):
             self.check_state()
-
-    def poll(self):
-        """The watch's stand-in: the same three checks, a few stat calls each tick. The state file is
-        only read while a pause is pending."""
-        if self.native_request.exists():
-            self.prepare_native()
-        self.take_wake()
-        self.check_state()
-        return True
-
-    def take_wake(self):
-        if self.wake.exists():
-            self.wake.unlink(missing_ok=True)
-            self.woken()
 
     def read_state(self):
         try:
@@ -353,7 +323,7 @@ def load_netmanager():
 
 
 def main():
-    directory = os.environ.get("BL_LAUNCH_DIR")
+    directory = os.environ.get("DD_LAUNCH_DIR")
     if not directory or not Path(directory).is_dir():
         sys.exit("droiddeck-login1: no DroidDeck session directory")
     ready = Path(directory) / "steam-sleep-ready"
@@ -368,7 +338,7 @@ def main():
 
     def acquired(bus, name):
         acquired_names.add(name)
-        if acquired_names == {NAME, UPOWER} and manager:
+        if acquired_names == {NAME, UPOWER}:
             ready.write_text("ready\n")
 
     def lost(bus, name):

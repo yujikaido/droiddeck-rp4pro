@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-# assemble.sh <extracted packages root> <out.tzst>
-# Packs the video side of SteamOS's PipeWire and WirePlumber: no audio plugins, no JACK.
 set -euo pipefail
 src=$1
 out=$2
@@ -26,4 +24,4 @@ for package in pipewire libpipewire wireplumber libwireplumber; do
 done
 
 mkdir -p "$(dirname "$out")"
-(cd "$b" && find . -type f | LC_ALL=C sort | tar --numeric-owner -cf - -T -) | zstd -19 -q -f -o "$out"
+(cd "$b" && find . -type f | LC_ALL=C sort | tar -cf - -T -) | zstd -19 -q -f -o "$out"

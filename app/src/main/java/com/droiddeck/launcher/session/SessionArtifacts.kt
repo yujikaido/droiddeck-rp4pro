@@ -31,7 +31,6 @@ object SessionArtifacts {
     private val collectingDone = collectingLock.newCondition()
     private val collecting = HashSet<File>()
 
-    /** Recovery leaves [dir] alone from the stop until [collect] has finished it. */
     fun collectionStarted(dir: File) {
         collectingLock.lock()
         try { collecting.add(dir) } finally { collectingLock.unlock() }
@@ -76,9 +75,10 @@ object SessionArtifacts {
             LogRedactor.learnFromRuntime(LinuxRuntime.rootDir(context))
             val record = Record(dir)
             copySteamLogs(context, dir, record, steamArch)
-            copyStuckPipelines(context, dir)
+            copyRpcs3Log(context, dir, record)
             VacDiagnostics.collect(context, dir)
             SessionLogCapture.dumpCrashBuffer(File(dir, "crash.log"))
+            SessionLogCapture.dumpMemoryPressure(File(dir, "memory-pressure.log"))
             val scrubbed = markScrubbed(scrubTree(record))
             SessionEvents.record("session.artifacts_collected", mapOf("reason" to reason), dir)
             if (scrubbed) File(dir, COMPLETE_MARKER).writeText("collected: $reason at ${now()}\n")
@@ -86,22 +86,6 @@ object SessionArtifacts {
             Log.w(TAG, "collecting session artifacts", e)
         }
     }
-
-    private fun copyStuckPipelines(context: Context, dir: File) {
-        try {
-            val src = com.droiddeck.launcher.gpu.VkBridgeComponent.stuckPipelines(context)
-            if (!src.isFile) return
-            if (src.length() > STUCK_PIPELINES_MAX_BYTES) {
-                File(dir, "vkbridge-stuck-pipelines.txt").writeText("stuck-pipelines is ${src.length()} bytes; not copied\n")
-                return
-            }
-            src.copyTo(File(dir, "vkbridge-stuck-pipelines.txt"), overwrite = true)
-        } catch (e: Exception) {
-            Log.w(TAG, "could not copy the bridge's stuck-pipelines list", e)
-        }
-    }
-
-    private const val STUCK_PIPELINES_MAX_BYTES = 64L * 1024
 
     @Synchronized
     fun scrubOlder(context: Context) {
@@ -334,11 +318,13 @@ object SessionArtifacts {
         runCatching { File(dir, CLIENT_FILE).writeText("$arch\n") }
     }
 
-    /** The Steam client a session ran, when it recorded one. */
     internal fun recordedClient(dir: File): String? =
         runCatching { File(dir, CLIENT_FILE).readText().trim() }.getOrNull()?.takeIf { it == "arm64" || it == "x86_64" }
 
     private const val LOG_MARKS = "steam-log-marks.txt"
+    private const val RPCS3_LOG_MARKS = "rpcs3-log-marks.txt"
+    private const val RPCS3_LOGS = "root/.cache/rpcs3"
+    private const val RPCS3_LOG = "RPCS3.log"
     private const val MAX_STEAM_LOG = 8L * 1024 * 1024
     private const val HEAD = 4096L
 
@@ -346,11 +332,19 @@ object SessionArtifacts {
     private class CopyResult(val files: List<File>, val failed: Boolean, val deferred: Boolean)
 
     fun markSteamLogs(dir: File, logs: File) {
-        val lines = logs.listFiles { f -> f.isFile }?.mapNotNull { f ->
+        logs.listFiles { f -> f.isFile }?.let { markLogs(dir, LOG_MARKS, it.toList()) }
+    }
+
+    fun markRpcs3Log(dir: File, root: File) {
+        markLogs(dir, RPCS3_LOG_MARKS, listOf(File(root, "$RPCS3_LOGS/$RPCS3_LOG")).filter { it.isFile })
+    }
+
+    private fun markLogs(dir: File, marks: String, files: List<File>) {
+        val lines = files.mapNotNull { f ->
             val size = f.length()
             head(f, size)?.let { "$size\t$it\t${f.name}" }
-        } ?: return
-        runCatching { File(dir, LOG_MARKS).writeText(lines.joinToString("") { "$it\n" }) }
+        }
+        runCatching { File(dir, marks).writeText(lines.joinToString("") { "$it\n" }) }
     }
 
     private fun head(f: File, length: Long): String? = runCatching {
@@ -366,8 +360,8 @@ object SessionArtifacts {
         java.security.MessageDigest.getInstance("SHA-1").digest(buf).joinToString("") { "%02x".format(it) }
     }.getOrNull()
 
-    private fun steamLogMarks(dir: File): List<Mark>? = runCatching {
-        File(dir, LOG_MARKS).readLines().mapNotNull { line ->
+    private fun logMarks(dir: File, marks: String): List<Mark>? = runCatching {
+        File(dir, marks).readLines().mapNotNull { line ->
             val parts = line.split('\t', limit = 3)
             parts.getOrNull(0)?.toLongOrNull()?.let { size -> parts.getOrNull(1)?.let { Mark(size, it) } }
         }
@@ -389,11 +383,32 @@ object SessionArtifacts {
         val logs = File(steamArch?.let { SessionPrefs.steamRoot(context, it) } ?: SessionPrefs.activeSteamRoot(context), "logs")
         if (!logs.isDirectory) return
         val out = File(dir, "steam").apply { mkdirs() }
-        val result = copySessionLogsResult(logs, dir, out) { stopWhenSessionStarts && SessionState.running }
+        addCopied(record, copySessionLogsResult(logs, dir, out) { stopWhenSessionStarts && SessionState.running })
+        Log.i(TAG, "collected ${out.listFiles()?.size ?: 0} Steam log(s), scrubbed, into $out")
+    }
+
+    private fun copyRpcs3Log(context: Context, dir: File, record: Record, stopWhenSessionStarts: Boolean = false) {
+        val out = File(dir, "rpcs3")
+        val logs = File(LinuxRuntime.rootDir(context), RPCS3_LOGS)
+        val copied = copyRpcs3LogResult(logs, dir, out) { stopWhenSessionStarts && SessionState.running } ?: return
+        addCopied(record, copied)
+        if (copied.files.isNotEmpty()) Log.i(TAG, "collected RPCS3's log, scrubbed, into $out")
+    }
+
+    internal fun copyRpcs3Log(logs: File, dir: File, out: File): List<File> = copyRpcs3LogResult(logs, dir, out) { false }?.files.orEmpty()
+
+    private fun copyRpcs3LogResult(logs: File, dir: File, out: File, shouldStop: () -> Boolean): CopyResult? {
+        if (!File(dir, RPCS3_LOG_MARKS).isFile || !File(logs, RPCS3_LOG).isFile) return null
+        out.mkdirs()
+        val result = copySessionLogsResult(logs, dir, out, marksName = RPCS3_LOG_MARKS, accept = { it.name == RPCS3_LOG }, shouldStop = shouldStop)
+        if (result.files.isEmpty()) out.delete()
+        return result
+    }
+
+    private fun addCopied(record: Record, result: CopyResult) {
         result.files.forEach { dst -> record.files[dst] = Scrubbed(dst.length(), dst.lastModified()) }
         record.failed = record.failed || result.failed
         record.deferred = record.deferred || result.deferred
-        Log.i(TAG, "collected ${out.listFiles()?.size ?: 0} Steam log(s), scrubbed, into $out")
     }
 
     internal fun copySessionLogs(
@@ -401,20 +416,22 @@ object SessionArtifacts {
         dir: File,
         out: File,
         openWriter: (File) -> Writer = { it.bufferedWriter() },
-    ): List<File> = copySessionLogsResult(logs, dir, out, openWriter) { false }.files
+    ): List<File> = copySessionLogsResult(logs, dir, out, openWriter = openWriter) { false }.files
 
     private fun copySessionLogsResult(
         logs: File,
         dir: File,
         out: File,
+        marksName: String = LOG_MARKS,
+        accept: (File) -> Boolean = { true },
         openWriter: (File) -> Writer = { it.bufferedWriter() },
         shouldStop: () -> Boolean,
     ): CopyResult {
-        val marks = steamLogMarks(dir)
+        val marks = logMarks(dir, marksName)
         val copied = ArrayList<File>()
         var failed = false
         var deferred = false
-        val sources = logs.listFiles { f -> f.isFile } ?: return CopyResult(copied, true, false)
+        val sources = logs.listFiles { f -> f.isFile && accept(f) } ?: return CopyResult(copied, true, false)
         for (src in sources) {
             if (shouldStop()) {
                 failed = true
@@ -521,18 +538,23 @@ object SessionArtifacts {
         return true
     }
 
+    /**
+     * Finishes the folders of sessions whose process died without its teardown. Returns true when
+     * the newest of them ended because Android killed the app for memory, so the app can say so
+     * (a game "crashing" on a phone with little free RAM is usually this, not a driver fault).
+     */
     @Synchronized
-    fun finishAbandoned(context: Context, beforeGuestStart: Boolean = false) {
+    fun finishAbandoned(context: Context, beforeGuestStart: Boolean = false): Boolean {
         val stopWhenSessionStarts = !beforeGuestStart
         val parent = LinuxRuntime.logDir(context)
         val abandoned = parent.listFiles { f ->
             SessionPaths.isSessionFolder(f) && !File(f, COMPLETE_MARKER).exists() && !inFlight(f)
-        }?.sortedWith(SessionPaths.chronological) ?: return
-        if (abandoned.isEmpty()) return
+        }?.sortedWith(SessionPaths.chronological) ?: return false
+        if (abandoned.isEmpty()) return false
+        var killedForMemory = false
         val current = SessionPaths.current()
         val latestPreviousSession = SessionPaths.sessionFolders(context).lastOrNull { it != current }
         LogRedactor.learnFromRuntime(LinuxRuntime.rootDir(context))
-        val exits = exitRecords(context)
         for (dir in abandoned) {
             if (stopWhenSessionStarts && SessionState.running) break
             if (dir == current) continue
@@ -555,8 +577,10 @@ object SessionArtifacts {
                             (if (newest) "" else "Steam's logs are not included: a later session has overwritten them.\n") +
                             "crash.log holds Android's crash buffer as of the next app start - if this\n" +
                             "session died of a crash, the entry is in there unless the device rebooted.\n" +
-                            (if (newest) exitText(exits) else "")
+                            (if (newest) exitReasons(context) else "")
                     )
+                    restartNote(File(dir, "device.txt").lastModified(), bootedAt())?.let { recoveryNote.appendText(it) }
+                    if (newest && lastExitForMemory(context)) killedForMemory = true
                 }
                 if (recoveryPreviouslyAttempted && !runtimeCaptured.exists() &&
                     (runtimeExpired.exists() || !beforeGuestStart) &&
@@ -570,7 +594,6 @@ object SessionArtifacts {
                     runtimeExpired.writeText("runtime evidence no longer belongs to this session, at ${now()}\n")
                 }
                 val record = Record(dir)
-                if (newest && !recoveryAttempted) LowMemoryNotice.record(context, exits)
                 if (newest && !recoveryAttempted) {
                     copySteamLogs(
                         context,
@@ -579,8 +602,7 @@ object SessionArtifacts {
                         steamArch = recordedClient(dir),
                         stopWhenSessionStarts = stopWhenSessionStarts,
                     )
-                    // The bridge's list of pipelines its compile watchdog cut off, as it stood when the session died.
-                    copyStuckPipelines(context, dir)
+                    copyRpcs3Log(context, dir, record, stopWhenSessionStarts)
                     if (!record.deferred && (!stopWhenSessionStarts || !SessionState.running)) {
                         if (!record.failed && VacDiagnostics.collect(context, dir)) {
                             try {
@@ -610,15 +632,18 @@ object SessionArtifacts {
                 if (!crashLog.exists()) {
                     SessionLogCapture.dumpCrashBuffer(crashLog)
                 }
+                val memoryLog = File(dir, "memory-pressure.log")
+                if (newest && !memoryLog.exists()) {
+                    SessionLogCapture.dumpMemoryPressure(memoryLog, context)
+                }
                 if (stopWhenSessionStarts && SessionState.running) {
                     record.failed = true
                     record.deferred = true
                     markScrubbed(record)
                     break
                 }
-                SessionEvents.record("session.artifacts_recovered", mapOf("newest" to newest) +
-                    if (newest && exits.isNotEmpty()) mapOf("android_exit" to exitReason(exits[0].reason)) else emptyMap(), dir)
-                if (beforeGuestStart) return
+                SessionEvents.record("session.artifacts_recovered", mapOf("newest" to newest), dir)
+                if (beforeGuestStart) break
                 val scrubbed = scrubTree(record) { stopWhenSessionStarts && SessionState.running }
                 val marked = markScrubbed(scrubbed)
                 if (scrubbed.deferred) break
@@ -629,78 +654,55 @@ object SessionArtifacts {
                 Log.w(TAG, "could not finish $dir", e)
             }
         }
+        // Whoever finishes the folder first (the agent provider starts before the activity) leaves
+        // the notice for the launcher to show.
+        if (killedForMemory) SessionPrefs.setMemoryKillNotice(context, true)
+        return killedForMemory
     }
 
-    /** One of Android's records of how an app process ended (ApplicationExitInfo; sizes in KB). */
-    internal class Exit(
-        val time: Long, val pid: Int, val process: String, val reason: Int, val status: Int,
-        val importance: Int, val pssKb: Long, val rssKb: Long, val description: String?,
-    )
-
-    /* Android keeps how the app's last processes ended (API 30+), newest first. A kill by the
-     * low-memory killer, from the recents screen or by the vendor's battery manager never reaches
-     * the crash buffer, so for those this is the only trace. Read before this start's own process
-     * can end, so the newest record is the process the abandoned session ran in. */
-    private fun exitRecords(context: Context): List<Exit> {
-        if (android.os.Build.VERSION.SDK_INT < 30) return emptyList()
-        val am = context.getSystemService(android.app.ActivityManager::class.java) ?: return emptyList()
+    /** Android's newest record for this app's main process says it was killed for memory. */
+    private fun lastExitForMemory(context: Context): Boolean {
+        if (android.os.Build.VERSION.SDK_INT < 30) return false
         return runCatching {
-            am.getHistoricalProcessExitReasons(null, 0, EXITS_SHOWN).map { e ->
-                Exit(e.timestamp, e.pid, e.processName, e.reason, e.status, e.importance, e.pss, e.rss, e.description)
+            val am = context.getSystemService(android.app.ActivityManager::class.java) ?: return false
+            am.getHistoricalProcessExitReasons(context.packageName, 0, 3)
+                .firstOrNull { it.processName == context.packageName }
+                ?.reason == android.app.ApplicationExitInfo.REASON_LOW_MEMORY
+        }.getOrDefault(false)
+    }
+
+    private fun exitReasons(context: Context): String {
+        if (android.os.Build.VERSION.SDK_INT < 30) return ""
+        return runCatching {
+            val am = context.getSystemService(android.app.ActivityManager::class.java) ?: return ""
+            val reasons = am.getHistoricalProcessExitReasons(context.packageName, 0, 3)
+            if (reasons.isEmpty()) return ""
+            val fmt = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.US)
+            buildString {
+                append("\nAndroid's record of how this app's recent processes ended (newest first):\n")
+                reasons.forEach { r ->
+                    append("  ${fmt.format(java.util.Date(r.timestamp))} ${r.processName} pid ${r.pid}: reason ${reasonName(r.reason)}, " +
+                        "status ${r.status}, importance ${r.importance}, pss ${r.pss / 1024} MB, rss ${r.rss / 1024} MB" +
+                        (r.description?.let { " - $it" } ?: "") + "\n")
+                }
             }
-        }.onFailure { Log.w(TAG, "Android's exit records", it) }.getOrDefault(emptyList())
+        }.getOrDefault("")
     }
 
-    internal fun exitText(exits: List<Exit>): String {
-        if (exits.isEmpty()) return ""
-        val f = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
-        return "\nHow Android says the app's last processes ended (newest first):\n" + exits.joinToString("") { e ->
-            /* The exit() argument for a process that exited itself, the signal for every other one. */
-            val status = when {
-                e.reason == android.app.ApplicationExitInfo.REASON_EXIT_SELF -> ", exit status ${e.status}"
-                e.status != 0 -> ", signal ${e.status}"
-                else -> ""
-            }
-            val name = e.process.takeIf { it.contains(':') }?.let { " (${it.substringAfter(':')})" } ?: ""
-            "  ${f.format(Date(e.time))} pid ${e.pid}$name: ${exitReason(e.reason)}$status, " +
-                "${importance(e.importance)}, pss ${e.pssKb / 1024} MB, rss ${e.rssKb / 1024} MB" +
-                (e.description?.takeIf { it.isNotBlank() }?.let { " - ${LogRedactor.redact(it.trim())}" } ?: "") + "\n"
-        }
+    private fun reasonName(reason: Int): String = when (reason) {
+        android.app.ApplicationExitInfo.REASON_LOW_MEMORY -> "LOW_MEMORY (killed for memory)"
+        android.app.ApplicationExitInfo.REASON_SIGNALED -> "SIGNALED"
+        android.app.ApplicationExitInfo.REASON_CRASH -> "CRASH"
+        android.app.ApplicationExitInfo.REASON_CRASH_NATIVE -> "CRASH_NATIVE"
+        android.app.ApplicationExitInfo.REASON_ANR -> "ANR"
+        android.app.ApplicationExitInfo.REASON_EXCESSIVE_RESOURCE_USAGE -> "EXCESSIVE_RESOURCE_USAGE"
+        android.app.ApplicationExitInfo.REASON_USER_REQUESTED -> "USER_REQUESTED"
+        android.app.ApplicationExitInfo.REASON_USER_STOPPED -> "USER_STOPPED"
+        android.app.ApplicationExitInfo.REASON_EXIT_SELF -> "EXIT_SELF"
+        android.app.ApplicationExitInfo.REASON_DEPENDENCY_DIED -> "DEPENDENCY_DIED"
+        android.app.ApplicationExitInfo.REASON_OTHER -> "OTHER"
+        else -> reason.toString()
     }
-
-    internal fun exitReason(reason: Int): String = when (reason) {
-        android.app.ApplicationExitInfo.REASON_EXIT_SELF -> "exited itself"
-        android.app.ApplicationExitInfo.REASON_SIGNALED -> "killed by a signal"
-        android.app.ApplicationExitInfo.REASON_LOW_MEMORY -> "low memory (Android's low-memory killer)"
-        android.app.ApplicationExitInfo.REASON_CRASH -> "app crash"
-        android.app.ApplicationExitInfo.REASON_CRASH_NATIVE -> "native crash"
-        android.app.ApplicationExitInfo.REASON_ANR -> "not responding"
-        android.app.ApplicationExitInfo.REASON_INITIALIZATION_FAILURE -> "failed to start"
-        android.app.ApplicationExitInfo.REASON_PERMISSION_CHANGE -> "a permission changed"
-        android.app.ApplicationExitInfo.REASON_EXCESSIVE_RESOURCE_USAGE -> "too much CPU or other resources"
-        android.app.ApplicationExitInfo.REASON_USER_REQUESTED -> "stopped by the user (force stop or swiped away)"
-        android.app.ApplicationExitInfo.REASON_USER_STOPPED -> "the user's profile stopped"
-        android.app.ApplicationExitInfo.REASON_DEPENDENCY_DIED -> "a process it depended on died"
-        android.app.ApplicationExitInfo.REASON_OTHER -> "killed by the system (other)"
-        android.app.ApplicationExitInfo.REASON_FREEZER -> "killed while frozen"
-        android.app.ApplicationExitInfo.REASON_PACKAGE_STATE_CHANGE -> "the app was disabled or changed"
-        android.app.ApplicationExitInfo.REASON_PACKAGE_UPDATED -> "the app was updated"
-        else -> "reason $reason"
-    }
-
-    /* How much Android valued the process when it ended: a cached or background one goes first. */
-    private fun importance(importance: Int): String = when {
-        importance <= android.app.ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND -> "in the foreground"
-        importance <= android.app.ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND_SERVICE -> "foreground service"
-        importance <= android.app.ActivityManager.RunningAppProcessInfo.IMPORTANCE_VISIBLE -> "visible"
-        importance <= android.app.ActivityManager.RunningAppProcessInfo.IMPORTANCE_PERCEPTIBLE -> "perceptible"
-        importance <= android.app.ActivityManager.RunningAppProcessInfo.IMPORTANCE_SERVICE -> "background service"
-        importance <= android.app.ActivityManager.RunningAppProcessInfo.IMPORTANCE_TOP_SLEEPING -> "on top, screen off"
-        importance <= android.app.ActivityManager.RunningAppProcessInfo.IMPORTANCE_CACHED -> "in the background (cached)"
-        else -> "gone (importance $importance)"
-    }
-
-    private const val EXITS_SHOWN = 3
 
     @Synchronized
     fun prune(context: Context) {
@@ -709,16 +711,6 @@ object SessionArtifacts {
         val old = finished.dropLast(SessionPaths.KEEP_SESSIONS)
         old.forEach { com.droiddeck.launcher.core.FileUtils.delete(it) }
         if (old.isNotEmpty()) Log.i(TAG, "deleted ${old.size} session folder(s) past the newest ${SessionPaths.KEEP_SESSIONS}")
-    }
-
-    /* Also at each session's end, not only at app start: a day of sessions without the app being
-     * closed (Android keeps it alive) went well past the newest KEEP_SESSIONS, 40 MB or so each. */
-    fun pruneQuietly(context: Context) {
-        try {
-            prune(context)
-        } catch (e: Exception) {
-            Log.w(TAG, "pruning session folders", e)
-        }
     }
 
     @Synchronized
@@ -730,6 +722,22 @@ object SessionArtifacts {
         Log.i(TAG, "cleared ${gone.size} session folder(s)")
         return gone.size
     }
+
+    private fun bootedAt(): Long = System.currentTimeMillis() - android.os.SystemClock.elapsedRealtime()
+
+    internal fun restartNote(sessionStartedAt: Long, bootedAt: Long): String? {
+        if (sessionStartedAt <= 0L) return null
+        val stamp = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
+        return if (bootedAt > sessionStartedAt + BOOT_CLOCK_SLACK_MS) {
+            "The device itself probably restarted after this session began (estimated boot ${stamp.format(Date(bootedAt))}, from the clock and uptime, so a clock change can fake it):\n" +
+                "if so, the whole system went down and crash.log is the new boot's buffer and says nothing about the session.\n"
+        } else {
+            "The device does not appear to have restarted since this session began (estimated boot ${stamp.format(Date(bootedAt))}, from the clock and uptime):\n" +
+                "only this app's processes ended, so crash.log and the exit records cover the end.\n"
+        }
+    }
+
+    private const val BOOT_CLOCK_SLACK_MS = 60_000L
 
     private fun now(): String = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
 }

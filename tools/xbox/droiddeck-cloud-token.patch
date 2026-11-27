@@ -1,47 +1,21 @@
+diff --git a/crates/xodus-cli/src/commands.rs b/crates/xodus-cli/src/commands.rs
+index 4f1b211..088a6d0 100644
 --- a/crates/xodus-cli/src/commands.rs
 +++ b/crates/xodus-cli/src/commands.rs
-@@ -6,6 +6,7 @@
- pub mod login;
+@@ -7,6 +7,7 @@ pub mod login;
  pub mod logout;
+ pub mod offline_pc;
  pub mod profile;
 +pub mod cloud_token;
  pub mod social;
  pub mod game_activity;
  pub mod achievements;
---- a/crates/xodus-cli/src/main.rs
-+++ b/crates/xodus-cli/src/main.rs
-@@ -70,6 +70,8 @@
-         #[arg(long, default_value_t = false)]
-         json: bool,
-     },
-+    #[command(about = "Get an Xbox Cloud Gaming streaming token for the stored account")]
-+    CloudToken,
-     #[command(about = "Read Xbox gamertag and gamerpic for the stored account")]
-     Profile {
-         #[arg(long, default_value_t = false)]
-@@ -251,6 +253,7 @@
-         args.command,
-         SubCommand::Account { .. }
-             | SubCommand::Profile { .. }
-+            | SubCommand::CloudToken
-             | SubCommand::Social { .. }
-             | SubCommand::GameActivity { .. }
-             | SubCommand::Achievements { .. }
-@@ -317,6 +320,7 @@
-             }
-         },
-         SubCommand::Profile { json } => commands::profile::run(&tokens, json).await,
-+        SubCommand::CloudToken => commands::cloud_token::run(&tokens).await,
-         SubCommand::Social { .. } => commands::social::run(&tokens).await,
-         SubCommand::GameActivity { title_id, json } => commands::game_activity::run(&tokens, title_id, json).await,
-         SubCommand::Achievements { title_id, json } => commands::achievements::run(&tokens, title_id, json).await,
+diff --git a/crates/xodus-cli/src/commands/cloud_token.rs b/crates/xodus-cli/src/commands/cloud_token.rs
+new file mode 100644
+index 0000000..03e4553
 --- /dev/null
 +++ b/crates/xodus-cli/src/commands/cloud_token.rs
-@@ -0,0 +1,237 @@
-+//! Xbox Cloud Gaming streaming token for the stored account (DroidDeck). Same bearer
-+//! RPS -> Xbox user -> XSTS exchange as the profile read, for the cloud gaming relying party,
-+//! then the streaming service's user login (as xbox.com and Greenlight's xal-node do).
-+//! Never provisions a device or opens login.
+@@ -0,0 +1,227 @@
 +use std::{process::ExitCode, time::Duration};
 +use serde_json::{Value, json};
 +use xodus::{models::{live::ExchangeUserTokenOutcome, secrets::Token, soap}, tokens::TokenManager};
@@ -49,23 +23,20 @@
 +const GSSV_RELYING_PARTY: &str = "http://gssv.xboxlive.com/";
 +const OFFERINGS: [&str; 2] = ["xgpuweb", "xgpuwebf2p"];
 +
-+/// The stored account's compact Microsoft account ticket for one service target and policy.
 +async fn ticket(tokens: &TokenManager, client: &reqwest::Client, target: &str, policy: soap::PolicyReference) -> Result<(String, String), &'static str> {
-+    let (account, device, user) = super::session::prepare(tokens, client).await.map_err(|stage| {
++    let (account, device, user, snapshot) = super::session::prepare(tokens, client).await.map_err(|stage| {
 +        super::session::diagnostic(stage); stage
 +    })?;
 +    let outcome = super::session::exchange(|| async { xodus::api::live::exchange_user_token(client, user.clone(), account.clone(), device.clone(),
 +        None, Some("Silent".into()), "{d6d5a677-0872-4ab0-9442-bb792fce85c5}".into(),
 +        &[(target.into(), Some(policy.clone()))])
 +        .await.map_err(|error| super::session::classify(&error)) }).await?;
++    tokens.validate_user_token_snapshot(&snapshot).map_err(|_| "account-changed")?;
 +    let response = match outcome {
 +        ExchangeUserTokenOutcome::Issued(soap::BodyContent::RequestSecurityTokenResponseCollection(mut collection)) if !collection.security_tokens.is_empty() => collection.security_tokens.remove(0),
 +        ExchangeUserTokenOutcome::Issued(soap::BodyContent::RequestSecurityTokenResponse(response)) => *response,
 +        _ => return Err("msa-response"),
 +    };
-+    // Only accept compact forms here and reject incomplete token responses. The cloud
-+    // transfer purpose answers with a login proof token, which is what /connect takes (Greenlight
-+    // sends the MSAL response's "lpt").
 +    let kind = response.token_type.clone();
 +    if kind == "urn:passport:loginprooftoken" {
 +        let shape = match (&response.requested_security_token.binary_security_token, &response.requested_security_token.encrypted_data) {
@@ -97,8 +68,6 @@
 +    Ok((account, xsts.token))
 +}
 +
-+/// The Microsoft account token a cloud session's /connect step takes (xbox.com asks MSAL for
-+/// "service::http://Passport.NET/purpose::PURPOSE_XBOX_CLOUD_CONSOLE_TRANSFER_TOKEN").
 +async fn transfer_token(tokens: &TokenManager, client: &reqwest::Client) -> Result<String, &'static str> {
 +    let policy = soap::PolicyReference { uri: "PURPOSE_XBOX_CLOUD_CONSOLE_TRANSFER_TOKEN".into(), val: String::default() };
 +    Ok(ticket(tokens, client, "http://Passport.NET/purpose", policy).await?.1)
@@ -153,7 +122,6 @@
 +        let xsts = &xsts;
 +        async move { request_offering(client, &endpoint, xsts, offering).await }
 +    }).await?;
-+    // Diagnostic lines are letters and dashes only (the app's allow-list).
 +    eprintln!("NEXUS_SESSION_DIAGNOSTIC_V1 gssv-login-ok-{}", if offering == "xgpuweb" { "gamepass" } else { "free" });
 +    let transfer = transfer_token(tokens, &client).await;
 +    eprintln!("NEXUS_SESSION_DIAGNOSTIC_V1 transfer-token-{}", if transfer.is_ok() { "ok" } else { "missing" });
@@ -275,3 +243,32 @@
 +    }
 +
 +}
+diff --git a/crates/xodus-cli/src/main.rs b/crates/xodus-cli/src/main.rs
+index 290d586..b2a3383 100644
+--- a/crates/xodus-cli/src/main.rs
++++ b/crates/xodus-cli/src/main.rs
+@@ -86,6 +86,8 @@ enum SubCommand {
+         #[arg(long, default_value_t = false)]
+         json: bool,
+     },
++    #[command(about = "Get an Xbox Cloud Gaming streaming token for the stored account")]
++    CloudToken,
+     #[command(about = "Read Xbox gamertag and gamerpic for the stored account")]
+     Profile {
+         #[arg(long, default_value_t = false)]
+@@ -304,6 +306,7 @@ async fn main() -> ExitCode {
+         SubCommand::Account { .. }
+             | SubCommand::SavedAccounts { .. }
+             | SubCommand::Profile { .. }
++            | SubCommand::CloudToken
+             | SubCommand::Social { .. }
+             | SubCommand::NativeSocial { .. }
+             | SubCommand::GameActivity { .. }
+@@ -381,6 +384,7 @@ async fn main() -> ExitCode {
+         },
+         SubCommand::Profile { json, license } => commands::profile::run(&tokens, json, license).await,
+         SubCommand::NativeSocial { action } => commands::native_social::run(&tokens,action).await,
++        SubCommand::CloudToken => commands::cloud_token::run(&tokens).await,
+         SubCommand::Social { .. } => commands::social::run(&tokens).await,
+         SubCommand::GameActivity { title_id, json } => commands::game_activity::run(&tokens, title_id, json).await,
+         SubCommand::Achievements { title_id, json } => commands::achievements::run(&tokens, title_id, json).await,

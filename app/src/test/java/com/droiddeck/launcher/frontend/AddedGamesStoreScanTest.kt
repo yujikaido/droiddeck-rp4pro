@@ -18,12 +18,12 @@ import org.robolectric.annotation.Config
 class AddedGamesStoreScanTest {
     private val app get() = RuntimeEnvironment.getApplication()
 
-    private fun install(store: Store, id: String, title: String, exe: String, launcher: Boolean = false): File {
+    private fun install(store: Store, id: String, title: String, exe: String, launcher: Boolean = false, workdir: String? = null): File {
         SessionPrefs.setGameStorage(app, SessionPrefs.GAME_STORAGE_OFF, "")
         val folder = File(StoreInstallRoot.storeDir(StoreInstallRoot.installRoot(app), store), StoreInstallRoot.folderName(title, id))
         File(folder, exe).apply { parentFile!!.mkdirs(); writeText("game") }
         File(folder, "unins000.exe").writeText("uninstaller")
-        var sidecar = StoreGameSidecar(store, id, title, exe, args = if (launcher) listOf("-EpicPortal") else emptyList())
+        var sidecar = StoreGameSidecar(store, id, title, exe, workdir = workdir, args = if (launcher) listOf("-EpicPortal") else emptyList())
         if (launcher) sidecar = StoreLaunch.writeLauncher(folder, sidecar)
         sidecar.write(folder)
         return folder
@@ -66,6 +66,27 @@ class AddedGamesStoreScanTest {
         assertTrue(game.guestExe.endsWith("/Tools/Editor.exe"))
     }
 
+    @Test fun everyStoreKeepsItsLauncherWhenItsOwnExeIsReselected() {
+        for (store in listOf(Store.GOG, Store.AMAZON, Store.EPIC)) {
+            val folder = install(store, "own-${store.id}", "Own ${store.label}", "Binaries/Game.exe", launcher = true)
+            val own = File(folder, "Binaries/Game.exe")
+            val before = AddedGames.scan(app).single { it.folder.absolutePath == folder.absolutePath }
+            assertTrue(AddedGames.addExe(app, own) is AddedGames.AddResult.Existing)
+            val game = AddedGames.scan(app).single { it.folder.absolutePath == folder.absolutePath }
+            assertEquals(own.path, game.exe.path)
+            assertTrue(game.guestExe.endsWith("/" + StoreLaunch.LAUNCHER))
+            assertEquals(before.appId, game.appId)
+        }
+    }
+
+    @Test fun aDifferentPickedExeOnAnyStoreGameIsRunDirectly() {
+        val folder = install(Store.GOG, "tool", "Tool GOG", "Binaries/Game.exe", launcher = true)
+        val tool = File(folder, "Tools/Editor.exe").apply { parentFile!!.mkdirs(); writeText("tool") }
+        AddedExes.put(app, AddedExes.Entry(folder.path, tool.path, picked = true))
+        val game = AddedGames.scan(app).single { it.folder.absolutePath == folder.absolutePath }
+        assertTrue(game.guestExe.endsWith("/Tools/Editor.exe"))
+    }
+
     @Test fun anOlderSidecarsSteamSwitchIsIgnoredEveryInstallIsListed() {
         val folder = install(Store.AMAZON, "amzn1.adg.product.x", "Yakuza 0", "Yakuza0.exe")
         val file = StoreGameSidecar.file(folder)
@@ -80,5 +101,66 @@ class AddedGamesStoreScanTest {
         assertTrue(listing.contains("\"name\":\"Celeste\""))
         assertTrue(listing.contains(StoreLaunch.LAUNCHER))
         assertTrue(listing.contains("\"store\":\"${Store.EPIC.id}\""))
+    }
+
+    // GOG runs a task from its declared working directory; the install root when it declares none.
+    @Test fun aTaskWorkingDirectoryBecomesTheShortcutsStartIn() {
+        val folder = install(Store.GOG, "1207658924", "Witcher Game", "System/witcher.exe", workdir = "System")
+        val game = AddedGames.scan(app).single { it.folder.absolutePath == folder.absolutePath }
+        assertTrue(game.guestDir.endsWith("/Witcher Game/System"))
+    }
+
+    @Test fun anEmptyTaskWorkingDirectoryIsTheGameFolder() {
+        val folder = install(Store.GOG, "1207658924", "Witcher Game", "System/witcher.exe", workdir = "")
+        val game = AddedGames.scan(app).single { it.folder.absolutePath == folder.absolutePath }
+        assertEquals("/root/Games/Stores/GOG/Witcher Game", game.guestDir)
+    }
+
+    @Test fun aSidecarWithoutATaskDirectoryStillStartsInTheExeFolder() {
+        val folder = install(Store.GOG, "7", "Old Game", "bin/old.exe")
+        val game = AddedGames.scan(app).single { it.folder.absolutePath == folder.absolutePath }
+        assertTrue(game.guestDir.endsWith("/Old Game/bin"))
+    }
+
+    // A picked exe that is not the store's own keeps its own folder, not the task directory.
+    @Test fun aPickedExeOnAGogGameStartsInItsOwnFolder() {
+        val folder = install(Store.GOG, "1207658924", "Witcher Game", "System/witcher.exe", workdir = "")
+        val tool = File(folder, "Tools/Editor.exe").apply { parentFile!!.mkdirs(); writeText("tool") }
+        AddedExes.put(app, AddedExes.Entry(folder.path, tool.path, picked = true))
+        val game = AddedGames.scan(app).single { it.folder.absolutePath == folder.absolutePath }
+        assertTrue(game.guestDir.endsWith("/Witcher Game/Tools"))
+    }
+
+    @Test fun pickingTheStoresOwnExeKeepsTheTaskDirectory() {
+        val folder = install(Store.GOG, "1207658924", "Witcher Game", "System/witcher.exe", workdir = "")
+        AddedExes.put(app, AddedExes.Entry(folder.path, File(folder, "System/witcher.exe").path, picked = true))
+        val game = AddedGames.scan(app).single { it.folder.absolutePath == folder.absolutePath }
+        assertEquals("/root/Games/Stores/GOG/Witcher Game", game.guestDir)
+    }
+
+    @Test fun aStoreGameThatIsUpdatingIsNotListedThroughItsSavedExe() {
+        val folder = install(Store.GOG, "upd", "Updating GOG", "Binaries/Game.exe", launcher = true)
+        val own = File(folder, "Binaries/Game.exe")
+        assertTrue(AddedGames.addExe(app, own) is AddedGames.AddResult.Existing)
+        assertTrue(AddedGames.scan(app).any { it.folder.absolutePath == folder.absolutePath })
+        StoreGameSidecar.read(folder)!!.copy(state = StoreGameSidecar.STATE_UPDATING).write(folder)
+        assertTrue(AddedGames.scan(app).none { it.folder.absolutePath == folder.absolutePath })
+    }
+
+    @Test fun reselectingTheMappedExeReplacesAnUnmappedAliasOfIt() {
+        val folder = install(Store.EPIC, "alias", "Alias Epic", "Binaries/Game.exe", launcher = true)
+        val own = File(folder, "Binaries/Game.exe")
+        val alias = File(java.nio.file.Files.createTempDirectory("alias").toFile(), "bin")
+        try {
+            java.nio.file.Files.createSymbolicLink(alias.toPath(), File(folder, "Binaries").toPath())
+        } catch (e: Exception) {
+            org.junit.Assume.assumeNoException(e)
+        }
+        val aliased = File(alias, "Game.exe")
+        assertNull(AddedGames.guestPath(app, aliased))
+        SessionPrefs.setAddedGameExe(app, folder.path, aliased.path)
+        assertTrue(AddedGames.addExe(app, own) is AddedGames.AddResult.Existing)
+        assertEquals(own.path, SessionPrefs.addedGameExe(app, folder.path))
+        assertEquals(own.path, AddedExes.list(app).single { it.folder == folder.path }.exe)
     }
 }

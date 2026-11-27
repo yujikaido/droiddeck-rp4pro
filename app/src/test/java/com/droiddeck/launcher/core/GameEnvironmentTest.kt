@@ -4,12 +4,12 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class GameEnvironmentTest {
-    @Test fun defaultsIncludeRequestedGraphicsLevelsAndKeepCaching() {
+    @Test fun defaultsDetectGraphicsCapabilitiesAndKeepCaching() {
         val values = GameEnvironment.defaults("")
         assertEquals("false", values["MESA_SHADER_CACHE_DISABLE"])
         assertEquals("1", values["DROIDDECK_ANTICHEAT_OFFLINE"])
-        assertEquals("12_2", values["VKD3D_FEATURE_LEVEL"])
-        assertEquals("6_9", values["VKD3D_SHADER_MODEL"])
+        assertFalse(values.containsKey("VKD3D_FEATURE_LEVEL"))
+        assertFalse(values.containsKey("VKD3D_SHADER_MODEL"))
     }
 
     @Test fun forceSsbsIsADefaultAGameCanTurnOff() {
@@ -35,14 +35,14 @@ class GameEnvironmentTest {
     }
 
     @Test fun graphicsDefaultsRespectExistingEditsAndRemovals() {
-        val config = GameEnvironment.Config(shared = mapOf("VKD3D_FEATURE_LEVEL" to "12_0"))
+        val config = GameEnvironment.Config(shared = mapOf("VKD3D_FEATURE_LEVEL" to "12_0", "VKD3D_SHADER_MODEL" to "6_5"))
             .withEntries("42", mapOf("VKD3D_SHADER_MODEL" to null))
         val game = GameEnvironment.effective(config, "", "42")
         assertEquals("12_0", game["VKD3D_FEATURE_LEVEL"])
         assertTrue(game.containsKey("VKD3D_SHADER_MODEL"))
         assertNull(game["VKD3D_SHADER_MODEL"])
         val restored = GameEnvironment.effective(config.withEntries("42", emptyMap()), "", "42")
-        assertEquals("6_9", restored["VKD3D_SHADER_MODEL"])
+        assertEquals("6_5", restored["VKD3D_SHADER_MODEL"])
     }
 
     @Test fun dotnetRuntimeFitsAndroidAddressSpaceForEveryGame() {
@@ -134,12 +134,12 @@ class GameEnvironmentTest {
             assertEquals("1", chosen.games["42"]!!["FEX_TSOENABLED"])
         }
         val ntsync = GameEnvironment.withGameSync(base, "42", "ntsync").games["42"]!!
-        assertEquals(listOf("1", "0", "1"), listOf(ntsync["BL_SYNC"], ntsync["BL_FSYNC_FIRST"], ntsync["BL_SYNC_FALLBACK"]))
+        assertEquals(listOf("1", "0", "1"), listOf(ntsync["DD_SYNC"], ntsync["DD_FSYNC_FIRST"], ntsync["DD_SYNC_FALLBACK"]))
         assertFalse(ntsync.containsKey("PROTON_NO_ESYNC"))
         val fsync = GameEnvironment.withGameSync(base, "42", "fsync").games["42"]!!
-        assertEquals(listOf("0", "1", "1", "1"), listOf(fsync["BL_SYNC"], fsync["BL_FSYNC_FIRST"], fsync["BL_SYNC_FALLBACK"], fsync["PROTON_NO_ESYNC"]))
+        assertEquals(listOf("0", "1", "1", "1"), listOf(fsync["DD_SYNC"], fsync["DD_FSYNC_FIRST"], fsync["DD_SYNC_FALLBACK"], fsync["PROTON_NO_ESYNC"]))
         val wineserver = GameEnvironment.withGameSync(base, "42", "wineserver").games["42"]!!
-        assertEquals(listOf("0", "0", "0"), listOf(wineserver["BL_SYNC"], wineserver["BL_FSYNC_FIRST"], wineserver["BL_SYNC_FALLBACK"]))
+        assertEquals(listOf("0", "0", "0"), listOf(wineserver["DD_SYNC"], wineserver["DD_FSYNC_FIRST"], wineserver["DD_SYNC_FALLBACK"]))
         val inherited = GameEnvironment.withGameSync(base, "42", null)
         assertNull(GameEnvironment.gameSync(inherited, "42"))
         assertEquals(mapOf("FEX_TSOENABLED" to "1"), inherited.games["42"])
