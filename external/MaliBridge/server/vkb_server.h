@@ -108,6 +108,9 @@ typedef struct vkb_srv_mem {
     int export_fd1;          /* VKB_EMU_DMABUF_EXPORT: the dma-buf fd + 1 handed out as the export (0: none) */
     int sync_fd1;            /* cached readback: the shared dma-buf + 1, for DMA_BUF_IOCTL_SYNC (0: not cached) */
     struct dab_entry *dab;   /* VKB_EMU_DMABUF_AHB: the AHardwareBuffer pages exported or imported (server_dmabuf_ahb.c) */
+    void *cu_map;            /* cached upload (server_cached_upload.c): the server's mapping, for cache maintenance */
+    size_t cu_len;
+    uint64_t cu_owner;       /* the client process's token: its submits and waits maintain these pages */
     uint8_t stat_cls, stat_ded; /* accounting (server_memory.c): strategy class, dedicated to an image (1) / buffer (2) */
     int stat_pid;
     struct vkb_srv_mem *next;
@@ -163,6 +166,11 @@ typedef struct vkb_srv_table {
      * offered (or off), -1 refused at vkCreateDevice (made without it), -2 listed without its deviceFault feature */
     int device_fault;
     PFN_vkGetPhysicalDeviceImageFormatProperties2 pvm_f2; /* instance: the image-format query beneath pv_mutable_linear's (server_errata_pvmutable.c) */
+    /* instance: the queries beneath msaa2_as_4's (server_errata_msaa2.c) */
+    PFN_vkGetPhysicalDeviceProperties ms_p1;
+    PFN_vkGetPhysicalDeviceProperties2 ms_p2;
+    PFN_vkGetPhysicalDeviceImageFormatProperties ms_if1;
+    PFN_vkGetPhysicalDeviceImageFormatProperties2 ms_if2;
 } vkb_srv_table;
 
 /* server_main.c */
@@ -457,6 +465,8 @@ enum {
     VKB_ERRATUM_PV_FBLOOP_SPLIT, /* PV-06 PowerVR: an in-pass feedback loop (ATTACHMENT_FEEDBACK_LOOP_OPTIMAL, a barrier inside the pass) reads wrong; the pass is split at the barrier */
     VKB_ERRATUM_PV_ZINK_NAME,    /* PV-08: PowerVR's driver hides features from the engine name "mesa zink" */
     VKB_ERRATUM_FRAGDEPTH_NODEPTH, /* MK-49 G925 r49p1: a fragment shader writing FragDepth into a rendering with no depth attachment never finishes */
+    VKB_ERRATUM_NAN_POSITION,    /* MK-45 a NaN clip-space position rasterized over the whole target (Mali-G77 r32p1) */
+    VKB_ERRATUM_MSAA2_AS_4,      /* MK-46 no 2x multisampling (1x and 4x only); D3D9 games that ask for 2x quit */
     VKB_ERRATUM_EXAMPLE,         /* a no-op, the pattern of a fix */
     VKB_ERRATA_COUNT
 };
@@ -549,6 +559,11 @@ int vkb_zink_profile_result(void);
 const char *vkb_errata_zink_engine(const char *engine, char *why, size_t cap);
 int vkb_errata_zink_name_on(char *why, size_t cap); /* server_errata.c: the erratum's decision for an instance */
 void vkb_errata_zink_instance_install(vkb_srv_table *inst); /* a renamed instance: the profile kept but for vertexInputDynamicState */
+/* msaa2_as_4 (MK-46, server_errata_msaa2.c): 1 when this physical device's clients are offered 2x
+ * multisampling the driver lacks (it has 4x) - the erratum's decision (VKBRIDGE_ERRATA=-msaa2_as_4
+ * turns it off) and the driver's sample counts; why (may be NULL) gets the reason */
+int vkb_errata_msaa2_shown(const vkb_srv_table *inst, VkPhysicalDevice pd, char *why, size_t cap);
+void vkb_errata_msaa2_instance_install(vkb_srv_table *inst); /* the property and image format queries */
 int vkb_hang_wanted(void); /* VKBRIDGE_HANG_DETECT: vkCreateDevice also enables VK_EXT_device_fault */
 void vkb_hang_device_init(vkb_srv_table *t);
 void vkb_hang_arm_next(vkb_srv_table *t, const char *what); /* server_lostlog.c: a loss with a GPU fault address */
@@ -671,6 +686,12 @@ void vkb_srv_reply_status(vkb_srv_call *c, uint32_t status);
 vkb_srv_table *vkb_srv_current_table(void);
 void vkb_cbfail_device_init(vkb_srv_table *t); /* server_conn.c */
 void vkb_cbfail_device_destroy(vkb_srv_table *t);
+/* Cached upload memory, VKBRIDGE_CACHED_UPLOAD=1 (server_cached_upload.c) */
+int vkb_cu_reserve(uint64_t size);          /* 1: this shared allocation gets cached pages (budget taken) */
+void vkb_cu_unreserve(uint64_t size);
+void vkb_cu_add(vkb_srv_mem *m);            /* after the allocation, with m->sync_fd1 set */
+void vkb_cu_remove(vkb_srv_mem *m);         /* before its pages go */
+void vkb_cu_device_init(vkb_srv_table *t);
 void vkb_syncfd_device_init(vkb_srv_table *t);   /* server_syncfd.c: sync-fd exports with a deadline */
 int vkb_syncfd_device_destroy(vkb_srv_table *t); /* 1: an export is still in the driver, leave the device alive */
 int vkb_syncfd_order_ms(uint32_t table, uint32_t cmd); /* the order wait's deadline for that request, 0: none */

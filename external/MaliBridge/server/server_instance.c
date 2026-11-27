@@ -311,6 +311,7 @@ void vkb_sv_vkCreateInstance(vkb_srv_call *c)
         vkb_errata_gs_instance_install(t); /* over all of them, its processes only */
         t->zink_renamed = engine_why_name != NULL;
         vkb_errata_zink_instance_install(t); /* PV-08: over everything, renamed Zink instances only */
+        vkb_errata_msaa2_instance_install(t); /* MK-46: 2x sample counts over every other query */
         id = vkb_table_register(t);
         if (!id) {
             t->real.vkDestroyInstance(inst, NULL);
@@ -732,6 +733,7 @@ void vkb_sv_vkCreateDevice(vkb_srv_call *c)
             vkb_vidyn_device_init(t, vidyn); /* over every layer that makes pipelines: its variants go through them all */
             vkb_async_device_init(t); /* over every layer that sees pipelines: the client's may be stand-ins */
             vkb_cbfail_device_init(t); /* submits leave out command buffers the driver would not begin (server_conn.c) */
+            vkb_cu_device_init(t); /* cached upload: cache maintenance around submits and waits (server_cached_upload.c) */
             vkb_syncfd_device_init(t); /* sync-fd exports answered within a deadline (server_syncfd.c) */
             vkb_syncfb_device_init(t); /* a fence the client's mirror saw done is signalled before it is reset (server_syncfb.c) */
             vkb_report_device_init(t); /* outermost: device losses and long waits as the client sees them */

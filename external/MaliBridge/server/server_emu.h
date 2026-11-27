@@ -34,6 +34,14 @@ typedef struct vkb_emu_image {
     int64_t bc_small;         /* BC decoded by the small-image rule (VKBRIDGE_BC_SMALL_DECODE): the bytes that costs over transcoding it */
     VkImageUsageFlags client_usage; /* BC: the usage the app asked for (the transcoded image has no COLOR_ATTACHMENT) */
     struct bc_sink *sinks;    /* BC transcoded: stand-ins for uncompressed views the app may render to (server_emu_bcn.c) */
+    /* An image made with the AHardwareBuffer handle type (the client's shareable linear images under
+     * the AHB memory strategy) has no memory requirements or layout the driver can answer until an
+     * AHardwareBuffer is bound (Mali r32p1 answers size 0 and faults in vkGetImageSubresourceLayout):
+     * both are answered from a twin made from plain_ci, the same image without the handle type. */
+    VkImageCreateInfo plain_ci;
+    uint8_t ahb_external, bound, twin_req_ok, twin_layout_ok;
+    VkMemoryRequirements twin_req;
+    VkSubresourceLayout twin_layout;
     struct vkb_emu_image *next;
 } vkb_emu_image;
 
