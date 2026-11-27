@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- ROMs live on internal storage and on SD cards (/storage/XXXX-XXXX): any path, read by the emulator the URI is granted to. -->
+<paths>
+    <root-path name="root" path="/" />
+</paths>

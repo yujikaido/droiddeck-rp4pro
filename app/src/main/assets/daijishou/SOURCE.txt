@@ -1,0 +1,1 @@
+Platform definitions from Daijishou (https://github.com/TapiocaFox/Daijishou, commit cc55a86), MIT License (LICENSE.MD).
