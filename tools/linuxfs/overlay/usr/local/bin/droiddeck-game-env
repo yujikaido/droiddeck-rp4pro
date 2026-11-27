@@ -416,9 +416,9 @@ def ubisoft_overlay_off(env):
 
 BGE_VIDEO = r"[Software\\Ubisoft\\Beyond Good & Evil\\SettingsApplication.INI\\Basic video]"
 BGE_PICTURE_STAMP = ".droiddeck-bge-picture"
-# "Antialiasing" in its settings is AfterFx, a full-screen blur; with it and Flare on, the picture is a washed-out
-# grey with streaks on Mali.
-BGE_PICTURE_OFF = ("AfterFx", "Flare")
+# "Antialiasing" in its settings is the Blurryness slider (0-10), a full-screen blur; with it up or Flare on, the
+# picture is a washed-out grey with streaks on Mali. AfterFx stays as it is: the game plays right with it on.
+BGE_PICTURE_OFF = ("Blurryness", "Flare")
 
 
 def wineserver_running(prefix):
@@ -489,7 +489,7 @@ def beyond_good_and_evil_picture(command, env, wait=15):
             except BaseException:
                 os.unlink(staged)
                 raise
-        stamp.write_text("AfterFx and Flare turned off once\n")
+        stamp.write_text("Blurryness and Flare turned off once\n")
         print("droiddeck-game-env: Beyond Good & Evil: Antialiasing (blur) and Flare off", file=sys.stderr)
     except OSError as error:
         print("droiddeck-game-env: Beyond Good & Evil picture settings left as is (%s)" % error, file=sys.stderr)
