@@ -609,7 +609,7 @@ static int dev_init(void) {
 
     static const char *const import_exts[4] = {"VK_KHR_external_memory_fd", "VK_EXT_external_memory_dma_buf",
                                                "VK_EXT_image_drm_format_modifier", "VK_KHR_image_format_list"};
-    const char *dev_exts[9] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+    const char *dev_exts[12] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
     uint32_t n_dev_exts = 1;
     uint32_t ne = 0;
     g_vk.EnumerateDeviceExtensionProperties(g_pd, NULL, &ne, NULL);
@@ -656,6 +656,8 @@ static int dev_init(void) {
     VkDeviceQueueCreateInfo qci = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
                                    .queueFamilyIndex = g_qfam, .queueCount = 1, .pQueuePriorities = &prio};
     const void *fg_features = vkp_framegen_device_features(g_inst, vk_loader_gipa(), g_pd);
+    if (fg_features)
+        n_dev_exts += (uint32_t)vkp_framegen_device_extensions(dev_exts + n_dev_exts, 12 - (int)n_dev_exts);
     VkDeviceCreateInfo dci = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = fg_features,
                               .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci,
                               .enabledExtensionCount = n_dev_exts, .ppEnabledExtensionNames = dev_exts};

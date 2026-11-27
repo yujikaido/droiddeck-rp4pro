@@ -11,6 +11,7 @@ void fge_device_ready(PFN_vkGetInstanceProcAddr gipa, VkInstance inst, VkPhysica
 }
 int fge_caps_ok(int kind) { (void)kind; return 0; }
 const char *fge_caps_reason(void) { return "frame-generation engines not built into this compositor"; }
+int fge_device_extensions(const char **out, int max) { (void)out; (void)max; return 0; }
 int fge_format_ok(VkFormat fmt) { (void)fmt; return 0; }
 int fge_start(int kind, const char *cache_path) { (void)kind; (void)cache_path; return -1; }
 void fge_stop(void) {}

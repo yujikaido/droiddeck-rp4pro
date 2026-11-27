@@ -212,9 +212,12 @@ void FrameGen::barrier(VkCommandBuffer cmd, VkImage img, VkImageLayout from, VkI
 }
 
 
+static void destroyScratch(const DeviceDispatch* dd, VkDevice dev, VkDescriptorPool pool); /* record_impl.inc */
+
 void FrameGen::destroy() {
     if (!device_) return;
     dd_->DeviceWaitIdle(device_);
+    destroyScratch(dd_, device_, descPool_); /* its sets came from this pool; a later engine at the same size must not reuse them */
     for (auto& i : pyrA_) destroyImage(i); pyrA_.clear();
     for (auto& i : pyrB_) destroyImage(i); pyrB_.clear();
     for (auto& i : pyrAs_) destroyImage(i); pyrAs_.clear();

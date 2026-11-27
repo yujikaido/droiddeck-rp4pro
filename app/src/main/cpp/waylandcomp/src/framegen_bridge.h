@@ -21,6 +21,9 @@ unsigned vkp_framegen_stats_take(void);
 
 const void *vkp_framegen_device_features(VkInstance inst, PFN_vkGetInstanceProcAddr gipa,
                                          VkPhysicalDevice pd);
+/* After vkp_framegen_device_features(): device extensions the engines need on this driver, appended
+ * to the compositor's list (a Vulkan 1.1 driver takes the LSFG chain through three KHR extensions). */
+int vkp_framegen_device_extensions(const char **out, int max);
 void vkp_framegen_device_ready(VkDevice dev, VkQueue queue, uint32_t qfam, int features_enabled);
 void vkp_framegen_device_lost(void);
 

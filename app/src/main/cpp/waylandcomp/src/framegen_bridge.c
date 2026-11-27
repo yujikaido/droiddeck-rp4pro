@@ -175,6 +175,8 @@ const void *vkp_framegen_device_features(VkInstance inst, PFN_vkGetInstanceProcA
     return fge_probe(gipa, inst, pd, VK_FORMAT_R8G8B8A8_UNORM);
 }
 
+int vkp_framegen_device_extensions(const char **out, int max) { return fge_device_extensions(out, max); }
+
 void vkp_framegen_device_ready(VkDevice dev, VkQueue queue, uint32_t qfam, int features_enabled) {
     g_dev = dev; g_queue = queue; g_qfam = qfam; g_features_enabled = features_enabled;
 #define R(n) vk.n = (PFN_vk##n)g_vk.GetDeviceProcAddr(dev, "vk" #n)

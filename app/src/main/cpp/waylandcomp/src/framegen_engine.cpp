@@ -22,6 +22,9 @@ namespace {
 VkTable g_table{};
 lsfg::Caps g_caps{};
 VkPhysicalDeviceVulkan12Features g_v12{};
+/* Vulkan 1.1 drivers (Mali r32p1 on the Retroid Pocket 4 Pro) take the memory-model feature through its
+ * KHR struct; the 1.2 aggregate is refused below 1.2. */
+VkPhysicalDeviceVulkanMemoryModelFeaturesKHR g_mm{};
 VkPhysicalDeviceFeatures2 g_f2{};
 VkPhysicalDevice g_pd = VK_NULL_HANDLE;
 VkDevice g_dev = VK_NULL_HANDLE;
@@ -89,7 +92,9 @@ const void *fge_probe(PFN_vkGetInstanceProcAddr gipa, VkInstance inst, VkPhysica
     g_caps = lsfg::Caps{};
 
 
-    g_caps.features = lsfg::queryFeatures(g_table, pd, exts,  false);
+    /* allowVk11: a 1.1 driver with VK_KHR_spirv_1_4, VK_KHR_shader_float_controls and
+     * VK_KHR_vulkan_memory_model runs the chain with its modules lowered to SPIR-V 1.4 (Mali r32p1). */
+    g_caps.features = lsfg::queryFeatures(g_table, pd, exts, true);
     g_caps.probedFormat = ring_fmt;
     g_caps.storageOnSwapchainFormat = g_table.GetPhysicalDeviceFormatProperties
         ? lsfg::probeStorageFormat(g_table, pd, ring_fmt) : false;
@@ -101,14 +106,22 @@ const void *fge_probe(PFN_vkGetInstanceProcAddr gipa, VkInstance inst, VkPhysica
         ELOG("device gates for the LSFG chain fail: %s", g_caps.reason);
         return nullptr;
     }
-    g_v12 = VkPhysicalDeviceVulkan12Features{};
-    g_v12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
-    g_v12.vulkanMemoryModel = VK_TRUE;
-    g_v12.vulkanMemoryModelDeviceScope =
-        g_caps.features.vulkanMemoryModelDeviceScope ? VK_TRUE : VK_FALSE;
+    const VkBool32 dev_scope = g_caps.features.vulkanMemoryModelDeviceScope ? VK_TRUE : VK_FALSE;
     g_f2 = VkPhysicalDeviceFeatures2{};
     g_f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-    g_f2.pNext = &g_v12;
+    if (g_caps.features.deviceApiVersion < VK_API_VERSION_1_2) {
+        g_mm = VkPhysicalDeviceVulkanMemoryModelFeaturesKHR{};
+        g_mm.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES_KHR;
+        g_mm.vulkanMemoryModel = VK_TRUE;
+        g_mm.vulkanMemoryModelDeviceScope = dev_scope;
+        g_f2.pNext = &g_mm;
+    } else {
+        g_v12 = VkPhysicalDeviceVulkan12Features{};
+        g_v12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+        g_v12.vulkanMemoryModel = VK_TRUE;
+        g_v12.vulkanMemoryModelDeviceScope = dev_scope;
+        g_f2.pNext = &g_v12;
+    }
     g_f2.features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
     g_f2.features.shaderStorageImageExtendedFormats = VK_TRUE;
     return &g_f2;
@@ -133,6 +146,19 @@ int fge_caps_ok(int kind) {
 }
 
 const char *fge_caps_reason(void) { return g_caps.reason; }
+
+/* Device extensions the LSFG chain needs on this driver (only the Vulkan 1.1 path asks for any); the
+ * compositor enables them on the device it creates after fge_probe(). */
+int fge_device_extensions(const char **out, int max) {
+    if (!g_probed || !g_caps.features.deviceGatesPass()) return 0;
+    const std::vector<const char *> names = lsfg::extensionNames(g_caps.features);
+    int n = 0;
+    for (const char *name : names) {
+        if (n >= max) break;
+        out[n++] = name;
+    }
+    return n;
+}
 
 int fge_format_ok(VkFormat fmt) {
     if (!g_ready || !g_table.GetPhysicalDeviceFormatProperties || fmt == VK_FORMAT_UNDEFINED) return 0;
