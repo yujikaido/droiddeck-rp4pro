@@ -2,7 +2,7 @@
 
 [README](README.md) · **Games** · [Changelog](CHANGELOG.md) · [Fixes](FIXES.md) · [License](LICENSE)
 
-Retroid Pocket 4 Pro, fix13 to fix53, Proton Experimental, default DroidDeck settings unless noted. Add a row
+Retroid Pocket 4 Pro, fix13 to fix56, Proton Experimental, default DroidDeck settings unless noted. Add a row
 for each game you try; "Playable" means a full session without crashes or rendering faults.
 
 | Game | Install | Status | FPS | Notes |
@@ -25,6 +25,9 @@ whether the game is on internal storage or the SD card, and the frame-generation
 
 ## Tips
 
+- **On fix56 a game doesn't start?** DroidDeck 0.7.11 moves games to DroidDeck-Proton 11-14.1. Most run there, but
+  Turtles: Shredder's Revenge and Beyond Good & Evil only start on **Proton Experimental ARM64**: in Steam, the
+  game's Properties → Compatibility.
 - **Every game closes about a second after starting?** Steam updated Proton while it was running, and the update
   put back a graphics layer (DXVK 3) that the Mali chip can't run. Close Steam in DroidDeck and open it again:
   DroidDeck puts its Mali version (DXVK 1.10.3) back when Steam starts.

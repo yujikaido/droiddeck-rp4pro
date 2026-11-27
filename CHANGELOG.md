@@ -5,6 +5,42 @@
 Newest first. Each build is on the [Releases](../../releases) page; from fix43 on, the app's **Updates** page
 offers new ones by itself.
 
+## fix56: DroidDeck 0.7.11 underneath, without proot
+
+DroidDeck released 0.7.11 on November 25. fix56 rebuilds this build on it: DroidDeck's own main release this time,
+with the MaliBridge it ships (v0.5.5.4 and newer Mali fixes), and everything the RP4 Pro builds added carried over:
+the Retro tab, the Network page, updates from this repository, the per-game fixes and the bridge fixes.
+
+What 0.7.11 brings to the RP4 Pro:
+- **No proot.** Steam and games run straight on Android instead of through proot, with less CPU overhead.
+- **Faster SD card starts.** DroidDeck no longer walks every game folder on the card at each session start and
+  launch.
+- **The newer bridge**, and DroidDeck's rebuilt Settings with search, a tab bar you can rearrange (Retro and Network
+  are tabs there too) and many smaller changes; see DroidDeck's own release notes.
+
+Fixed in fix56:
+- **Games on Proton Experimental closed right away on 0.7.11** (Turtles: Shredder's Revenge, Beyond Good & Evil).
+  When 0.7.11 puts in the older DXVK this handheld needs, it removed Proton's `d3d8.dll`, and Valve's start-up check
+  stops the game without it. fix56 leaves Proton's own file in place.
+- **The RP4 Pro Wi-Fi and Bluetooth switches are gone.** DroidDeck now targets Android 14, where Android ignores
+  those switches from apps; Steam's quick settings and Android's pull-down have both.
+
+Good to know when updating from fix55:
+- Android asks once for **All files access** for DroidDeck Mali.
+- The first start downloads 0.7.11's new runtime pieces and Steam's client update. Your games, saves, settings and
+  Steam login stay.
+- 0.7.11 moves games to **DroidDeck-Proton 11-14.1**. Most run there (Ys Origin does), but **Turtles: Shredder's
+  Revenge** and **Beyond Good & Evil** only start on **Proton Experimental ARM64**: in Steam, the game's Properties →
+  Compatibility.
+
+Tested on the RP4 Pro: Steam starts signed in without proot and with the Mali bridge on, the SD card library is
+found, Ys Origin draws its rooms at 59 fps, Turtles and Beyond Good & Evil play on Proton Experimental, the Retro tab
+starts RetroArch and closes it on the way back, the Network page lists the games on my NAS, and the Updates page
+follows this repository.
+
+Not tested yet: frame generation (LSFG, Win-FG), a download to the SD card, Steam's Move install folder, and the
+Tales games.
+
 ## fix55: DroidDeck Mali v0.5.5.3 underneath
 
 ASEbrahim released DroidDeck Mali v0.5.5.3 (on DroidDeck 0.6.9) on November 6. fix55 moves this build onto it,
