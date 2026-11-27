@@ -100,6 +100,8 @@ def addonPacks = ['proot', 'directaudio', 'tracking', 'xbox', 'comet', 'butler',
         if (name == 'proot' && prootPackPin.PROOT_PACK_SHA256) {
             return [(name): [sha256: prootPackPin.PROOT_PACK_SHA256, size: (prootPackPin.PROOT_PACK_SIZE ?: '0') as long]]
         }
+        // Same for DirectAudio: the runtime installer needs it, and without a pin a source build can never update the runtime.
+        if (name == 'directaudio' && pin) return [(name): pin]
         return [(name): [sha256: '', size: 0L]]
     }
     def digest = java.security.MessageDigest.getInstance('SHA-256')
@@ -122,6 +124,116 @@ def variantSuffixes = rootProject.file('tools/release/variants.txt').readLines()
     .collect { def f = it.trim().split(/\s+/); "${f[1]}=${f[2] == '-' ? '' : f[2]}" }
     .join(';')
 
+def maliBridgeVersion = (gitValue(['-C', 'external/MaliBridge', 'describe', '--tags', '--match', 'v[0-9]*']) ?: '').replace('"', '')
+// Side-by-side builds, such as the MaliBridge test build: another applicationId, so the APK installs
+// next to the standard app, and its own launcher name. DROIDDECK_APP_ID_SUFFIX (-Pdroiddeck.appIdSuffix,
+// e.g. ".mali") is appended to com.droiddeck.launcher; DROIDDECK_APPLICATION_ID (-Pdroiddeck.applicationId)
+// sets the whole id instead. DROIDDECK_APP_LABEL (-Pdroiddeck.appLabel) names the app in every language,
+// "DroidDeck <Suffix>" by default for a suffix build. Unset, the build is the standard one. The
+// namespace (R, BuildConfig, the JNI class names) stays com.droiddeck.launcher either way.
+def buildSetting = { String env, String property ->
+    (providers.environmentVariable(env).getOrNull() ?: project.findProperty(property))?.toString()?.trim() ?: ''
+}
+def standardApplicationId = 'com.droiddeck.launcher'
+def appIdSuffix = buildSetting('DROIDDECK_APP_ID_SUFFIX', 'droiddeck.appIdSuffix')
+def appIdOverride = buildSetting('DROIDDECK_APPLICATION_ID', 'droiddeck.applicationId')
+if (appIdSuffix && appIdOverride) {
+    throw new GradleException('Set DROIDDECK_APP_ID_SUFFIX or DROIDDECK_APPLICATION_ID, not both')
+}
+if (appIdSuffix && !(appIdSuffix ==~ /(\.[a-z][a-z0-9_]*)+/)) {
+    throw new GradleException("DROIDDECK_APP_ID_SUFFIX must look like .mali, not '${appIdSuffix}'")
+}
+def droiddeckApplicationId = appIdOverride ?: standardApplicationId + appIdSuffix
+if (!(droiddeckApplicationId ==~ /[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+/)) {
+    throw new GradleException("Not an Android package name: '${droiddeckApplicationId}'")
+}
+def appLabel = buildSetting('DROIDDECK_APP_LABEL', 'droiddeck.appLabel')
+if (!appLabel && appIdSuffix) {
+    appLabel = 'DroidDeck ' + appIdSuffix.tokenize('.').collect { it.capitalize() }.join(' ')
+}
+if (appLabel) {
+    // app_name, overridden for every language main/res translates it into: the build types' source
+    // sets take precedence over main, so the 30-odd strings.xml stay as they are.
+    def escaped = appLabel.replace('\\', '\\\\').replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+        .replace("'", "\\'").replace('"', '\\"').replaceFirst(/^([@?])/, '\\\\$1')
+    def labelRes = layout.buildDirectory.dir('generated/res/appLabel').get().asFile
+    labelRes.deleteDir()
+    file('src/main/res').listFiles().findAll { dir ->
+        dir.isDirectory() && dir.name ==~ /values(-.+)?/ && new File(dir, 'strings.xml').with { it.isFile() && it.text.contains('name="app_name"') }
+    }.each { dir ->
+        new File(labelRes, dir.name).mkdirs()
+        new File(labelRes, "${dir.name}/strings.xml").text =
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<resources>\n    <string name=\"app_name\">${escaped}</string>\n</resources>\n"
+    }
+    android.sourceSets.debug.res.srcDir(labelRes)
+    android.sourceSets.release.res.srcDir(labelRes)
+}
+// In-app updates for the MaliBridge build (applicationId ending in .mali): the app follows the releases of this
+// GitHub repository instead of DroidDeck's catalog. For this RP4 Pro build that is its own repository: the official
+// MaliBridge APKs are signed with another key and leave out these fixes. DROIDDECK_UPDATES_REPO
+// (-Pdroiddeck.updatesRepo) names another owner/repo; empty for every other build.
+def maliUpdatesRepo = buildSetting('DROIDDECK_UPDATES_REPO', 'droiddeck.updatesRepo') ?:
+    (droiddeckApplicationId.endsWith('.mali') ? 'yujikaido/droiddeck-rp4pro' : '')
+if (maliUpdatesRepo && !(maliUpdatesRepo ==~ /[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+/)) {
+    throw new GradleException("DROIDDECK_UPDATES_REPO must look like owner/repo, not '${maliUpdatesRepo}'")
+}
+// The MaliBridge release this APK is published as (the release tag, e.g. v0.5.4), which the updater
+// compares with the newest release: DROIDDECK_MALI_RELEASE (-Pdroiddeck.maliRelease), else
+// tools/release/mali-release.txt. For the .mali build, versionName and versionCode follow it (below).
+def maliReleaseSetting = buildSetting('DROIDDECK_MALI_RELEASE', 'droiddeck.maliRelease')
+def maliRelease = maliReleaseSetting ?:
+    (rootProject.file('tools/release/mali-release.txt').with { it.isFile() ? it.readLines() : [] }
+        .collect { it.trim() }.find { it && !it.startsWith('#') } ?: '')
+if (maliRelease && !(maliRelease ==~ /v?[0-9]+(\.[0-9]+[a-z]*)*(-[0-9A-Za-z.]+)?/)) {
+    throw new GradleException("The MaliBridge release must look like v0.5.4, not '${maliRelease}'")
+}
+// A MaliBridge release build: DROIDDECK_MALI_RELEASE given for the build (tools-mali/build-rc.sh) as a plain
+// version, v0.5.5.2, not v0.5.5.2-test1 or -rc2. Such builds draw no build tag (BuildWatermark); test
+// builds and local builds that only read tools/release/mali-release.txt keep it.
+def maliStable = maliReleaseSetting ? !maliReleaseSetting.contains('-') : false
+// The .mali build's own version: versionName is the MaliBridge release (v0.5.4.1 -> "0.5.4.1") and
+// versionCode is derived from it, ((major * 100 + minor) * 100 + patch) * 10 + hotfix (0.5.4.1 -> 5041),
+// so each release installs over the one before and the updater's versionCode check holds. Letter and
+// pre-release suffixes leave the code as it is. Every other build keeps DroidDeck's versionCode and
+// versionName from defaultConfig.
+// The RP4 Pro build's own release (fix43), which the updater compares instead of the MaliBridge release:
+// DROIDDECK_RP4PRO_RELEASE (-Pdroiddeck.rp4proRelease), else tools/release/rp4pro-release.txt.
+def rp4proRelease = buildSetting('DROIDDECK_RP4PRO_RELEASE', 'droiddeck.rp4proRelease') ?:
+    (rootProject.file('tools/release/rp4pro-release.txt').with { it.isFile() ? it.readLines() : [] }
+        .collect { it.trim() }.find { it && !it.startsWith('#') } ?: '')
+if (rp4proRelease && !(rp4proRelease ==~ /fix[0-9]+/)) {
+    throw new GradleException("The RP4 Pro release must look like fix43, not '${rp4proRelease}'")
+}
+def maliVersionCode = 0
+def maliVersionName = ''
+if (droiddeckApplicationId.endsWith('.mali') && maliRelease) {
+    def numbers = maliRelease.replaceFirst(/^[vV]/, '').replaceFirst(/-.*$/, '').tokenize('.')
+        .collect { (it =~ /^[0-9]+/)[0] as int }
+    while (numbers.size() < 4) numbers << 0
+    if (numbers.size() > 4 || numbers[1] > 99 || numbers[2] > 99 || numbers[3] > 9) {
+        throw new GradleException("The MaliBridge release ${maliRelease} does not fit the .mali versionCode scheme")
+    }
+    maliVersionCode = ((numbers[0] * 100 + numbers[1]) * 100 + numbers[2]) * 10 + numbers[3]
+    maliVersionName = maliRelease.replaceFirst(/^[vV]/, '')
+    // The .mali builds before this scheme carried DroidDeck's versionCode 13
+    if (maliVersionCode <= 13) {
+        throw new GradleException("The .mali versionCode ${maliVersionCode} must stay above 13")
+    }
+}
+if (droiddeckApplicationId != standardApplicationId || appLabel) {
+    logger.lifecycle("DroidDeck side-by-side build: ${droiddeckApplicationId}" + (appLabel ? ", \"${appLabel}\"" : ''))
+}
+// Owner-key signing for MaliBridge release builds: DROIDDECK_SIGNING_STORE (a PKCS12 or JKS file),
+// DROIDDECK_SIGNING_STORE_PASSWORD, DROIDDECK_SIGNING_KEY_ALIAS and DROIDDECK_SIGNING_KEY_PASSWORD (or the
+// droiddeck.signing* properties). Unset, release builds keep the test key.
+def ownerStore = buildSetting('DROIDDECK_SIGNING_STORE', 'droiddeck.signingStore')
+def ownerStorePassword = buildSetting('DROIDDECK_SIGNING_STORE_PASSWORD', 'droiddeck.signingStorePassword')
+def ownerKeyAlias = buildSetting('DROIDDECK_SIGNING_KEY_ALIAS', 'droiddeck.signingKeyAlias')
+def ownerKeyPassword = buildSetting('DROIDDECK_SIGNING_KEY_PASSWORD', 'droiddeck.signingKeyPassword') ?: ownerStorePassword
+if (ownerStore && !(file(ownerStore).isFile() && ownerStorePassword && ownerKeyAlias)) {
+    throw new GradleException('DROIDDECK_SIGNING_STORE needs an existing file, its password and a key alias')
+}
+
 android {
     namespace 'com.droiddeck.launcher'
     compileSdk 34
@@ -129,13 +241,23 @@ android {
         .asText.get().readLines().find { it.startsWith('CI_ANDROID_NDK_VERSION=') }.split('=', 2)[1].trim()
 
     defaultConfig {
-        applicationId "com.droiddeck.launcher"
+        applicationId droiddeckApplicationId
         minSdkVersion 26
         targetSdkVersion 34
         versionCode 20
         versionName "0.7.11"
         buildConfigField "String", "BUILD_LABEL", "\"${escapedBuildLabel}\""
         buildConfigField "String", "SOURCE_COMMIT", "\"${sourceCommit}\""
+        buildConfigField "String", "MALIBRIDGE_VERSION", "\"${maliBridgeVersion}\""
+        buildConfigField "String", "UPDATES_REPO", "\"${maliUpdatesRepo}\""
+        buildConfigField "String", "MALI_RELEASE", "\"${maliRelease}\""
+        buildConfigField "String", "RP4PRO_RELEASE", "\"${rp4proRelease}\""
+        buildConfigField "boolean", "MALI_STABLE", "${maliStable}"
+        // The .mali build's own version (see maliVersionCode above); the literal lines stay DroidDeck's
+        if (maliVersionCode) {
+            setVersionCode(maliVersionCode)
+            setVersionName(maliVersionName)
+        }
         buildConfigField "int", "PR_NUMBER", "${prNumber}"
         buildConfigField "String", "PR_TITLE", "\"${escapeJava(prTitle)}\""
         buildConfigField "String", "BUILD_BRANCH", "\"${escapeJava(buildBranch)}\""
@@ -199,6 +321,9 @@ android {
         release {
             minifyEnabled false
             signingConfig signingConfigs.testkey
+            // The .mali test builds are debuggable so `adb shell run-as` reaches the session logs
+            // (-Pdroiddeck.notDebuggable drops it)
+            debuggable droiddeckApplicationId.endsWith('.mali') && !project.hasProperty('droiddeck.notDebuggable')
         }
     }
 
@@ -404,6 +529,8 @@ dependencies {
     implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3'
     implementation 'com.flyfishxu:kadb-android:1.2.1'
     implementation 'com.termux.termux-app:terminal-view:0.118.0'
+    // Network page: SMB2/3 shares (a NAS or a Windows shared folder)
+    implementation 'com.hierynomus:smbj:0.14.0'
     implementation 'androidx.camera:camera-camera2:1.4.2'
     implementation 'androidx.camera:camera-lifecycle:1.4.2'
     implementation 'androidx.webkit:webkit:1.12.1'

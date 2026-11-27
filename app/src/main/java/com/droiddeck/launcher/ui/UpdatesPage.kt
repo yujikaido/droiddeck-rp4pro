@@ -87,8 +87,10 @@ class UpdatesState(
     val stage: String? = null,
     val percent: Int = -1,
     val askPermission: Boolean = false,
+    /** The MaliBridge build's own updates (MaliBridge's GitHub releases); null in every other build. */
+    val mali: MaliUpdateState? = null,
 ) {
-    val hasUpdate: Boolean get() = AppUpdates.hasUpdate(catalog, follow)
+    val hasUpdate: Boolean get() = mali?.hasUpdate ?: AppUpdates.hasUpdate(catalog, follow)
 }
 
 class UpdatesActions(
@@ -98,6 +100,7 @@ class UpdatesActions(
     val onAllowInstalls: () -> Unit = {},
     val onDismissPermission: () -> Unit = {},
     val onSeen: (Release) -> Unit = {},
+    val mali: MaliUpdateActions = MaliUpdateActions(),
 )
 
 @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
@@ -106,6 +109,7 @@ internal fun UpdatesPage(s: FrontEndState, a: FrontEndActions, modifier: Modifie
     val host = rememberMenuHost()
     val u = s.updates
     val ua = a.updates
+    u.mali?.let { MaliUpdatesPage(s, it, ua.mali, modifier); return }
     val me = remember { AppUpdates.installed() }
     val colors = MaterialTheme.colorScheme
     Column(modifier = modifier) {
@@ -245,7 +249,7 @@ private fun StatusPanel(s: FrontEndState, u: UpdatesState, ua: UpdatesActions, m
 }
 
 @Composable
-private fun ReleaseNotes(title: String, notes: String, key: String) {
+internal fun ReleaseNotes(title: String, notes: String, key: String) {
     val colors = MaterialTheme.colorScheme
     val pal = LocalPalette.current
     var open by rememberSaveable(key) { mutableStateOf(false) }

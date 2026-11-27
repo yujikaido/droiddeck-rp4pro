@@ -16,6 +16,7 @@ import com.droiddeck.launcher.session.SessionState
 import com.droiddeck.launcher.ui.UpdatesActions
 import com.droiddeck.launcher.ui.UpdatesState
 import com.droiddeck.launcher.update.AppUpdates
+import com.droiddeck.launcher.update.MaliUpdater
 import com.droiddeck.launcher.update.SelfInstaller
 import com.droiddeck.launcher.update.UpdateWatch
 
@@ -28,11 +29,13 @@ internal class UpdatesMenu(private val activity: Activity, private val ui: Handl
     var percent by mutableIntStateOf(-1)
     var askPermission by mutableStateOf(false)
     private var pending: AppUpdates.Release? = null
+    /** The MaliBridge build follows MaliBridge's releases instead of DroidDeck's catalog. */
+    private val mali = if (MaliUpdater.forThisBuild) MaliUpdatesMenu(activity, ui) else null
     private var lastCheck = 0L
     private var request = 0
     @Volatile private var session = -1
 
-    fun state() = UpdatesState(catalog, follow, checking, error, stage, percent, askPermission)
+    fun state() = UpdatesState(catalog, follow, checking, error, stage, percent, askPermission, mali?.state())
 
     fun actions() = UpdatesActions(
         onCheck = { check(force = true) },
@@ -45,11 +48,13 @@ internal class UpdatesMenu(private val activity: Activity, private val ui: Handl
         },
         onDismissPermission = { askPermission = false; pending = null },
         onSeen = { r -> UpdateWatch.seen(activity, r) },
+        mali = mali?.actions() ?: com.droiddeck.launcher.ui.MaliUpdateActions(),
     )
 
-    val hasUpdate: Boolean get() = AppUpdates.hasUpdate(catalog, follow)
+    val hasUpdate: Boolean get() = mali?.state()?.hasUpdate ?: AppUpdates.hasUpdate(catalog, follow)
 
     fun onResume() {
+        mali?.let { it.onResume(); return }
         pending?.let { r ->
             if (SelfInstaller.canInstall(activity)) { pending = null; install(r) }
         }
@@ -57,6 +62,7 @@ internal class UpdatesMenu(private val activity: Activity, private val ui: Handl
     }
 
     fun check(force: Boolean) {
+        mali?.let { it.check(manual = force); return }
         if (checking || stage != null) return
         val now = System.currentTimeMillis()
         if (!force && now - lastCheck < 60_000) return
@@ -116,6 +122,7 @@ internal class UpdatesMenu(private val activity: Activity, private val ui: Handl
 
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
+            mali?.let { it.onInstallStatus(intent); return }
             if (intent.getIntExtra(PackageInstaller.EXTRA_SESSION_ID, -1).let { it < 0 || it != session }) return
             when (val status = intent.getIntExtra(PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_FAILURE)) {
                 PackageInstaller.STATUS_PENDING_USER_ACTION -> {
@@ -136,14 +143,17 @@ internal class UpdatesMenu(private val activity: Activity, private val ui: Handl
     }
 
     fun start() {
-        catalog = AppUpdates.cached(activity)
-        follow = AppUpdates.follow(activity, catalog)
+        if (mali != null) mali.start() else {
+            catalog = AppUpdates.cached(activity)
+            follow = AppUpdates.follow(activity, catalog)
+        }
         val filter = IntentFilter(SelfInstaller.ACTION_STATUS)
         if (Build.VERSION.SDK_INT >= 33) activity.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
         else activity.registerReceiver(receiver, filter)
     }
 
     fun unregister() {
+        mali?.stop()
         runCatching { activity.unregisterReceiver(receiver) }
     }
 }
