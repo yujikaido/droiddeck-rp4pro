@@ -4702,8 +4702,4 @@
     <string name="session_end_no_browser">No browser found to open the report page.</string>
     <string name="drawer_frame_limit_presets">Quick caps</string>
     <string name="drawer_frame_limit_chip">%1$d fps</string>
-    <string name="rp4_title">RP4 Pro</string>
-    <string name="rp4_wifi">Wi-Fi</string>
-    <string name="rp4_bluetooth">Bluetooth</string>
-    <string name="rp4_switch_failed">Android did not allow the switch</string>
 </resources>

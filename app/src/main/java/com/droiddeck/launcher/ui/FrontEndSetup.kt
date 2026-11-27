@@ -600,8 +600,8 @@ internal fun SetupPanel(
                         BoxWithConstraints(Modifier.fillMaxWidth()) {
                             if (maxWidth >= 840.dp && !LocalNarrowPane.current) Row(horizontalArrangement = Arrangement.spacedBy(16.dp), verticalAlignment = Alignment.Top) {
                                 Column(Modifier.weight(1f)) { look() }
-                                Column(Modifier.weight(1f)) { device(); Rp4ProGroup(host); art(); download() }
-                            } else Column { look(); device(); Rp4ProGroup(host); art(); download() }
+                                Column(Modifier.weight(1f)) { device(); art(); download() }
+                            } else Column { look(); device(); art(); download() }
                         }
                     }
                     DEVELOPER_TAB -> {

@@ -29,7 +29,12 @@ class BuildWatermarkTest {
     fun localBuildShowsBranch() {
         assertEquals(
             listOf("LOCAL | abcdef0", "feat/thing"),
-            BuildWatermark.lines(pr = 0, ci = false, commit = "abcdef0123", title = "", branch = "feat/thing"),
+            BuildWatermark.lines(pr = 0, ci = false, commit = "abcdef0123", title = "", branch = "feat/thing", rp4pro = ""),
         )
+    }
+
+    @Test
+    fun rp4ProReleaseBuildHasNoWatermark() {
+        assertNull(BuildWatermark.lines(pr = 0, ci = false, commit = "abcdef0123", title = "", branch = "fix56", rp4pro = "fix56"))
     }
 }

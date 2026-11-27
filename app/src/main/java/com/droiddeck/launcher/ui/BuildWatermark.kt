@@ -34,8 +34,10 @@ object BuildWatermark {
         commit: String = BuildConfig.SOURCE_COMMIT,
         title: String = BuildConfig.PR_TITLE,
         branch: String = BuildConfig.BUILD_BRANCH,
+        rp4pro: String = BuildConfig.RP4PRO_RELEASE,
     ): List<String>? {
-        if (ci && pr <= 0) return null
+        // the Retroid Pocket 4 Pro build's releases (fix56...) are local builds people install as they are
+        if ((ci || rp4pro.isNotEmpty()) && pr <= 0) return null
         val hash = commit.take(7).ifEmpty { "unknown" }
         val head = if (pr > 0) "PR-$pr | $hash" else "LOCAL | $hash"
         val detail = (if (pr > 0) title else branch).trim()
