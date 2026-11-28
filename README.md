@@ -36,13 +36,12 @@ This isn't the general DroidDeck Mali build; it's made and tested for the RP4 Pr
 
 More before/after pictures are in the [Changelog](CHANGELOG.md) and [Fixes](FIXES.md).
 
-## Latest: fix56
+## Latest: fix57
 
-**DroidDeck 0.7.11 underneath, without proot.** fix56 rebuilds the build on DroidDeck's newest release, where Steam
-and games run straight on Android, and keeps all the RP4 Pro additions. It also fixes games on Proton Experimental
-closing at start on 0.7.11. Turtles and Beyond Good & Evil need Proton Experimental ARM64 set in Steam, see the
-[CHANGELOG](CHANGELOG.md). Get it from the [Releases](../../releases) page, or from the app's **Updates** page on fix43 or
-later. Every build's notes are in the [CHANGELOG](CHANGELOG.md).
+**Star Wars: The Force Unleashed plays, and Tales of Vesperia is back to full speed.** fix57 is fix56 with two
+game fixes that apply by themselves: Force Unleashed starts without its .NET launcher and with the controller on,
+and Vesperia gets anti-aliasing off once. Get it from the [Releases](../../releases) page, or from the app's **Updates** page on fix43 or later.
+Every build's notes are in the [CHANGELOG](CHANGELOG.md).
 
 ## More pages
 
@@ -55,7 +54,7 @@ later. Every build's notes are in the [CHANGELOG](CHANGELOG.md).
 
 ## Installing
 
-`DroidDeck-MaliBridge-v0.7.11-rp4pro-fix56.apk` (on the [Releases](../../releases) page) is DroidDeck 0.7.11
+`DroidDeck-MaliBridge-v0.7.11-rp4pro-fix57.apk` (on the [Releases](../../releases) page) is DroidDeck 0.7.11
 built from source with its MaliBridge, these fixes, the Retro tab and the Network page. fix14, the earlier build on v0.5.4, is still
 there too. Both are signed with a **personal debug key**, not the author's. Because of that:
 
@@ -138,7 +137,7 @@ Steam's **Quick Access** menu, the same as on a Steam Deck.
 | `patches/` | the compositor and frame-generation patches against the `mali-test-build` fork |
 | `tools/` | the Vulkan probes run inside the DroidDeck rootfs during the investigation (`vk*.py`), the apitrace frame replay (`ys_replay.py`), and the preload build / APK repack scripts |
 | `docs/` | the pull-request write-ups sent upstream, and [`PROGRESS-LOG.md`](docs/PROGRESS-LOG.md), the day-by-day investigation log |
-| branch [`source`](../../tree/source) | the whole app fix56 is built from (DroidDeck 0.7.11 with its MaliBridge, the fixes, the Retro tab and the Network page) |
+| branch [`source`](../../tree/source) | the whole app fix57 is built from (DroidDeck 0.7.11 with its MaliBridge, the fixes, the Retro tab and the Network page) |
 
 ## Credits
 

@@ -5,6 +5,27 @@
 Newest first. Each build is on the [Releases](../../releases) page; from fix43 on, the app's **Updates** page
 offers new ones by itself.
 
+## fix57: Star Wars: The Force Unleashed plays, Tales of Vesperia back to full speed
+
+A small build on top of fix56, with two game fixes that apply by themselves.
+
+- **Star Wars: The Force Unleashed (Ultimate Sith Edition) starts and plays with the controller.** Its .NET
+  launcher stopped at ".NET Framework ... not installed", and the game ignored the controller because only the
+  launcher writes the setting that selects one. fix57 starts `SWTFU.exe` directly and, when the game has no
+  `Config.xml` yet, writes one with the controller selected at 1280x720. It also turns FEX's TSO off for this game,
+  because the sound stutters with it on. Use Retroid's **High** performance mode; it is CPU-bound (about 31 fps on
+  Standard).
+- **Tales of Vesperia runs at full speed again.** On fix56 the game used a different prefix
+  than before, and its settings started with anti-aliasing on (about 20 fps in towns and on the field). fix57 turns anti-aliasing off once per
+  prefix. Set `antialiasing=1` in its `settings.ini` with the game closed to have it back.
+
+Good to know:
+- If the controller stops working in a game **and** in Steam's own menus, restart Steam. That happened once on
+  fix56 and a Steam restart cleared it.
+
+Tested on the RP4 Pro: the update installs over fix56, Steam starts signed in, Force Unleashed goes straight to
+the game with the controller working, and its log shows the launcher skipped and TSO off.
+
 ## fix56: DroidDeck 0.7.11 underneath, without proot
 
 DroidDeck released 0.7.11 on November 25. fix56 rebuilds this build on it: DroidDeck's own main release this time,

@@ -78,7 +78,8 @@ MaliBridge v0.5.5.1 with the same server fixes moved onto it, and the Linux-side
 ASEbrahim's DroidDeck Mali v0.5.5.3 and `external/MaliBridge` his MaliBridge v0.5.5.3, again with the server fixes
 moved onto it. fix56 is rebuilt on DroidDeck 0.7.11 itself (Droid-Deck/DroidDeck c6169cba8) with the MaliBridge it
 ships (64a3f22) in `external/MaliBridge`, the server fixes moved onto that, and from DroidDeck Mali only the parts
-this build uses (its `.mali` app id and version scheme, and the updater that follows this repository).
+this build uses (its `.mali` app id and version scheme, and the updater that follows this repository). fix57 is
+fix56 with game fixes in `droiddeck-game-env`.
 
 fix14 and earlier were the stock v0.5.4 APK with three libraries replaced:
 
@@ -93,7 +94,7 @@ DroidDeck branches for `main`.
 
 ## Source and commit history
 
-This repository holds the build, the write-ups and the evidence. The app that fix56 is built from is on this
+This repository holds the build, the write-ups and the evidence. The app that fix57 is built from is on this
 repository's **[`source`](../../commits/source)** branch: the v0.5.4.1 source release as its first commit, then
 one commit per change (ASEbrahim's v0.5.4.2 came in as one commit, fix46, his v0.5.5.1 bridge as one, fix53, and his v0.5.5.3 as one, fix55), the Retro tab included. The bridge and compositor fixes, with their history, are also on
 branches of the two forks, where each commit is one fix with its reasoning in the message:
@@ -126,7 +127,8 @@ updated to the v0.5.4.2 base, with a correction on `nan_position`'s cause.
 The order is the order the problems appeared: nothing started, then games from the SD card, then the white
 rooms, then the second launch. The pull requests in `docs/` tell each story in full, and
 [`docs/PROGRESS-LOG.md`](docs/PROGRESS-LOG.md) is the unpolished day-by-day log, dead ends included. The
-fix44 to fix56 changes (the `msaa2_as_4` erratum, the known-games entries for Oath and Ys Origin, the
+fix44 to fix57 changes (the `msaa2_as_4` erratum, the known-games entries for Oath and Ys Origin, the
 anti-aliasing switch, the Frame limit change, fast cores first, closing Retro emulators, ScummVM on the Retro tab,
 the v0.5.5.1 bridge, the SD card fixes, the Network page, the v0.5.5.3 base, Proton Experimental as the default,
-games' own setup steps and Beyond Good & Evil's settings) are on the `source` branch.
+games' own setup steps, Beyond Good & Evil's settings, Force Unleashed's launcher skip and controller setting,
+and Vesperia's anti-aliasing) are on the `source` branch.
