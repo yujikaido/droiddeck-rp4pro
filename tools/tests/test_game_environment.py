@@ -1815,6 +1815,26 @@ class GameEnvironmentTest(unittest.TestCase):
             (game / "SWTFU.exe").unlink()
             self.assertEqual(MODULE["skip_swtfu_launcher"](command), command)
 
+    def test_tales_of_vesperia_anti_aliasing_goes_off_once(self):
+        command = ["proton", "waitforexitandrun", "/g/Tales of Vesperia Definitive Edition/TOV_DE.exe"]
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix = Path(tmp) / "738540/pfx"
+            prefix.mkdir(parents=True)
+            env = {"STEAM_COMPAT_DATA_PATH": str(prefix.parent)}
+            settings = prefix / MODULE["TOV_SETTINGS"]
+            settings.parent.mkdir(parents=True)
+            settings.write_bytes(b"vsync=1\r\nantialiasing=1\r\nshadow=0\r\n")
+            MODULE["tales_of_vesperia_aa"](command, env)
+            self.assertEqual(settings.read_bytes(), b"vsync=1\r\nantialiasing=0\r\nshadow=0\r\n")
+            settings.write_bytes(b"vsync=1\r\nantialiasing=1\r\nshadow=0\r\n")
+            MODULE["tales_of_vesperia_aa"](command, env)
+            self.assertIn(b"antialiasing=1", settings.read_bytes())
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix = Path(tmp) / "738540/pfx"
+            prefix.mkdir(parents=True)
+            MODULE["tales_of_vesperia_aa"](command, {"STEAM_COMPAT_DATA_PATH": str(prefix.parent)})
+            self.assertIn(b"antialiasing=0\r\n", (prefix / MODULE["TOV_SETTINGS"]).read_bytes())
+
     def test_force_unleashed_gets_a_config_with_the_pad_once(self):
         with tempfile.TemporaryDirectory() as tmp:
             prefix = Path(tmp) / "32430/pfx"

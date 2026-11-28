@@ -334,6 +334,38 @@ def force_unleashed_config(command, env):
         print("droiddeck-game-env: Star Wars: The Force Unleashed Config.xml not written (%s)" % error, file=sys.stderr)
 
 
+TOV_SETTINGS = "drive_c/users/steamuser/AppData/Local/BANDAI NAMCO Entertainment/Tales of Vesperia/settings.ini"
+TOV_AA_STAMP = ".droiddeck-tov-aa"
+# Tales of Vesperia: Definitive Edition has no graphics menu; its anti-aliasing (on by default) costs the RP4 Pro's
+# Mali-G77 most of its frame rate (battles 60 -> 27, towns 42 -> 17). The file the game writes, with it off.
+TOV_DEFAULTS = ("vsync=1", "resX=1280", "resY=720", "windowMode=1", "antialiasing=0", "shadow=0", "drawDist=1",
+                "anisotropic=0", "lod=1")
+
+
+def tales_of_vesperia_aa(command, env):
+    """Anti-aliasing off once per prefix: a missing settings.ini is written with it off, an existing one gets
+    antialiasing=0; a player who turns it on again later keeps it (the stamp)."""
+    if len(command) < 3 or os.path.basename(command[2]).lower() != "tov_de.exe":
+        return
+    prefix = Path(env.get("STEAM_COMPAT_DATA_PATH", "/nonexistent")) / "pfx"
+    stamp, settings = prefix / TOV_AA_STAMP, prefix / TOV_SETTINGS
+    if stamp.exists() or not prefix.is_dir():
+        return
+    try:
+        if settings.is_file():
+            text = settings.read_bytes().decode("latin-1")
+            updated = re.sub(r"(?mi)^(antialiasing=)1(\r?)$", r"\g<1>0\2", text)
+            if updated != text:
+                settings.write_bytes(updated.encode("latin-1"))
+        else:
+            settings.parent.mkdir(parents=True, exist_ok=True)
+            settings.write_bytes(("\r\n".join(TOV_DEFAULTS) + "\r\n").encode())
+        stamp.write_text("antialiasing turned off once\n")
+        print("droiddeck-game-env: Tales of Vesperia: anti-aliasing off", file=sys.stderr)
+    except OSError as error:
+        print("droiddeck-game-env: Tales of Vesperia settings left as is (%s)" % error, file=sys.stderr)
+
+
 DQM4_MESH_DETAIL = {"r.SkeletalMeshLODBias": "-4", "r.SkeletalMeshLODRadiusScale": "0.25"}
 
 
@@ -1816,6 +1848,7 @@ def main():
             command = skip_red_launcher(command)
             command = skip_swtfu_launcher(command)
             force_unleashed_config(command, env)
+            tales_of_vesperia_aa(command, env)
             if len(command) > 2:
                 death_stranding_allocator(app_id, command[2])
                 dragon_quest_monsters_4_mesh_detail(command[2], effective_env)
