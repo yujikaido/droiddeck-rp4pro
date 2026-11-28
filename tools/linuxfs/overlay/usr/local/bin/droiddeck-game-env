@@ -156,6 +156,14 @@ def beyond_good_and_evil_frame_cap(game):
 
 
 @fix
+def force_unleashed_tso(game):
+    """Star Wars: The Force Unleashed's main thread kept a fast RP4 Pro core at ~86% with FEX's main TSO on and the
+    sound stuttered (filled late); with it off the sound is smooth. A game's own FEX preset still wins."""
+    if game.stem == "swtfu":
+        return {"FEX_TSOENABLED": "0"}, [], "Star Wars: The Force Unleashed: FEX main TSO off (sound stutters with it on)"
+
+
+@fix
 def godot_vulkan(game):
     if is_godot(game) and not game.has_arg("--rendering-driver"):
         return {}, ["--rendering-driver", "vulkan"], "Godot: Vulkan renderer"
@@ -278,6 +286,18 @@ def skip_red_launcher(command):
         game = os.path.join(os.path.dirname(command[2]), "bin", "x64", "Cyberpunk2077.exe")
         if os.path.isfile(game):
             print("droiddeck-game-env: REDlauncher skipped", file=sys.stderr)
+            return command[:2] + [game] + command[3:]
+    return command
+
+
+def skip_swtfu_launcher(command):
+    """Star Wars: The Force Unleashed (Ultimate Sith Edition) starts through SWTFU Launcher.exe, a .NET program that
+    stops at ".NET Framework v4.0.30319 not installed" on a fresh prefix and leaves a black screen; the game is
+    SWTFU.exe beside it, whose own options menu sets the resolution."""
+    if len(command) > 2 and os.path.basename(command[2]).lower() == "swtfu launcher.exe":
+        game = os.path.join(os.path.dirname(command[2]), "SWTFU.exe")
+        if os.path.isfile(game):
+            print("droiddeck-game-env: SWTFU Launcher skipped", file=sys.stderr)
             return command[:2] + [game] + command[3:]
     return command
 
@@ -1762,6 +1782,7 @@ def main():
         fixes = {}
         if waiting:
             command = skip_red_launcher(command)
+            command = skip_swtfu_launcher(command)
             if len(command) > 2:
                 death_stranding_allocator(app_id, command[2])
                 dragon_quest_monsters_4_mesh_detail(command[2], effective_env)

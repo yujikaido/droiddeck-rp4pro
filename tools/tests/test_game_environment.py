@@ -1800,6 +1800,21 @@ class GameEnvironmentTest(unittest.TestCase):
             MODULE["beyond_good_and_evil_picture"](command, env)
             self.assertIn('"Flare"=dword:00000001', registry.read_text())
 
+    def test_force_unleashed_skips_its_dotnet_launcher_and_runs_without_main_tso(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            game = Path(tmp) / "Star Wars The Force Unleashed"
+            game.mkdir()
+            for name in ("SWTFU Launcher.exe", "SWTFU.exe"):
+                (game / name).touch()
+            command = ["proton", "waitforexitandrun", str(game / "SWTFU Launcher.exe"), "-x"]
+            self.assertEqual(MODULE["skip_swtfu_launcher"](command), ["proton", "waitforexitandrun", str(game / "SWTFU.exe"), "-x"])
+            env, extra, notes = MODULE["engine_fixes"](str(game / "SWTFU.exe"), [], "32430")
+            self.assertEqual((env, extra), ({"FEX_TSOENABLED": "0"}, []))
+            config = {"version": 1, "shared": {"FEX_TSOENABLED": "1"}, "games": {"32430": {"FEX_TSOENABLED": "1"}}}
+            self.assertEqual(MODULE["apply_config"]({}, config, "32430", env)["FEX_TSOENABLED"], "1")
+            (game / "SWTFU.exe").unlink()
+            self.assertEqual(MODULE["skip_swtfu_launcher"](command), command)
+
     def test_beyond_good_and_evil_picture_waits_for_wine(self):
         with tempfile.TemporaryDirectory() as tmp:
             prefix = Path(tmp) / "compatdata/15130/pfx"
