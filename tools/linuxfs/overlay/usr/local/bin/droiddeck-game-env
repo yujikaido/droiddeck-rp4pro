@@ -302,6 +302,38 @@ def skip_swtfu_launcher(command):
     return command
 
 
+SWTFU_CONFIG = "drive_c/users/steamuser/AppData/Local/Aspyr/Star Wars The Force Unleashed/Config.xml"
+# The launcher's file (SWTFU Launcher.exe writes it; skipped above): without it the game runs on keyboard and mouse and
+# never looks for a pad. Controller input at 1280x720, the launcher's keyboard bindings.
+SWTFU_SETTINGS = (
+    ("Version", "1"), ("VideoWidth", "1280"), ("VideoHeight", "720"), ("LowDetail", "0"), ("IsKBAndMouse", "FALSE"),
+    ("MovementForward", "DIK_W"), ("MovementLeft", "DIK_A"), ("MovementBack", "DIK_S"), ("MovementRight", "DIK_D"),
+    ("ForceDash", "DIK_LSHIFT"), ("Jump", "DIK_SPACE"), ("Pause", "DIK_RETURN"), ("CenterCamera", "DIK_C"),
+    ("Options", "DIK_ESCAPE"), ("LightSaberAttack", "MOUSE_B0"), ("Block", "DIK_R"), ("ForceGrip", "MOUSE_B1"),
+    ("ForcePush", "DIK_E"), ("ForceLightning", "DIK_Q"), ("LockOn", "DIK_LCONTROL"), ("ActivateActionCamera", "DIK_V"),
+    ("PlayerOptions", "DIK_ESCAPE"), ("IsMouseXAxisInverted", "FALSE"), ("IsMouseYAxisInverted", "FALSE"),
+    ("ClothLevel", "1"),
+)
+
+
+def force_unleashed_config(command, env):
+    """A missing Config.xml for SWTFU.exe is written with the pad selected; one that exists is left alone."""
+    if len(command) < 3 or os.path.basename(command[2]).lower() != "swtfu.exe":
+        return
+    config = Path(env.get("STEAM_COMPAT_DATA_PATH", "/nonexistent")) / "pfx" / SWTFU_CONFIG
+    if config.exists() or not config.parent.parent.parent.is_dir():
+        return
+    lines = ['<?xml version="1.0" encoding="utf-8" ?>', "<r>"] + \
+        ['<s id="%s">%s</s>' % pair for pair in SWTFU_SETTINGS] + ["</r>", ""]
+    try:
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_bytes("\r\n".join(lines).encode())
+        print("droiddeck-game-env: Star Wars: The Force Unleashed: Config.xml written with the controller selected",
+              file=sys.stderr)
+    except OSError as error:
+        print("droiddeck-game-env: Star Wars: The Force Unleashed Config.xml not written (%s)" % error, file=sys.stderr)
+
+
 DQM4_MESH_DETAIL = {"r.SkeletalMeshLODBias": "-4", "r.SkeletalMeshLODRadiusScale": "0.25"}
 
 
@@ -1783,6 +1815,7 @@ def main():
         if waiting:
             command = skip_red_launcher(command)
             command = skip_swtfu_launcher(command)
+            force_unleashed_config(command, env)
             if len(command) > 2:
                 death_stranding_allocator(app_id, command[2])
                 dragon_quest_monsters_4_mesh_detail(command[2], effective_env)

@@ -1815,6 +1815,22 @@ class GameEnvironmentTest(unittest.TestCase):
             (game / "SWTFU.exe").unlink()
             self.assertEqual(MODULE["skip_swtfu_launcher"](command), command)
 
+    def test_force_unleashed_gets_a_config_with_the_pad_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix = Path(tmp) / "32430/pfx"
+            (prefix / "drive_c/users/steamuser/AppData/Local").mkdir(parents=True)
+            env = {"STEAM_COMPAT_DATA_PATH": str(prefix.parent)}
+            config = prefix / MODULE["SWTFU_CONFIG"]
+            MODULE["force_unleashed_config"](["proton", "waitforexitandrun", "/g/SWTFU Launcher.exe"], env)
+            self.assertFalse(config.exists())
+            MODULE["force_unleashed_config"](["proton", "waitforexitandrun", "/g/SWTFU.exe"], env)
+            text = config.read_bytes().decode()
+            self.assertTrue(text.startswith('<?xml version="1.0" encoding="utf-8" ?>\r\n<r>\r\n'))
+            self.assertIn('<s id="IsKBAndMouse">FALSE</s>\r\n', text)
+            config.write_text("mine")
+            MODULE["force_unleashed_config"](["proton", "waitforexitandrun", "/g/SWTFU.exe"], env)
+            self.assertEqual(config.read_text(), "mine")
+
     def test_beyond_good_and_evil_picture_waits_for_wine(self):
         with tempfile.TemporaryDirectory() as tmp:
             prefix = Path(tmp) / "compatdata/15130/pfx"
