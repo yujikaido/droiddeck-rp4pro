@@ -3,15 +3,7 @@
 **README** · [Games](GAMES.md) · [Changelog](CHANGELOG.md) · [Fixes](FIXES.md) · [License](LICENSE)
 
  [DroidDeck Mali](https://github.com/ASEbrahim/MaliBridge) (DroidDeck + MaliBridge) for the
-**Retroid Pocket 4 Pro** (MediaTek Dimensity 1100, Mali-G77 MC9, Android 13, Arm driver r32p1). The first stock
-build, v0.5.4, didn't start on this device; v0.5.4.1 does, and this build adds the fixes for games that still
-broke on it. Everything
-here is GPL-3.0, like the projects it is built from. The bridge fixes were offered upstream as
-[ASEbrahim/MaliBridge#35](https://github.com/ASEbrahim/MaliBridge/pull/35); ASEbrahim closed it once Steam
-started on the RP4 Pro in his releases, with the rest planned for a later version. The DroidDeck fixes were offered as
-[#1692](https://github.com/Droid-Deck/DroidDeck/pull/1692) and [#1693](https://github.com/Droid-Deck/DroidDeck/pull/1693)
-and withdrawn: that project's CI rejects commits carrying an AI co-author trailer, and these were written with
-Claude Code, so they live on the fork branches below instead. Maintainers are welcome to take them from there.
+**Retroid Pocket 4 Pro** (MediaTek Dimensity 1100, Mali-G77 MC9, Android 13, Arm driver r32p1).
 
 Tested on my personal Retroid Pocket 4 Pro only. The fixes switch themselves on for the r32 Mali driver, so the build
 is safe on other phones, but nothing else has been tested on them.
